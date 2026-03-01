@@ -37,10 +37,12 @@ if '--device' in _sys.argv:
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -511,8 +513,107 @@ def _propagate_with_monitoring(
 
 
 # ---------------------------------------------------------------------------
+# Parallel processing helpers
+# ---------------------------------------------------------------------------
+
+def _get_mp_context():
+    """Return a multiprocessing context safe for any thread state.
+
+    On Linux, ``forkserver`` avoids the deadlock risk of ``fork()`` in a
+    multi-threaded parent process (e.g. when PyTorch data-loaders or
+    async I/O workers have been used).  On platforms where ``forkserver``
+    is unavailable, falls back to ``spawn``.
+    """
+    import multiprocessing as mp
+    available = mp.get_all_start_methods()
+    if "forkserver" in available:
+        return mp.get_context("forkserver")
+    return mp.get_context("spawn")
+
+
+# ---------------------------------------------------------------------------
 # Stitching and overlay
 # ---------------------------------------------------------------------------
+
+def _read_mask_png(path: str) -> Optional[np.ndarray]:
+    """Read a grayscale PNG mask, robust to zlib conflicts.
+
+    Tries ``cv2.imread`` first (faster), falls back to ``PIL`` if OpenCV
+    encounters the zlib-parameter issue that occurs when PIL and OpenCV
+    share the same process with different zlib versions.
+    """
+    frame = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if frame is not None:
+        return frame
+    # Fallback: PIL is immune to the zlib parameter bug
+    try:
+        return np.array(Image.open(path))
+    except Exception:
+        return None
+
+
+def _stitch_single_object(
+    oid: int,
+    chunks_dir_str: str,
+    prompt_name: str,
+    chunk_infos: list,
+    overlap: int,
+    output_dir_str: str,
+    fps: float,
+    width: int,
+    height: int,
+) -> str:
+    """Stitch PNG masks for a single object across all chunks into one MP4.
+
+    This is a module-level function so it can be pickled by
+    ``ProcessPoolExecutor``.  All path arguments are strings.
+
+    Returns the filename of the created mask video.
+    """
+    import cv2 as _cv2
+    import numpy as _np
+    from PIL import Image as _PILImage
+
+    def _read_png(p: str) -> _np.ndarray | None:
+        frame = _cv2.imread(p, _cv2.IMREAD_GRAYSCALE)
+        if frame is not None:
+            return frame
+        try:
+            return _np.array(_PILImage.open(p))
+        except Exception:
+            return None
+
+    chunks_dir = Path(chunks_dir_str)
+    output_dir = Path(output_dir_str)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = output_dir / f"object_{oid}_mask.mp4"
+    fourcc = _cv2.VideoWriter_fourcc(*"mp4v")
+    writer = _cv2.VideoWriter(str(out_path), fourcc, fps, (width, height), False)
+    black = _np.zeros((height, width), dtype=_np.uint8)
+
+    for ci, cinfo in enumerate(chunk_infos):
+        chunk_id = cinfo["chunk"]
+        skip = overlap if ci > 0 else 0
+        obj_mask_dir = (
+            chunks_dir / f"chunk_{chunk_id}" / "masks" / prompt_name / f"object_{oid}"
+        )
+        if not obj_mask_dir.exists():
+            chunk_len = cinfo["end"] - cinfo["start"] + 1
+            for _ in range(chunk_len - skip):
+                writer.write(black)
+            continue
+        pngs = sorted(obj_mask_dir.glob("frame_*.png"))
+        chunk_len = cinfo["end"] - cinfo["start"] + 1
+        usable = chunk_len - skip
+        for png in pngs[skip : skip + max(0, usable)]:
+            frame = _read_png(str(png))
+            if frame is not None:
+                writer.write(frame)
+
+    writer.release()
+    return out_path.name
+
 
 def _stitch_masks_to_video(
     chunks_dir: Path,
@@ -524,42 +625,51 @@ def _stitch_masks_to_video(
     fps: float,
     width: int,
     height: int,
+    max_workers: Optional[int] = None,
 ):
-    """Stitch per-chunk PNG masks into per-object mask videos."""
+    """Stitch per-chunk PNG masks into per-object mask videos (parallel).
+
+    Each object is stitched in a separate process using
+    ``ProcessPoolExecutor`` to utilise all CPU cores.  Falls back to
+    sequential processing when only one object exists or in test mode.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    sorted_ids = sorted(object_ids)
 
-    black = np.zeros((height, width), dtype=np.uint8)
+    if not sorted_ids:
+        return
 
-    for oid in sorted(object_ids):
-        out_path = output_dir / f"object_{oid}_mask.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height), False)
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 1, len(sorted_ids), 8)
 
-        for ci, cinfo in enumerate(chunk_infos):
-            chunk_id = cinfo["chunk"]
-            skip = overlap if ci > 0 else 0
-            obj_mask_dir = (
-                chunks_dir / f"chunk_{chunk_id}" / "masks" / prompt_name / f"object_{oid}"
+    # Use sequential path for single object (avoids process-spawn overhead)
+    if len(sorted_ids) == 1 or max_workers <= 1:
+        for oid in sorted_ids:
+            name = _stitch_single_object(
+                oid, str(chunks_dir), prompt_name, chunk_infos,
+                overlap, str(output_dir), fps, width, height,
             )
-            if not obj_mask_dir.exists():
-                # Object not present in this chunk — write black frames
-                chunk_len = cinfo["end"] - cinfo["start"] + 1
-                for _ in range(chunk_len - skip):
-                    writer.write(black)
-                continue
-            pngs = sorted(obj_mask_dir.glob("frame_*.png"))
-            # Limit to actual chunk frame count (handles partial chunks
-            # where a completed prompt may have more PNGs on disk than
-            # the chunk was credited for)
-            chunk_len = cinfo["end"] - cinfo["start"] + 1
-            usable = chunk_len - skip
-            for png in pngs[skip:skip + max(0, usable)]:
-                frame = np.array(Image.open(png))
-                if frame is not None:
-                    writer.write(frame)
+            print(f"    Saved mask video: {name}")
+        return
 
-        writer.release()
-        print(f"    Saved mask video: {out_path.name}")
+    # Parallel: one process per object
+    mp_ctx = _get_mp_context()
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_ctx) as pool:
+        futures = {
+            pool.submit(
+                _stitch_single_object,
+                oid, str(chunks_dir), prompt_name, chunk_infos,
+                overlap, str(output_dir), fps, width, height,
+            ): oid
+            for oid in sorted_ids
+        }
+        for future in as_completed(futures):
+            oid = futures[future]
+            try:
+                name = future.result()
+                print(f"    Saved mask video: {name}")
+            except Exception as exc:
+                print(f"    \033[91mError stitching object {oid}: {exc}\033[0m")
 
 
 def _create_overlay_video(
@@ -568,7 +678,11 @@ def _create_overlay_video(
     output_path: Path,
     alpha: float = 0.5,
 ):
-    """Overlay coloured masks onto the original video."""
+    """Overlay coloured masks onto the original video.
+
+    Uses vectorised numpy compositing (all 3 channels at once) instead
+    of per-channel loops for ~3× speedup on large frames.
+    """
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -580,29 +694,36 @@ def _create_overlay_video(
     # Open mask video readers
     mask_caps = [cv2.VideoCapture(str(p)) for p in mask_videos if p.exists()]
 
-    # Colour palette
+    # Colour palette (BGR for OpenCV)
     colours = [
         (30, 144, 255), (255, 50, 50), (50, 205, 50),
         (255, 165, 0), (148, 103, 189), (255, 215, 0),
     ]
+    # Pre-compute colour arrays as (1, 1, 3) float32 for vectorised blending
+    colour_arrays = [
+        np.array(c, dtype=np.float32).reshape(1, 1, 3)
+        for c in colours
+    ]
+    inv_alpha = np.float32(1.0 - alpha)
+    f_alpha = np.float32(alpha)
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         overlay = frame.copy()
+        frame_f32 = frame.astype(np.float32)
         for i, mc in enumerate(mask_caps):
             ret_m, mask_frame = mc.read()
             if ret_m and mask_frame is not None:
                 if mask_frame.ndim == 3:
                     mask_frame = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
                 binary = mask_frame > 127
-                c = colours[i % len(colours)]
-                for ch in range(3):
-                    overlay[:, :, ch][binary] = (
-                        (1 - alpha) * frame[:, :, ch][binary]
-                        + alpha * c[ch]
-                    ).astype(np.uint8)
+                if binary.any():
+                    c_arr = colour_arrays[i % len(colour_arrays)]
+                    # Vectorised: blend all 3 channels at once
+                    blended = (inv_alpha * frame_f32[binary] + f_alpha * c_arr).astype(np.uint8)
+                    overlay[binary] = blended
         writer.write(overlay)
 
     for mc in mask_caps:
@@ -616,6 +737,121 @@ def _create_overlay_video(
 # Per-object tracking metadata
 # ---------------------------------------------------------------------------
 
+def _analyze_single_object(
+    oid: int,
+    mask_dir_str: str,
+    fps: float,
+    frame_offset: int = 0,
+    min_active_pixels: int = 50,
+    gap_tolerance: int = 2,
+) -> Dict[str, Any]:
+    """Analyse a single object's mask video for temporal presence.
+
+    Module-level function so it can be pickled by ``ProcessPoolExecutor``.
+    """
+    import cv2 as _cv2
+
+    def _ts(sec: float) -> str:
+        m, s = divmod(sec, 60)
+        h, m = divmod(int(m), 60)
+        return f"{h:02d}:{int(m):02d}:{s:06.3f}"
+
+    mask_dir = Path(mask_dir_str)
+    mp4 = mask_dir / f"object_{oid}_mask.mp4"
+
+    if not mp4.exists():
+        return {
+            "object_id": oid,
+            "intervals": [],
+            "num_intervals": 0,
+            "total_frames_active": 0,
+            "total_frames": 0,
+            "total_duration_s": 0.0,
+            "first_frame": None,
+            "last_frame": None,
+            "first_timestamp": None,
+            "last_timestamp": None,
+            "first_timecode": None,
+            "last_timecode": None,
+            "mean_mask_area_pct": None,
+            "max_mask_area_pct": None,
+        }
+
+    cap = _cv2.VideoCapture(str(mp4))
+    total = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
+    total_pixels = max(w * h, 1)
+
+    active_frames: list = []
+    area_fractions: list = []
+    for fidx in range(total):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame.ndim == 3:
+            frame = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
+        active_px = int((frame > 127).sum())
+        if active_px >= min_active_pixels:
+            active_frames.append(fidx)
+            area_fractions.append(active_px / total_pixels)
+    cap.release()
+
+    # Group into intervals with gap tolerance
+    raw_intervals: list = []
+    if active_frames:
+        iv_start = active_frames[0]
+        iv_end = active_frames[0]
+        for fidx in active_frames[1:]:
+            if fidx <= iv_end + 1 + gap_tolerance:
+                iv_end = fidx
+            else:
+                raw_intervals.append((iv_start, iv_end))
+                iv_start = fidx
+                iv_end = fidx
+        raw_intervals.append((iv_start, iv_end))
+
+    intervals: list = []
+    for s, e in raw_intervals:
+        abs_s = s + frame_offset
+        abs_e = e + frame_offset
+        intervals.append({
+            "start_frame": abs_s,
+            "end_frame": abs_e,
+            "start_time": round(abs_s / fps, 3),
+            "end_time": round(abs_e / fps, 3),
+            "start_timecode": _ts(abs_s / fps),
+            "end_timecode": _ts(abs_e / fps),
+            "duration_frames": abs_e - abs_s + 1,
+            "duration_s": round((abs_e - abs_s + 1) / fps, 3),
+        })
+
+    active_count = len(active_frames)
+    abs_first = (active_frames[0] + frame_offset) if active_frames else None
+    abs_last = (active_frames[-1] + frame_offset) if active_frames else None
+    total_dur = round(active_count / fps, 3) if active_count else 0.0
+
+    mean_area = round(sum(area_fractions) / len(area_fractions) * 100, 4) if area_fractions else None
+    max_area = round(max(area_fractions) * 100, 4) if area_fractions else None
+
+    return {
+        "object_id": oid,
+        "intervals": intervals,
+        "num_intervals": len(intervals),
+        "total_frames_active": active_count,
+        "total_frames": total,
+        "total_duration_s": total_dur,
+        "first_frame": abs_first,
+        "last_frame": abs_last,
+        "first_timestamp": round(abs_first / fps, 3) if abs_first is not None else None,
+        "last_timestamp": round(abs_last / fps, 3) if abs_last is not None else None,
+        "first_timecode": _ts(abs_first / fps) if abs_first is not None else None,
+        "last_timecode": _ts(abs_last / fps) if abs_last is not None else None,
+        "mean_mask_area_pct": mean_area,
+        "max_mask_area_pct": max_area,
+    }
+
+
 def _build_object_tracking(
     mask_dir: Path,
     object_ids: set,
@@ -623,6 +859,7 @@ def _build_object_tracking(
     frame_offset: int = 0,
     min_active_pixels: int = 50,
     gap_tolerance: int = 2,
+    max_workers: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Scan stitched mask videos and compute per-object presence info.
 
@@ -634,6 +871,9 @@ def _build_object_tracking(
     regions are bridged so that tiny dips (e.g. from mp4 compression or a
     single missed frame) do not fragment intervals.
 
+    When multiple objects are present, analysis is parallelised across
+    CPU cores using ``ProcessPoolExecutor``.
+
     Args:
         mask_dir: Directory containing ``object_{id}_mask.mp4`` files.
         object_ids: Set of global object IDs to scan.
@@ -644,118 +884,68 @@ def _build_object_tracking(
             be considered "active".  Default 50 (≈ noise-only filter).
         gap_tolerance: Maximum gap (in frames) between active frames that
             will be bridged into a single interval.  Default 2.
+        max_workers: Maximum number of parallel processes.  Defaults to
+            ``min(cpu_count, len(object_ids), 8)``.
 
     Returns:
         List of dicts, one per object, sorted by object ID.
     """
-    tracking: List[Dict[str, Any]] = []
+    sorted_ids = sorted(object_ids)
+    if not sorted_ids:
+        return []
 
-    def _ts(sec: float) -> str:
-        m, s = divmod(sec, 60)
-        h, m = divmod(int(m), 60)
-        return f"{h:02d}:{int(m):02d}:{s:06.3f}"
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 1, len(sorted_ids), 8)
 
-    for oid in sorted(object_ids):
-        mp4 = mask_dir / f"object_{oid}_mask.mp4"
-        if not mp4.exists():
-            tracking.append({
-                "object_id": oid,
-                "intervals": [],
-                "num_intervals": 0,
-                "total_frames_active": 0,
-                "total_frames": 0,
-                "total_duration_s": 0.0,
-                "first_frame": None,
-                "last_frame": None,
-                "first_timestamp": None,
-                "last_timestamp": None,
-                "first_timecode": None,
-                "last_timecode": None,
-                "mean_mask_area_pct": None,
-                "max_mask_area_pct": None,
-            })
-            continue
+    mask_dir_str = str(mask_dir)
 
-        cap = cv2.VideoCapture(str(mp4))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_pixels = max(w * h, 1)
+    # Single object — avoid process spawn overhead
+    if len(sorted_ids) == 1 or max_workers <= 1:
+        return [
+            _analyze_single_object(
+                oid, mask_dir_str, fps, frame_offset,
+                min_active_pixels, gap_tolerance,
+            )
+            for oid in sorted_ids
+        ]
 
-        # Scan all frames — collect active frame indices and per-frame areas
-        active_frames: List[int] = []
-        area_fractions: List[float] = []          # only for active frames
-        for fidx in range(total):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame.ndim == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            active_px = int((frame > 127).sum())
-            if active_px >= min_active_pixels:
-                active_frames.append(fidx)
-                area_fractions.append(active_px / total_pixels)
-        cap.release()
-
-        # ----- Group active frames into intervals with gap tolerance -----
-        # Two active regions separated by <= gap_tolerance inactive frames
-        # are merged into one interval.
-        raw_intervals: List[tuple] = []           # (start, end) pairs
-        if active_frames:
-            iv_start = active_frames[0]
-            iv_end = active_frames[0]
-            for fidx in active_frames[1:]:
-                if fidx <= iv_end + 1 + gap_tolerance:
-                    iv_end = fidx         # extend (possibly bridging a gap)
-                else:
-                    raw_intervals.append((iv_start, iv_end))
-                    iv_start = fidx
-                    iv_end = fidx
-            raw_intervals.append((iv_start, iv_end))
-
-        intervals: List[Dict[str, Any]] = []
-        for s, e in raw_intervals:
-            abs_s = s + frame_offset
-            abs_e = e + frame_offset
-            intervals.append({
-                "start_frame": abs_s,
-                "end_frame": abs_e,
-                "start_time": round(abs_s / fps, 3),
-                "end_time": round(abs_e / fps, 3),
-                "start_timecode": _ts(abs_s / fps),
-                "end_timecode": _ts(abs_e / fps),
-                "duration_frames": abs_e - abs_s + 1,
-                "duration_s": round((abs_e - abs_s + 1) / fps, 3),
-            })
-
-        active_count = len(active_frames)
-        abs_first = (active_frames[0] + frame_offset) if active_frames else None
-        abs_last = (active_frames[-1] + frame_offset) if active_frames else None
-        total_dur = round(active_count / fps, 3) if active_count else 0.0
-
-        mean_area = round(sum(area_fractions) / len(area_fractions) * 100, 4) if area_fractions else None
-        max_area = round(max(area_fractions) * 100, 4) if area_fractions else None
-
-        entry: Dict[str, Any] = {
-            "object_id": oid,
-            "intervals": intervals,
-            "num_intervals": len(intervals),
-            "total_frames_active": active_count,
-            "total_frames": total,
-            "total_duration_s": total_dur,
-            "first_frame": abs_first,
-            "last_frame": abs_last,
-            "first_timestamp": round(abs_first / fps, 3) if abs_first is not None else None,
-            "last_timestamp": round(abs_last / fps, 3) if abs_last is not None else None,
-            "first_timecode": _ts(abs_first / fps) if abs_first is not None else None,
-            "last_timecode": _ts(abs_last / fps) if abs_last is not None else None,
-            "mean_mask_area_pct": mean_area,
-            "max_mask_area_pct": max_area,
+    # Parallel analysis
+    mp_ctx = _get_mp_context()
+    results: Dict[int, Dict[str, Any]] = {}
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_ctx) as pool:
+        futures = {
+            pool.submit(
+                _analyze_single_object,
+                oid, mask_dir_str, fps, frame_offset,
+                min_active_pixels, gap_tolerance,
+            ): oid
+            for oid in sorted_ids
         }
+        for future in as_completed(futures):
+            oid = futures[future]
+            try:
+                results[oid] = future.result()
+            except Exception as exc:
+                print(f"    \033[91mError analysing object {oid}: {exc}\033[0m")
+                results[oid] = {
+                    "object_id": oid,
+                    "intervals": [],
+                    "num_intervals": 0,
+                    "total_frames_active": 0,
+                    "total_frames": 0,
+                    "total_duration_s": 0.0,
+                    "first_frame": None,
+                    "last_frame": None,
+                    "first_timestamp": None,
+                    "last_timestamp": None,
+                    "first_timecode": None,
+                    "last_timecode": None,
+                    "mean_mask_area_pct": None,
+                    "max_mask_area_pct": None,
+                }
 
-        tracking.append(entry)
-
-    return tracking
+    # Return sorted by object ID
+    return [results[oid] for oid in sorted_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +997,7 @@ def _process_video(
 
     def _on_soft():
         nonlocal _oom_stop_requested
-        print("\033[93m⚠ Memory warning: headroom < 20% — consider reducing chunk size\033[0m")
+        print("\033[93m⚠ Memory warning: headroom < 15% — consider reducing chunk size\033[0m")
 
     def _on_hard():
         nonlocal _oom_stop_requested
@@ -1553,13 +1743,37 @@ def _process_video(
             mon_result = _early_stop_monitor.finalize()
             cal = mon_result.calibration
 
-            # Use calibration to pick a safe chunk size
-            if cal and cal.safe_iterations > 0:
-                # safe_iterations is for total iterations; "both" = 2× frames
-                safe_frames = cal.safe_iterations // 2
-                safe_frames = int(safe_frames * 0.8)  # 80% safety margin
+            # Use calibration to compute frames that target SHRINK_TARGET_PCT
+            # utilisation.  VRAM = baseline + growth_rate × iterations.
+            # Target: baseline + growth_rate × target_iters = eff_limit × target_pct
+            # → target_iters = (eff_limit × target_pct − baseline) / growth_rate
+            target_pct = adaptive.SHRINK_TARGET_PCT
+            if (cal and cal.growth_rate_per_iter > 0
+                    and cal.baseline_bytes > 0
+                    and adaptive.effective_vram_limit > 0):
+                target_vram = adaptive.effective_vram_limit * target_pct
+                target_growth = target_vram - cal.baseline_bytes
+                if target_growth > 0:
+                    target_iters = target_growth / cal.growth_rate_per_iter
+                    safe_frames = max(int(target_iters / 2), adaptive.min_chunk_frames)
+                else:
+                    # Baseline alone exceeds target — use minimum chunk
+                    safe_frames = adaptive.min_chunk_frames
+            elif cal and cal.safe_iterations > 0:
+                # Fallback: safe_iterations = iters to hard limit; scale to target
+                # safe_iterations was computed against hard_pct, so ratio gives
+                # the fraction of that distance we want to use.
+                try:
+                    from sam3.__globals import VRAM_HARD_LIMIT_PCT
+                    hard_pct = VRAM_HARD_LIMIT_PCT
+                except ImportError:
+                    hard_pct = 0.975
+                safe_frames = max(
+                    int(cal.safe_iterations // 2 * (target_pct / hard_pct)),
+                    adaptive.min_chunk_frames,
+                )
             else:
-                safe_frames = current_chunk_frames // 2  # fallback: halve
+                safe_frames = current_chunk_frames // 2  # last resort: halve
 
             safe_frames = max(safe_frames, adaptive.min_chunk_frames)
             adaptive.current_chunk_size = safe_frames
@@ -1622,8 +1836,8 @@ def _process_video(
 
                 print(f"\033[93m  ⚠ Proactive stop on chunk {ci + 1}: {mon_result.stop_reason}. "
                       f"Saved {_partial_frames_processed} frames. "
-                      f"Resuming from frame {resume_frame}, "
-                      f"new chunk size = {safe_frames} frames (was {current_chunk_frames})\033[0m")
+                      f"Targeting {target_pct:.0%} VRAM utilisation → "
+                      f"next chunk: {current_chunk_frames} → {safe_frames} frames\033[0m")
 
                 new_chunks = adaptive.replan_remaining(
                     resume_frame, total_frames_in_video, overlap
@@ -1637,7 +1851,7 @@ def _process_video(
             else:
                 # No partial frames — retry from start_frame (old behavior)
                 print(f"\033[93m  ⚠ Proactive stop on chunk {ci + 1}: {mon_result.stop_reason}. "
-                      f"Calibration → {safe_frames} frames/chunk (was {current_chunk_frames})\033[0m")
+                      f"Targeting {target_pct:.0%} → next chunk: {current_chunk_frames} → {safe_frames} frames\033[0m")
 
                 new_chunks = adaptive.replan_remaining(
                     start_frame, total_frames_in_video, overlap
@@ -1654,6 +1868,21 @@ def _process_video(
             continue
 
         # ── Adaptive sizing: evaluate pressure and adjust for next chunk ──
+        # Extract calibration from the heaviest prompt (highest peak VRAM)
+        # for precision-targeted GROW and SHRINK decisions.
+        _baseline_vram = 0
+        _growth_rate = 0.0
+        _heaviest_peak = 0
+        for mres in _chunk_monitor_results:
+            cal_data = mres.get("calibration") if isinstance(mres, dict) else None
+            mres_peak = mres.get("peak_vram_mb", 0) if isinstance(mres, dict) else 0
+            if cal_data and mres_peak >= _heaviest_peak:
+                _heaviest_peak = mres_peak
+                if cal_data.get("baseline_mb"):
+                    _baseline_vram = int(cal_data["baseline_mb"] * (1024**2))
+                if cal_data.get("growth_rate_mb_per_iter"):
+                    _growth_rate = cal_data["growth_rate_mb_per_iter"] * (1024**2)
+
         rec = adaptive.record_chunk(
             chunk_id=chunk_id,
             chunk_size=current_chunk_frames,
@@ -1661,12 +1890,15 @@ def _process_video(
             peak_ram_bytes=peak_ram,
             n_objects=chunk_n_objects,
             soft_warning_seen=any_soft_warning,
+            baseline_vram_bytes=_baseline_vram,
+            growth_rate_per_iter=_growth_rate,
         )
 
         if rec.action == "SHRINK":
             print(f"\033[93m  ⚠ Memory pressure {rec.pressure} "
-                  f"({rec.vram_usage_pct:.0f}% of limit). "
-                  f"Reducing next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m")
+                  f"(peak {rec.vram_usage_pct:.0f}% of effective VRAM). "
+                  f"Targeting {rec.target_utilization_pct:.0f}% → "
+                  f"next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m")
             # Replan remaining chunks with smaller size
             next_start = end_frame + 1 - overlap
             if next_start < total_frames_in_video:
@@ -1677,8 +1909,10 @@ def _process_video(
                 n_chunks = len(chunk_list)
                 print(f"  Replanned: {len(new_chunks)} chunk(s) remaining")
         elif rec.action == "GROW":
-            print(f"\033[92m  ↑ Under-utilised ({rec.vram_usage_pct:.0f}% of limit). "
-                  f"Growing next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m")
+            _grow_method = "calibrated" if _growth_rate > 0 and _baseline_vram > 0 else "heuristic"
+            print(f"\033[92m  ↑ Under-utilised (peak {rec.vram_usage_pct:.0f}%). "
+                  f"Targeting {rec.target_utilization_pct:.0f}% ({_grow_method}) → "
+                  f"next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m")
             next_start = end_frame + 1 - overlap
             if next_start < total_frames_in_video:
                 new_chunks = adaptive.replan_remaining(

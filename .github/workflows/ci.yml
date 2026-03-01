@@ -1,14 +1,12 @@
 # ──────────────────────────────────────────────────────────────
 # CI — Lint & Test
-# Runs on every PR and push to main / develop / release/*
+# Runs on every push and every PR to catch issues before merge
 # ──────────────────────────────────────────────────────────────
 name: CI
 
 on:
   push:
-    branches: [main, develop, "release/*"]
   pull_request:
-    branches: [main, develop]
 
 # Cancel in-progress runs for the same PR / branch
 concurrency:

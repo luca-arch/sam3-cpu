@@ -396,6 +396,7 @@ class ChunkMemoryRecord:
     pressure: str = "NORMAL"
     action: str = "CONTINUE"        # CONTINUE | SHRINK | GROW | RECHUNK
     adjusted_chunk_size: int = 0    # chunk size for NEXT chunk
+    target_utilization_pct: float = 0.0  # target VRAM % for next chunk
 
 
 class AdaptiveChunkManager:
@@ -428,12 +429,25 @@ class AdaptiveChunkManager:
     """
 
     # Region: tuning constants (may be overridden per-instance by tier)
-    SHRINK_CRITICAL_FACTOR = 0.50   # halve on critical
-    SHRINK_WARNING_FACTOR = 0.75    # reduce 25% on warning
+    SHRINK_CRITICAL_FACTOR = 0.50   # floor: never retain more than 50% on CRITICAL
+    SHRINK_WARNING_FACTOR = 0.75    # floor: never retain more than 75% on WARNING
     GROW_FACTOR = 1.25              # default grow 25% (tier may override)
     OOM_SHRINK_FACTOR = 0.40        # aggressive shrink on actual OOM
     MAX_CONSECUTIVE_OOMS = 3        # give up after 3 OOMs on same chunk
     GROW_THRESHOLD = 0.50           # grow only when usage < this (tier may override)
+
+    # Target utilisation for next chunk after a SHRINK.
+    # Set just below the intra-chunk soft-limit (VRAM_SOFT_LIMIT_PCT) so the
+    # monitor has headroom to manage gracefully without immediately triggering
+    # soft warnings on the very next chunk.
+    SHRINK_TARGET_PCT = 0.80
+
+    # Target utilisation for next chunk when GROWING.
+    # Aggressive: aim for the intra-chunk soft-limit.  The per-frame monitor
+    # will catch any overshoot and trigger a predictive stop (saving partial
+    # results), so under-shooting here wastes GPU and hurts accuracy via
+    # unnecessary chunk boundaries.
+    GROW_TARGET_PCT = 0.85          # matches VRAM_SOFT_LIMIT_PCT
 
     def __init__(
         self,
@@ -516,6 +530,57 @@ class AdaptiveChunkManager:
             return MemoryPressure.ELEVATED
         return MemoryPressure.NORMAL
 
+    def _compute_target_chunk_size(
+        self,
+        chunk_size: int,
+        peak_vram_bytes: int,
+        usage_pct: float,
+        pressure: str,
+        baseline_vram_bytes: int = 0,
+    ) -> int:
+        """Compute next chunk size targeting :attr:`SHRINK_TARGET_PCT`.
+
+        Strategy
+        --------
+        VRAM = baseline + per_frame_growth × N_frames.
+
+        When ``baseline_vram_bytes`` is provided (from calibration), we
+        can isolate the per-frame growth and scale just that portion to
+        hit the target utilisation.  Without a baseline we fall back to
+        simple proportional scaling (assumes baseline ≈ 0), which
+        overestimates how much shrinking helps when the baseline is high.
+
+        In both cases the result is floored by the legacy fixed factor
+        (``SHRINK_CRITICAL_FACTOR`` for CRITICAL, ``SHRINK_WARNING_FACTOR``
+        for WARNING) to guarantee a meaningful reduction.
+        """
+        target_bytes = self.effective_vram_limit * self.SHRINK_TARGET_PCT
+
+        # Pick the legacy floor factor for this pressure level
+        if pressure == MemoryPressure.CRITICAL:
+            floor_factor = self.SHRINK_CRITICAL_FACTOR
+        else:
+            floor_factor = self.SHRINK_WARNING_FACTOR
+
+        if baseline_vram_bytes > 0 and peak_vram_bytes > baseline_vram_bytes:
+            # ── Baseline-aware: scale only the growth portion ──
+            growth_bytes = peak_vram_bytes - baseline_vram_bytes
+            target_growth = target_bytes - baseline_vram_bytes
+            if target_growth > 0 and growth_bytes > 0:
+                new_size = int(chunk_size * (target_growth / growth_bytes) * 0.95)
+            else:
+                # Baseline alone exceeds target — minimise chunk
+                new_size = self.min_chunk_frames
+        else:
+            # ── Proportional fallback (no baseline data) ──
+            new_size = int(chunk_size * (self.SHRINK_TARGET_PCT / max(usage_pct, 0.01)) * 0.95)
+
+        # Never weaker than the legacy fixed-factor floor
+        floor_size = int(chunk_size * floor_factor)
+        new_size = min(new_size, floor_size)
+
+        return max(new_size, self.min_chunk_frames)
+
     def record_chunk(
         self,
         chunk_id: int,
@@ -524,6 +589,8 @@ class AdaptiveChunkManager:
         peak_ram_bytes: int = 0,
         n_objects: int = 0,
         soft_warning_seen: bool = False,
+        baseline_vram_bytes: int = 0,
+        growth_rate_per_iter: float = 0.0,
     ) -> ChunkMemoryRecord:
         """Record a completed chunk and compute next chunk size.
 
@@ -536,6 +603,21 @@ class AdaptiveChunkManager:
             even if the aggregated peak falls under the NORMAL
             threshold — because a prompt was genuinely close to the
             limit at runtime.
+        baseline_vram_bytes : int
+            VRAM allocated before chunk processing began (model weights,
+            CUDA context, etc.).  When provided, enables baseline-aware
+            chunk sizing that correctly accounts for the fixed memory
+            overhead instead of blindly halving frame counts.
+        growth_rate_per_iter : float
+            Per-iteration VRAM growth in bytes, from the *heaviest*
+            prompt's calibration.  When provided with ``baseline_vram_bytes``,
+            enables calibration-based GROW that computes the exact frame
+            count to reach :attr:`GROW_TARGET_PCT` instead of using a
+            blind multiplier.
+            VRAM allocated before chunk processing began (model weights,
+            CUDA context, etc.).  When provided, enables baseline-aware
+            chunk sizing that correctly accounts for the fixed memory
+            overhead instead of blindly halving frame counts.
 
         Returns a :class:`ChunkMemoryRecord` with the recommended
         ``adjusted_chunk_size`` for the next chunk.
@@ -550,16 +632,10 @@ class AdaptiveChunkManager:
         )
 
         # Determine action
-        if pressure == MemoryPressure.CRITICAL:
-            new_size = max(
-                int(chunk_size * self.SHRINK_CRITICAL_FACTOR),
-                self.min_chunk_frames,
-            )
-            action = "SHRINK"
-        elif pressure == MemoryPressure.WARNING:
-            new_size = max(
-                int(chunk_size * self.SHRINK_WARNING_FACTOR),
-                self.min_chunk_frames,
+        if pressure in (MemoryPressure.CRITICAL, MemoryPressure.WARNING):
+            new_size = self._compute_target_chunk_size(
+                chunk_size, peak_vram_bytes, usage_pct, pressure,
+                baseline_vram_bytes=baseline_vram_bytes,
             )
             action = "SHRINK"
         elif (
@@ -567,40 +643,56 @@ class AdaptiveChunkManager:
             and usage_pct < self.GROW_THRESHOLD
             and not soft_warning_seen
         ):
-            # Under-utilised: grow but cap at max_growth_factor × initial.
-            # Dampen growth when many objects are tracked — SAM3 memory
-            # per frame scales roughly with object count, so the naive
-            # growth that is safe for 1 object would be dangerous for 29.
-            # Formula: growth = 1 + (G-1) / (1 + log2(N))
+            # ── Calibration-based GROW ──
+            # When we have the heaviest prompt's growth rate + baseline,
+            # compute exactly how many frames fit before GROW_TARGET_PCT.
             #
-            # Object-count trend: if objects are increasing between chunks
-            # (scene getting busier), further dampen.  If decreasing
-            # (objects leaving), boost growth slightly.
+            #   VRAM = baseline + growth_rate × iterations
+            #   target_iters = (eff_limit × target_pct − baseline) / growth_rate
+            #   target_frames = target_iters / 2   ("both" = 2× frames)
             #
-            # Growth is suppressed entirely when soft_warning_seen is
-            # True — a per-prompt monitor flagged VRAM/RAM pressure
-            # even though the post-chunk peak may look tame.
+            # This is aggressive by design: the intra-chunk monitor with
+            # its soft (85%) + hard (97.5%) limits will catch any
+            # overshoot and save partial results, so under-utilising VRAM
+            # here only hurts accuracy (more chunk boundaries) with no
+            # safety upside.
             import math
-            n = max(n_objects, 1)
-            dampened_growth = 1.0 + (self.GROW_FACTOR - 1.0) / (1.0 + math.log2(n))
+            calibration_grow = None
+            if (growth_rate_per_iter > 0
+                    and baseline_vram_bytes > 0
+                    and self.effective_vram_limit > 0):
+                target_vram = self.effective_vram_limit * self.GROW_TARGET_PCT
+                target_growth = target_vram - baseline_vram_bytes
+                if target_growth > 0:
+                    target_iters = target_growth / growth_rate_per_iter
+                    calibration_grow = max(int(target_iters / 2), self.min_chunk_frames)
 
-            # Trend adjustment: compare current n_objects with previous chunk
-            if len(self.chunk_history) >= 1:
-                prev_obj = self.chunk_history[-1].n_objects
-                if prev_obj > 0 and n_objects > prev_obj * 1.2:
-                    # Objects increasing >20% → further dampen
-                    dampened_growth = 1.0 + (dampened_growth - 1.0) * 0.5
-                elif prev_obj > 0 and n_objects < prev_obj * 0.8:
-                    # Objects decreasing >20% → boost (but cap to full factor)
-                    dampened_growth = min(
-                        dampened_growth * 1.3,
-                        1.0 + (self.GROW_FACTOR - 1.0),
-                    )
+            if calibration_grow is not None:
+                # ── Calibration path: exact targeting ──
+                # Floor: never grow less than the old dampened-multiplier
+                # would give (so calibration errors can only help, not hurt).
+                n = max(n_objects, 1)
+                dampened_floor = int(chunk_size * (1.0 + (self.GROW_FACTOR - 1.0) / (1.0 + math.log2(n))))
+                new_size = max(calibration_grow, dampened_floor)
+            else:
+                # ── Fallback: dampened multiplier (no calibration data) ──
+                n = max(n_objects, 1)
+                dampened_growth = 1.0 + (self.GROW_FACTOR - 1.0) / (1.0 + math.log2(n))
 
-            new_size = min(
-                int(chunk_size * dampened_growth),
-                int(self.initial_chunk_size * self.max_growth_factor),
-            )
+                # Trend adjustment: compare current n_objects with previous chunk
+                if len(self.chunk_history) >= 1:
+                    prev_obj = self.chunk_history[-1].n_objects
+                    if prev_obj > 0 and n_objects > prev_obj * 1.2:
+                        dampened_growth = 1.0 + (dampened_growth - 1.0) * 0.5
+                    elif prev_obj > 0 and n_objects < prev_obj * 0.8:
+                        dampened_growth = min(
+                            dampened_growth * 1.3,
+                            1.0 + (self.GROW_FACTOR - 1.0),
+                        )
+                new_size = int(chunk_size * dampened_growth)
+
+            # Hard cap: never exceed max_growth_factor × initial
+            new_size = min(new_size, int(self.initial_chunk_size * self.max_growth_factor))
             action = "GROW"
         else:
             new_size = chunk_size
@@ -618,6 +710,11 @@ class AdaptiveChunkManager:
             pressure=pressure,
             action=action,
             adjusted_chunk_size=new_size,
+            target_utilization_pct=(
+                round(self.SHRINK_TARGET_PCT * 100, 1) if action == "SHRINK"
+                else round(self.GROW_TARGET_PCT * 100, 1) if action == "GROW"
+                else 0.0
+            ),
         )
         self.chunk_history.append(rec)
 
@@ -692,6 +789,7 @@ class AdaptiveChunkManager:
             "tier": self._tier,
             "grow_factor": self.GROW_FACTOR,
             "grow_threshold": self.GROW_THRESHOLD,
+            "shrink_target_pct": self.SHRINK_TARGET_PCT,
             "vram_limit_bytes": self.vram_limit,
             "ram_limit_bytes": self.ram_limit,
             "effective_vram_limit_bytes": self.effective_vram_limit,
@@ -708,6 +806,7 @@ class AdaptiveChunkManager:
                     "pressure": r.pressure,
                     "action": r.action,
                     "adjusted_chunk_size": r.adjusted_chunk_size,
+                    "target_utilization_pct": r.target_utilization_pct,
                 }
                 for r in self.chunk_history
             ],

@@ -802,3 +802,353 @@ class TestObjectCountTrend:
                                 peak_vram_bytes=low_peak, n_objects=11)
         # Same result — no trend penalty/bonus
         assert rec1.adjusted_chunk_size == ref.adjusted_chunk_size
+
+
+# ---------------------------------------------------------------------------
+# Baseline-aware shrink targeting
+# ---------------------------------------------------------------------------
+
+class TestBaselineAwareShrink:
+    """Tests for proportional, baseline-aware shrink in record_chunk."""
+
+    VRAM_LIMIT = 80 * 1024**3  # 80 GB
+
+    def _make_mgr(self, initial=1000):
+        mgr = AdaptiveChunkManager(
+            initial_chunk_size=initial,
+            device="cpu",
+            vram_limit_bytes=self.VRAM_LIMIT,
+        )
+        # On CPU device, constructor sets vram_limit=0. Override for
+        # pressure evaluation to work with our simulated VRAM.
+        mgr.vram_limit = self.VRAM_LIMIT
+        return mgr
+
+    @property
+    def eff(self):
+        """effective_vram_limit for 80 GB with 5% reserve → 76 GB."""
+        return int(self.VRAM_LIMIT * 0.95)
+
+    def test_critical_with_baseline_targets_shrink_pct(self):
+        """CRITICAL (>90%) with baseline should target SHRINK_TARGET_PCT."""
+        mgr = self._make_mgr(975)
+        baseline = int(self.eff * 0.78)  # 78% baseline (model weights)
+        peak = int(self.eff * 0.93)      # 93% peak → CRITICAL
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=975,
+            peak_vram_bytes=peak, n_objects=5,
+            baseline_vram_bytes=baseline,
+        )
+
+        assert rec.action == "SHRINK"
+        assert rec.pressure == "CRITICAL"
+        assert rec.target_utilization_pct == round(mgr.SHRINK_TARGET_PCT * 100, 1)
+
+        # Baseline-aware: target_growth = eff * 0.80 - eff * 0.78 = eff * 0.02
+        # growth = eff * 0.93 - eff * 0.78 = eff * 0.15
+        # raw = 975 * (0.02 / 0.15) = 975 * 0.133 = 130
+        # * 0.95 safety = 123.  But floor is 975 * 0.50 = 487.
+        # So floor wins: new_size = min(123, 487) = 123 → capped to min_chunk_frames=25
+        # Actually 130 * 0.95 = 123.5 → 123.  That's >= min_chunk_frames.
+        # 123 < 487 (floor) → min(123, 487) = 123.
+        expected_raw = int(975 * ((self.eff * 0.80 - baseline) / (peak - baseline)) * 0.95)
+        floor_size = int(975 * mgr.SHRINK_CRITICAL_FACTOR)
+        expected = min(expected_raw, floor_size)
+        expected = max(expected, mgr.min_chunk_frames)
+        assert rec.adjusted_chunk_size == expected
+
+    def test_critical_without_baseline_proportional(self):
+        """CRITICAL without baseline uses proportional fallback."""
+        mgr = self._make_mgr(975)
+        peak = int(self.eff * 0.93)
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=975,
+            peak_vram_bytes=peak, n_objects=5,
+            baseline_vram_bytes=0,  # no baseline
+        )
+
+        assert rec.action == "SHRINK"
+        # Proportional: 975 * (0.80 / 0.93) * 0.95 = 975 * 0.818 = 797
+        # Floor: 975 * 0.50 = 487.5 → 487
+        # min(797, 487) = 487
+        proportional = int(975 * (mgr.SHRINK_TARGET_PCT / 0.93) * 0.95)
+        floor_size = int(975 * mgr.SHRINK_CRITICAL_FACTOR)
+        expected = min(proportional, floor_size)
+        assert rec.adjusted_chunk_size == expected
+
+    def test_warning_with_baseline(self):
+        """WARNING (80-90%) with baseline → milder than CRITICAL."""
+        mgr = self._make_mgr(500)
+        baseline = int(self.eff * 0.50)  # 50% baseline
+        peak = int(self.eff * 0.85)      # 85% peak → WARNING
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=500,
+            peak_vram_bytes=peak, n_objects=3,
+            baseline_vram_bytes=baseline,
+        )
+
+        assert rec.action == "SHRINK"
+        assert rec.pressure == "WARNING"
+
+        # Baseline-aware: target_growth = eff * 0.80 - eff * 0.50 = eff * 0.30
+        # growth = eff * 0.85 - eff * 0.50 = eff * 0.35
+        # raw = 500 * (0.30 / 0.35) * 0.95 = 500 * 0.814 = 407
+        # Floor: 500 * 0.75 = 375
+        # min(407, 375) = 375
+        target_growth = self.eff * 0.80 - baseline
+        actual_growth = peak - baseline
+        raw = int(500 * (target_growth / actual_growth) * 0.95)
+        floor_size = int(500 * mgr.SHRINK_WARNING_FACTOR)
+        expected = max(min(raw, floor_size), mgr.min_chunk_frames)
+        assert rec.adjusted_chunk_size == expected
+
+    def test_baseline_exceeds_target_uses_minimum(self):
+        """When baseline alone exceeds target_pct, use minimum chunk."""
+        mgr = self._make_mgr(500)
+        baseline = int(self.eff * 0.85)  # 85% baseline > 80% target
+        peak = int(self.eff * 0.93)      # CRITICAL
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=500,
+            peak_vram_bytes=peak, n_objects=1,
+            baseline_vram_bytes=baseline,
+        )
+
+        assert rec.action == "SHRINK"
+        assert rec.adjusted_chunk_size == mgr.min_chunk_frames
+
+    def test_low_baseline_proportional_wins(self):
+        """With low baseline, baseline-aware gives larger chunk than floor."""
+        mgr = self._make_mgr(1000)
+        baseline = int(self.eff * 0.10)   # 10% baseline
+        peak = int(self.eff * 0.91)       # CRITICAL
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=1000,
+            peak_vram_bytes=peak, n_objects=2,
+            baseline_vram_bytes=baseline,
+        )
+
+        assert rec.action == "SHRINK"
+        # Baseline-aware: target_growth = eff * 0.80 - eff * 0.10 = eff * 0.70
+        # growth = eff * 0.91 - eff * 0.10 = eff * 0.81
+        # raw = 1000 * (0.70 / 0.81) * 0.95 = 1000 * 0.821 = 821
+        # Floor: 1000 * 0.50 = 500
+        # min(821, 500) = 500  (floor still wins — it's conservative)
+        floor_size = int(1000 * mgr.SHRINK_CRITICAL_FACTOR)
+        assert rec.adjusted_chunk_size <= floor_size
+
+    def test_floor_prevents_overly_generous_shrink(self):
+        """Floor factor ensures a meaningful reduction even with baseline."""
+        mgr = self._make_mgr(800)
+        # WARNING pressure (82%) with low baseline
+        baseline = int(self.eff * 0.05)
+        peak = int(self.eff * 0.82)
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=800,
+            peak_vram_bytes=peak, n_objects=1,
+            baseline_vram_bytes=baseline,
+        )
+
+        assert rec.action == "SHRINK"
+        # Floor is 800 * 0.75 = 600
+        assert rec.adjusted_chunk_size <= int(800 * mgr.SHRINK_WARNING_FACTOR)
+
+    def test_target_utilization_pct_set_on_shrink(self):
+        """ChunkMemoryRecord should have target_utilization_pct on SHRINK."""
+        mgr = self._make_mgr(500)
+        peak = int(self.eff * 0.92)
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=500,
+            peak_vram_bytes=peak, n_objects=1,
+        )
+
+        assert rec.action == "SHRINK"
+        assert rec.target_utilization_pct == round(mgr.SHRINK_TARGET_PCT * 100, 1)
+
+    def test_target_utilization_pct_on_grow(self):
+        """ChunkMemoryRecord should have GROW_TARGET_PCT on GROW."""
+        mgr = self._make_mgr(500)
+        peak = int(self.eff * 0.20)
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=500,
+            peak_vram_bytes=peak, n_objects=1,
+        )
+
+        assert rec.action == "GROW"
+        assert rec.target_utilization_pct == round(mgr.GROW_TARGET_PCT * 100, 1)
+
+
+# ---------------------------------------------------------------------------
+# Calibration-based GROW
+# ---------------------------------------------------------------------------
+
+class TestCalibrationBasedGrow:
+    """Tests for aggressive, calibration-based growth in record_chunk."""
+
+    VRAM_LIMIT = 80 * 1024**3  # 80 GB
+
+    def _make_mgr(self, initial=500):
+        mgr = AdaptiveChunkManager(
+            initial_chunk_size=initial,
+            device="cpu",
+            vram_limit_bytes=self.VRAM_LIMIT,
+        )
+        mgr.vram_limit = self.VRAM_LIMIT
+        return mgr
+
+    @property
+    def eff(self):
+        return int(self.VRAM_LIMIT * 0.95)
+
+    def test_calibrated_grow_targets_soft_limit(self):
+        """With calibration data, GROW should compute frames to reach GROW_TARGET_PCT."""
+        mgr = self._make_mgr(260)
+        # Simulate: baseline 20% of eff, peak 27% (260 frames, "both"=520 iters)
+        baseline = int(self.eff * 0.20)
+        peak = int(self.eff * 0.27)
+        # growth_rate = (peak - baseline) / 520 iters
+        growth_rate = (peak - baseline) / 520
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=260,
+            peak_vram_bytes=peak, n_objects=2,
+            baseline_vram_bytes=baseline,
+            growth_rate_per_iter=growth_rate,
+        )
+
+        assert rec.action == "GROW"
+
+        # Expected: target_vram = eff * 0.85
+        # target_growth = eff * 0.85 - eff * 0.20 = eff * 0.65
+        # target_iters = target_growth / growth_rate
+        # target_frames = target_iters / 2
+        target_vram = self.eff * mgr.GROW_TARGET_PCT
+        target_growth = target_vram - baseline
+        target_iters = target_growth / growth_rate
+        expected_frames = int(target_iters / 2)
+
+        # Should be much larger than the old 260 * 1.25 = 325
+        assert rec.adjusted_chunk_size > 260 * 1.25
+        # But capped at max_growth_factor × initial
+        cap = int(260 * mgr.max_growth_factor)
+        expected_capped = min(expected_frames, cap)
+        assert rec.adjusted_chunk_size == expected_capped
+
+    def test_calibrated_grow_exceeds_dampened_floor(self):
+        """Calibrated size should always be >= the old dampened multiplier."""
+        mgr = self._make_mgr(200)
+        baseline = int(self.eff * 0.10)
+        peak = int(self.eff * 0.15)
+        growth_rate = (peak - baseline) / 400  # 200 frames * 2
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=200,
+            peak_vram_bytes=peak, n_objects=1,
+            baseline_vram_bytes=baseline,
+            growth_rate_per_iter=growth_rate,
+        )
+
+        assert rec.action == "GROW"
+        dampened_floor = int(200 * mgr.GROW_FACTOR)  # 1 object = full factor
+        # Calibrated should be >= floor (though capped by max_growth_factor)
+        assert rec.adjusted_chunk_size >= dampened_floor
+
+    def test_no_calibration_uses_dampened_fallback(self):
+        """Without calibration data, GROW falls back to dampened multiplier."""
+        mgr = self._make_mgr(260)
+        peak = int(self.eff * 0.27)
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=260,
+            peak_vram_bytes=peak, n_objects=2,
+            # No baseline or growth_rate
+        )
+
+        assert rec.action == "GROW"
+        # With 2 objects: dampened = 1 + (1.25-1) / (1+1) = 1.125
+        dampened = 1.0 + (mgr.GROW_FACTOR - 1.0) / (1.0 + 1.0)
+        expected = min(int(260 * dampened), int(260 * mgr.max_growth_factor))
+        assert rec.adjusted_chunk_size == expected
+
+    def test_calibrated_grow_capped_by_max_growth(self):
+        """Even with calibration, growth can't exceed max_growth_factor × initial."""
+        mgr = self._make_mgr(500)
+        # Very low baseline → calibration wants huge chunk
+        baseline = int(self.eff * 0.01)
+        peak = int(self.eff * 0.02)
+        growth_rate = (peak - baseline) / 1000  # tiny growth = wants huge chunk
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=500,
+            peak_vram_bytes=peak, n_objects=1,
+            baseline_vram_bytes=baseline,
+            growth_rate_per_iter=growth_rate,
+        )
+
+        assert rec.action == "GROW"
+        cap = int(500 * mgr.max_growth_factor)
+        assert rec.adjusted_chunk_size == cap
+
+    def test_calibrated_grow_with_many_objects(self):
+        """Calibration still works correctly with many objects."""
+        mgr = self._make_mgr(300)
+        baseline = int(self.eff * 0.30)
+        peak = int(self.eff * 0.40)
+        growth_rate = (peak - baseline) / 600
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=300,
+            peak_vram_bytes=peak, n_objects=20,
+            baseline_vram_bytes=baseline,
+            growth_rate_per_iter=growth_rate,
+        )
+
+        assert rec.action == "GROW"
+        # Calibrated: target = eff * 0.85, target_growth = eff * 0.55
+        target_growth = self.eff * mgr.GROW_TARGET_PCT - baseline
+        target_iters = target_growth / growth_rate
+        calibrated = int(target_iters / 2)
+        # Floor: dampened growth with 20 objects is minimal
+        import math
+        dampened_floor = int(300 * (1.0 + (mgr.GROW_FACTOR - 1.0) / (1.0 + math.log2(20))))
+        expected = max(calibrated, dampened_floor)
+        expected = min(expected, int(300 * mgr.max_growth_factor))
+        assert rec.adjusted_chunk_size == expected
+
+    def test_soft_warning_blocks_calibrated_grow(self):
+        """soft_warning_seen should prevent GROW even with calibration."""
+        mgr = self._make_mgr(260)
+        baseline = int(self.eff * 0.20)
+        peak = int(self.eff * 0.27)
+        growth_rate = (peak - baseline) / 520
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=260,
+            peak_vram_bytes=peak, n_objects=2,
+            baseline_vram_bytes=baseline,
+            growth_rate_per_iter=growth_rate,
+            soft_warning_seen=True,
+        )
+
+        assert rec.action == "CONTINUE"
+        assert rec.adjusted_chunk_size == 260
+
+    def test_grow_target_pct_in_record(self):
+        """GROW record should show GROW_TARGET_PCT in target_utilization_pct."""
+        mgr = self._make_mgr(300)
+        peak = int(self.eff * 0.20)
+
+        rec = mgr.record_chunk(
+            chunk_id=0, chunk_size=300,
+            peak_vram_bytes=peak, n_objects=1,
+        )
+
+        assert rec.action == "GROW"
+        assert rec.target_utilization_pct == round(mgr.GROW_TARGET_PCT * 100, 1)

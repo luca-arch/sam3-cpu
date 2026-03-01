@@ -458,3 +458,126 @@ class TestBuildObjectTracking:
         result = _build_object_tracking(tmp_path, {2, 0, 1}, fps, 0)
         ids = [r["object_id"] for r in result]
         assert ids == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Parallel postprocessing tests
+# ---------------------------------------------------------------------------
+
+class TestParallelStitching:
+    """Verify that multi-object stitching works with parallel workers."""
+
+    def _setup_multi_object_chunks(self, tmp_path, n_objects, n_chunks, frames_per_chunk, overlap):
+        chunks_dir = tmp_path / "chunks"
+        chunk_infos = []
+        for ci in range(n_chunks):
+            if ci == 0:
+                start = 0
+            else:
+                start = chunk_infos[-1]["end"] + 1 - overlap
+            end = start + frames_per_chunk - 1
+            chunk_infos.append({"chunk": ci, "start": start, "end": end})
+
+            for oid in range(n_objects):
+                obj_dir = chunks_dir / f"chunk_{ci}" / "masks" / "test" / f"object_{oid}"
+                obj_dir.mkdir(parents=True)
+                for fidx in range(frames_per_chunk):
+                    arr = np.full((10, 10), 128 + oid, dtype=np.uint8)
+                    cv2.imwrite(str(obj_dir / f"frame_{fidx:06d}.png"), arr)
+
+        return chunks_dir, chunk_infos
+
+    def test_parallel_stitch_multi_objects(self, tmp_path):
+        """5 objects should be stitched in parallel (max_workers > 1)."""
+        n_obj = 5
+        chunks_dir, chunk_infos = self._setup_multi_object_chunks(
+            tmp_path, n_obj, 2, 10, 3
+        )
+        out = tmp_path / "out"
+        _stitch_masks_to_video(
+            chunks_dir, "test", set(range(n_obj)), chunk_infos, 3,
+            out, 25, 10, 10, max_workers=4,
+        )
+        # All 5 mask videos should exist
+        for oid in range(n_obj):
+            mp4 = out / f"object_{oid}_mask.mp4"
+            assert mp4.exists(), f"Missing mask video for object {oid}"
+            cap = cv2.VideoCapture(str(mp4))
+            n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            # chunk 0: 10 frames, chunk 1: 10-3=7 → 17
+            assert n == 17, f"Object {oid}: expected 17 frames, got {n}"
+
+    def test_sequential_fallback_one_object(self, tmp_path):
+        """Single object should use sequential path (no subprocess spawn)."""
+        chunks_dir, chunk_infos = self._setup_multi_object_chunks(
+            tmp_path, 1, 1, 8, 0
+        )
+        out = tmp_path / "out"
+        _stitch_masks_to_video(
+            chunks_dir, "test", {0}, chunk_infos, 0,
+            out, 25, 10, 10, max_workers=1,
+        )
+        mp4 = out / "object_0_mask.mp4"
+        assert mp4.exists()
+        cap = cv2.VideoCapture(str(mp4))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        assert n == 8
+
+    def test_forced_max_workers_1(self, tmp_path):
+        """max_workers=1 forces sequential even with multiple objects."""
+        chunks_dir, chunk_infos = self._setup_multi_object_chunks(
+            tmp_path, 3, 1, 5, 0
+        )
+        out = tmp_path / "out"
+        _stitch_masks_to_video(
+            chunks_dir, "test", {0, 1, 2}, chunk_infos, 0,
+            out, 25, 10, 10, max_workers=1,
+        )
+        for oid in range(3):
+            assert (out / f"object_{oid}_mask.mp4").exists()
+
+
+class TestParallelTracking:
+    """Verify that multi-object tracking analysis works in parallel."""
+
+    def _make_mask_videos(self, tmp_path, n_objects, n_frames, w=32, h=32, fps=10.0):
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        for oid in range(n_objects):
+            mp4 = tmp_path / f"object_{oid}_mask.mp4"
+            writer = cv2.VideoWriter(str(mp4), fourcc, fps, (w, h), False)
+            for fidx in range(n_frames):
+                # Objects alternate active/inactive to verify individual analysis
+                if fidx % (oid + 2) == 0:
+                    writer.write(np.full((h, w), 255, dtype=np.uint8))
+                else:
+                    writer.write(np.zeros((h, w), dtype=np.uint8))
+            writer.release()
+        return fps
+
+    def test_parallel_tracking_multi_objects(self, tmp_path):
+        """6 objects analysed in parallel — results sorted by ID."""
+        n_obj = 6
+        fps = self._make_mask_videos(tmp_path, n_obj, 20)
+        result = _build_object_tracking(
+            tmp_path, set(range(n_obj)), fps, 0, max_workers=4,
+        )
+        assert len(result) == n_obj
+        ids = [r["object_id"] for r in result]
+        assert ids == list(range(n_obj))
+        # Each object should have different active frame counts
+        # (due to different modulo patterns)
+        for r in result:
+            assert r["total_frames"] == 20
+            assert r["total_frames_active"] > 0
+
+    def test_sequential_tracking_max_workers_1(self, tmp_path):
+        """max_workers=1 forces sequential processing."""
+        fps = self._make_mask_videos(tmp_path, 3, 10)
+        result = _build_object_tracking(
+            tmp_path, {0, 1, 2}, fps, 0, max_workers=1,
+        )
+        assert len(result) == 3
+        ids = [r["object_id"] for r in result]
+        assert ids == [0, 1, 2]
