@@ -559,12 +559,15 @@ class Sam3VideoInference(Sam3VideoBase):
     def _build_tracker_output(
         self, inference_state, frame_idx, refined_obj_id_to_mask=None
     ):
-        assert (
-            "cached_frame_outputs" in inference_state
-            and frame_idx in inference_state["cached_frame_outputs"]
-        ), (
-            "No cached outputs found. Ensure normal propagation has run first to populate the cache."
-        )
+        # If no cache entry exists yet for this frame (e.g. first point prompt
+        # before any propagation), start from an empty dict so the new mask
+        # becomes the sole output.
+        if (
+            "cached_frame_outputs" not in inference_state
+            or frame_idx not in inference_state["cached_frame_outputs"]
+        ):
+            inference_state.setdefault("cached_frame_outputs", {})[frame_idx] = {}
+
         cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
 
         obj_id_to_mask = cached_outputs.copy()
@@ -1762,6 +1765,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 obj_id_to_mask,
                 suppressed_obj_ids=suppressed_obj_ids,
             )
+            # Mark the frame as having outputs so propagation knows where to
+            # start (same as inject_masks and _run_single_frame_inference).
+            inference_state["previous_stages_out"][frame_idx] = "_THIS_FRAME_HAS_OUTPUTS_"
+
             return frame_idx, self._postprocess_output(
                 inference_state, out, suppressed_obj_ids=suppressed_obj_ids
             )

@@ -13,6 +13,7 @@ import torch
 from sam3.utils.profiler import profile
 from sam3.__globals import DEVICE, BPE_PATH, CPU_CORES_PERCENT
 from sam3.utils.logger import get_logger
+from sam3.memory_optimizer import clear_memory
 
 logger = get_logger(__name__)
 
@@ -758,10 +759,54 @@ class Sam3VideoDriver():
         if propagation_direction not in ("both", "forward", "backward"):
             raise ValueError("propagation_direction must be 'both', 'forward' or 'backward'. Options: 'both', 'forward', 'backward'")
         
-        # Stream results as they're generated (frame-by-frame processing)
+        # Collect all streaming results into a single return value
         result = {}
         object_ids = set()
         frame_objects = {}
+
+        for frame_idx, outputs, frame_obj_ids in self.propagate_in_video_streaming(
+            session_id=session_id,
+            start_frame_idx=start_frame_idx,
+            frames_to_track=frames_to_track,
+            propagation_direction=propagation_direction,
+        ):
+            result[frame_idx] = outputs
+            frame_objects[frame_idx] = frame_obj_ids
+            object_ids.update(frame_obj_ids)
+
+        return result, object_ids, frame_objects
+    
+    def propagate_in_video_streaming(
+        self,
+        session_id: str,
+        start_frame_idx: int = None,
+        frames_to_track: int = None,
+        propagation_direction: Literal["both", "forward", "backward"] = "both",
+    ):
+        """Generator yielding per-frame results for memory-monitored propagation.
+
+        Unlike :meth:`propagate_in_video` which collects ALL frames before
+        returning, this method yields ``(frame_idx, outputs, object_ids)``
+        per frame as processing completes.  This enables:
+
+        - **Intra-chunk memory monitoring** — check VRAM between frames.
+        - **Early stopping** — break from the generator to halt propagation.
+        - **Async I/O** — submit mask writes while GPU processes next frame.
+
+        Args:
+            Same as :meth:`propagate_in_video`.
+
+        Yields:
+            Tuple of ``(frame_idx, outputs_dict, object_ids_list)`` for each
+            processed frame.  ``object_ids_list`` contains ``int`` IDs.
+        """
+        if self.predictor is None:
+            raise ValueError("Model is not loaded.")
+
+        if propagation_direction not in ("both", "forward", "backward"):
+            raise ValueError(
+                "propagation_direction must be 'both', 'forward' or 'backward'"
+            )
 
         for response in self.predictor.handle_stream_request(
             request=dict(
@@ -772,15 +817,16 @@ class Sam3VideoDriver():
                 propagation_direction=propagation_direction,
             )
         ):
-            # Ensure response has required keys
             if "frame_index" in response and "outputs" in response:
-                result[response["frame_index"]] = response["outputs"]
-                frame_objects[response["frame_index"]] = response["outputs"]["out_obj_ids"].tolist()
-                object_ids.update(frame_objects[response["frame_index"]])
+                obj_ids = response["outputs"]["out_obj_ids"]
+                if hasattr(obj_ids, "tolist"):
+                    obj_ids = obj_ids.tolist()
+                yield response["frame_index"], response["outputs"], obj_ids
             else:
-                logger.warning(f"Response missing required keys. Got keys: {list(response.keys())}")
-        return result, object_ids, frame_objects
-    
+                logger.warning(
+                    f"Response missing required keys. Got keys: {list(response.keys())}"
+                )
+
     @profile()
     def refine_existing_object_with_points_prompt(
         self, 
@@ -1050,6 +1096,10 @@ class Sam3VideoDriver():
             )
         )
 
+        # Release CUDA cache so freed memory becomes available for next session
+        device = getattr(self, '_device', DEVICE.type)
+        clear_memory(device, full_gc=True)
+
     @profile()
     def reset_session(self, session_id: str):
         """Reset a session to its initial state, removing all prompts and tracked objects.
@@ -1098,6 +1148,12 @@ class Sam3VideoDriver():
                 session_id=session_id,
             )
         )
+
+        # Release cached GPU memory from the previous prompt's propagation.
+        # This is critical: reset_session clears model tracking state but
+        # CUDA still holds reserved (but freed) memory in its allocator pool.
+        device = getattr(self, '_device', DEVICE.type)
+        clear_memory(device, full_gc=True)
 
     @profile()
     def start_session(self, video_path: str) -> str:

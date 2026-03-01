@@ -39,10 +39,20 @@ IMAGE_INFERENCE_MB = 6760
 VIDEO_INFERENCE_MB = 6900
 TENSOR_SIZE_BYTES = 1008*1008*3*4 # Approximate size of a 1008x1008 RGB tensor in bytes
 
+# Model state overhead: the SAM3 tracker stores per-frame feature maps, cached
+# masks for N tracked objects, positional encodings, and memory-bank tensors.
+# The multiplier is applied on top of the raw pixel cost (width × height × 4)
+# to estimate the full per-frame GPU memory footprint.
+# Calibrated empirically: 480p → ~40 MB/frame, 1080p → ~70 MB/frame.
+MODEL_STATE_MULTIPLIER = 4.5
+
 # Memory usage for chunking (percentage of available memory to use)
 RAM_USAGE_PERCENT = 0.45   # Use 45% of available RAM for CPU video chunking (conservative)
 # RAM_USAGE_PERCENT = 0.65   # Use 65% of available RAM for CPU video chunking (conservative)
-VRAM_USAGE_PERCENT = 0.25  # Use 25% of available VRAM for GPU video chunking (aggressive, GPU memory is dedicated)
+VRAM_USAGE_PERCENT = 0.70  # Use 70% of available VRAM for GPU video chunking
+                            # (raised from 0.45 — the AdaptiveChunkManager in
+                            # memory_optimizer.py dynamically shrinks chunks if
+                            # actual peak usage exceeds safe thresholds)
 CPU_CORES_PERCENT = 0.90   # Use 90% of CPU cores for parallel processing (leave some for OS and other tasks)
 
 MEMORY_SAFETY_MULTIPLIER = 1.5  # Require 1.5x estimated memory for safety (reduced from 3x)

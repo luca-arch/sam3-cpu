@@ -8,6 +8,10 @@ import psutil
 from pathlib import Path
 from sam3.utils.ffmpeglib import ffmpeg_lib
 from sam3.utils.helpers import ram_stat, vram_stat
+from sam3.memory_optimizer import (
+    clear_memory,
+    estimate_per_frame_bytes,
+)
 from sam3.__globals import (
     logger,
     DEVICE, 
@@ -45,11 +49,28 @@ class MemoryManager:
             width: int, 
             height: int, 
             device: str = DEVICE.type, 
-            type: Literal['video', 'image'] = 'video'
+            type: Literal['video', 'image'] = 'video',
+            max_memory_bytes: int = None,
         ):
-        """Compute maximum frames that fit safely in RAM."""
-        bytes_per_frame = width * height * 3  # CV_8UC3
-        bytes_per_frame += TENSOR_SIZE_BYTES  # Add estimated tensor size for safety
+        """Compute maximum frames that fit safely in available memory.
+        
+        Uses the calibrated ``estimate_per_frame_bytes()`` from 
+        ``sam3.memory_optimizer`` which accounts for model state overhead
+        (feature maps, cached masks, attention KV caches) — not just raw
+        pixel size.
+
+        Parameters
+        ----------
+        max_memory_bytes : int, optional
+            Simulate a smaller device by capping total memory.  When set,
+            ``free`` is computed as ``max_memory_bytes − used`` so the
+            chunk planner thinks it only has this much VRAM/RAM.
+        """
+        # Clear stale CUDA cache before measuring so we get accurate free memory
+        clear_memory(device, full_gc=True)
+
+        # Calibrated per-frame estimate (includes model state overhead)
+        bytes_per_frame = estimate_per_frame_bytes(width, height, device)
 
         logger.debug(f"Frame size in MB: {bytes_per_frame / (1024 ** 2):.2f} MB")
 
@@ -57,14 +78,27 @@ class MemoryManager:
             memory_info = ram_stat()
             percent  = RAM_USAGE_PERCENT
             available_key = 'available'
-            vid_memory_max_usage = RAM_USAGE_PERCENT * memory_info['total'] * (1 - CPU_MEMORY_RESERVE_PERCENT)
         elif device == 'cuda':
             memory_info = vram_stat()
             percent  = VRAM_USAGE_PERCENT
             available_key = 'free'
-            vid_memory_max_usage = VRAM_USAGE_PERCENT * memory_info['total'] * (1 - GPU_MEMORY_RESERVE_PERCENT)
         else:
             raise ValueError(f"Unsupported device type: {device}")
+
+        # Apply simulated memory cap (for testing with smaller devices)
+        if max_memory_bytes is not None and max_memory_bytes > 0:
+            real_total = memory_info['total']
+            real_used = real_total - memory_info[available_key]
+            sim_total = max_memory_bytes
+            sim_free = max(sim_total - real_used, 0)
+            memory_info = dict(memory_info)  # copy
+            memory_info['total'] = sim_total
+            memory_info[available_key] = sim_free
+            logger.debug(
+                f"Simulated memory cap: {max_memory_bytes / (1024**3):.1f} GB "
+                f"(real total: {real_total / (1024**3):.1f} GB, "
+                f"sim free: {sim_free / (1024**3):.1f} GB)"
+            )
 
         if type == 'video':
             available_bytes = memory_info[available_key] - VIDEO_INFERENCE_MB * 1024 ** 2
@@ -118,7 +152,8 @@ class MemoryManager:
             self, 
             video_file: str, 
             device: str = DEVICE.type, 
-            chunk_spread: Literal["even", "default"] = "default"
+            chunk_spread: Literal["even", "default"] = "default",
+            max_memory_bytes: int = None,
         ):
         # Placeholder for actual chunk planning logic
         logger.info(f"Planning memory chunks for video: {video_file}")
@@ -130,7 +165,10 @@ class MemoryManager:
         
         logger.info(f"Video info: {video_info}")
         
-        frames_per_chunk = self.compute_memory_safe_frames(video_info['width'], video_info['height'], device, type='video')
+        frames_per_chunk = self.compute_memory_safe_frames(
+            video_info['width'], video_info['height'], device, type='video',
+            max_memory_bytes=max_memory_bytes,
+        )
         
         fps = round(video_info.get('fps', 25))  # Default to 25 if FPS info is missing
         if frames_per_chunk == 0:

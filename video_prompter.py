@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import psutil
 from PIL import Image
 
 
@@ -138,10 +139,17 @@ def _extract_subclip(
 # Memory validation
 # ---------------------------------------------------------------------------
 
-def _validate_video_memory(video_path: Path, device: str) -> Dict[str, Any]:
+def _validate_video_memory(
+    video_path: Path, device: str, max_memory_bytes: int = None,
+) -> Dict[str, Any]:
     """Check if there is enough memory to process at least MIN_VIDEO_FRAMES.
 
     Returns a dict with memory stats, chunk plan, and ``can_process`` flag.
+
+    Parameters
+    ----------
+    max_memory_bytes : int, optional
+        Simulate a smaller device (for testing).
     """
     from sam3.memory_manager import MemoryManager
     from sam3.utils.helpers import ram_stat, vram_stat
@@ -159,7 +167,8 @@ def _validate_video_memory(video_path: Path, device: str) -> Dict[str, Any]:
 
     mm = MemoryManager()
     max_frames = mm.compute_memory_safe_frames(
-        video_info["width"], video_info["height"], device, type="video"
+        video_info["width"], video_info["height"], device, type="video",
+        max_memory_bytes=max_memory_bytes,
     )
 
     if device == "cuda":
@@ -170,6 +179,15 @@ def _validate_video_memory(video_path: Path, device: str) -> Dict[str, Any]:
         mem = ram_stat()
         pct = RAM_USAGE_PERCENT
         available = mem["available"]
+
+    # Apply simulated cap to the reported values
+    if max_memory_bytes is not None and max_memory_bytes > 0:
+        real_used = mem["total"] - available
+        sim_total = max_memory_bytes
+        sim_available = max(sim_total - real_used, 0)
+        mem = dict(mem)
+        mem["total"] = sim_total
+        available = sim_available
 
     info: Dict[str, Any] = {
         "video": str(video_path),
@@ -225,7 +243,8 @@ def _show_video_memory_table(info: Dict[str, Any]):
 # ---------------------------------------------------------------------------
 
 def _make_chunk_plan(
-    video_path: Path, device: str, chunk_spread: str = "default"
+    video_path: Path, device: str, chunk_spread: str = "default",
+    max_memory_bytes: int = None,
 ) -> tuple:
     """Create a memory-safe chunk plan.
 
@@ -234,7 +253,8 @@ def _make_chunk_plan(
     from sam3.memory_manager import memory_manager
 
     metadata, chunks = memory_manager.chunk_plan_video(
-        str(video_path), device=device, chunk_spread=chunk_spread
+        str(video_path), device=device, chunk_spread=chunk_spread,
+        max_memory_bytes=max_memory_bytes,
     )
     return metadata, chunks
 
@@ -396,6 +416,91 @@ def _save_chunk_masks(
 
 
 # ---------------------------------------------------------------------------
+# Intra-chunk monitoring helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_cpu_masks(result: dict) -> None:
+    """Convert any GPU tensors in result dict to CPU numpy arrays in-place.
+
+    This must be called before submitting results to the ``AsyncIOWorker``
+    to ensure the background thread can access the data safely after CUDA
+    memory is released.
+    """
+    for frame_data in result.values():
+        if frame_data is None:
+            continue
+        masks = frame_data.get("out_binary_masks")
+        if masks is not None and hasattr(masks, "cpu"):
+            frame_data["out_binary_masks"] = masks.cpu().numpy()
+        obj_ids = frame_data.get("out_obj_ids")
+        if obj_ids is not None and hasattr(obj_ids, "cpu"):
+            frame_data["out_obj_ids"] = obj_ids.cpu().numpy()
+
+
+def _propagate_with_monitoring(
+    driver,
+    session_id: str,
+    monitor,
+    propagation_direction: str = "both",
+) -> Tuple[dict, set, dict, bool]:
+    """Stream-process video propagation with per-frame memory monitoring.
+
+    Iterates through ``driver.propagate_in_video_streaming()`` frame by
+    frame, calling ``monitor.check()`` at each step.  If the monitor
+    signals a stop (memory pressure), the generator is broken and partial
+    results are returned.
+
+    Parameters
+    ----------
+    driver : Sam3VideoDriver
+        The loaded video driver.
+    session_id : str
+        Active session from ``driver.start_session()``.
+    monitor : IntraChunkMonitor
+        Pre-initialised monitor (call ``monitor.start()`` before this).
+    propagation_direction : str
+        ``"both"``, ``"forward"``, or ``"backward"``.
+
+    Returns
+    -------
+    result : dict
+        ``{frame_idx: outputs}`` for processed frames.
+    object_ids : set
+        All unique object IDs found.
+    frame_objects : dict
+        ``{frame_idx: [obj_ids]}`` per frame.
+    early_stopped : bool
+        ``True`` if monitor triggered an early stop.
+    """
+    from sam3.memory_optimizer import clear_memory
+
+    result = {}
+    object_ids = set()
+    frame_objects = {}
+    early_stopped = False
+
+    try:
+        for frame_idx, outputs, frame_obj_ids in driver.propagate_in_video_streaming(
+            session_id, propagation_direction=propagation_direction
+        ):
+            if not monitor.check(frame_idx):
+                early_stopped = True
+                break
+            result[frame_idx] = outputs
+            frame_objects[frame_idx] = frame_obj_ids
+            object_ids.update(frame_obj_ids)
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            early_stopped = True
+            monitor._stop_reason = "oom_exception"
+            clear_memory(monitor.device, full_gc=True)
+        else:
+            raise
+
+    return result, object_ids, frame_objects, early_stopped
+
+
+# ---------------------------------------------------------------------------
 # Stitching and overlay
 # ---------------------------------------------------------------------------
 
@@ -501,12 +606,18 @@ def _build_object_tracking(
     object_ids: set,
     fps: float,
     frame_offset: int = 0,
+    min_active_pixels: int = 50,
+    gap_tolerance: int = 2,
 ) -> List[Dict[str, Any]]:
     """Scan stitched mask videos and compute per-object presence info.
 
     For each object, determines **all intervals** where the mask is active
-    (>= 1 % of pixels), handling objects that appear, disappear, and
-    reappear multiple times.
+    (has at least *min_active_pixels* bright pixels), handling objects that
+    appear, disappear, and reappear multiple times.
+
+    Short gaps of up to *gap_tolerance* inactive frames between two active
+    regions are bridged so that tiny dips (e.g. from mp4 compression or a
+    single missed frame) do not fragment intervals.
 
     Args:
         mask_dir: Directory containing ``object_{id}_mask.mp4`` files.
@@ -514,12 +625,15 @@ def _build_object_tracking(
         fps: Video FPS (used for timestamp conversion).
         frame_offset: If a sub-clip was extracted, offset added to frame
             numbers so they refer to the *original* video's timeline.
+        min_active_pixels: Minimum number of pixels > 127 for a frame to
+            be considered "active".  Default 50 (≈ noise-only filter).
+        gap_tolerance: Maximum gap (in frames) between active frames that
+            will be bridged into a single interval.  Default 2.
 
     Returns:
         List of dicts, one per object, sorted by object ID.
     """
     tracking: List[Dict[str, Any]] = []
-    area_threshold = 0.01  # 1 % of frame area
 
     def _ts(sec: float) -> str:
         m, s = divmod(sec, 60)
@@ -532,6 +646,7 @@ def _build_object_tracking(
             tracking.append({
                 "object_id": oid,
                 "intervals": [],
+                "num_intervals": 0,
                 "total_frames_active": 0,
                 "total_frames": 0,
                 "total_duration_s": 0.0,
@@ -539,6 +654,10 @@ def _build_object_tracking(
                 "last_frame": None,
                 "first_timestamp": None,
                 "last_timestamp": None,
+                "first_timecode": None,
+                "last_timecode": None,
+                "mean_mask_area_pct": None,
+                "max_mask_area_pct": None,
             })
             continue
 
@@ -548,50 +667,41 @@ def _build_object_tracking(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_pixels = max(w * h, 1)
 
-        # Scan all frames to build a set of active frames
+        # Scan all frames — collect active frame indices and per-frame areas
         active_frames: List[int] = []
-        mask_area_by_frame: Dict[int, float] = {}
+        area_fractions: List[float] = []          # only for active frames
         for fidx in range(total):
             ret, frame = cap.read()
             if not ret:
                 break
             if frame.ndim == 3:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            active_px = (frame > 127).sum()
-            frac = active_px / total_pixels
-            if frac >= area_threshold:
+            active_px = int((frame > 127).sum())
+            if active_px >= min_active_pixels:
                 active_frames.append(fidx)
-                mask_area_by_frame[fidx] = round(frac, 6)
+                area_fractions.append(active_px / total_pixels)
         cap.release()
 
-        # Group active frames into contiguous intervals
-        # A gap of >1 frame starts a new interval
-        intervals: List[Dict[str, Any]] = []
+        # ----- Group active frames into intervals with gap tolerance -----
+        # Two active regions separated by <= gap_tolerance inactive frames
+        # are merged into one interval.
+        raw_intervals: List[tuple] = []           # (start, end) pairs
         if active_frames:
             iv_start = active_frames[0]
             iv_end = active_frames[0]
             for fidx in active_frames[1:]:
-                if fidx == iv_end + 1:
-                    iv_end = fidx  # extend current interval
+                if fidx <= iv_end + 1 + gap_tolerance:
+                    iv_end = fidx         # extend (possibly bridging a gap)
                 else:
-                    # Close current interval, start new one
-                    abs_s = iv_start + frame_offset
-                    abs_e = iv_end + frame_offset
-                    intervals.append({
-                        "start_frame": abs_s,
-                        "end_frame": abs_e,
-                        "start_time": round(abs_s / fps, 3),
-                        "end_time": round(abs_e / fps, 3),
-                        "start_timecode": _ts(abs_s / fps),
-                        "end_timecode": _ts(abs_e / fps),
-                        "duration_frames": abs_e - abs_s + 1,
-                        "duration_s": round((abs_e - abs_s + 1) / fps, 3),
-                    })
+                    raw_intervals.append((iv_start, iv_end))
                     iv_start = fidx
                     iv_end = fidx
-            # Close last interval
-            abs_s = iv_start + frame_offset
-            abs_e = iv_end + frame_offset
+            raw_intervals.append((iv_start, iv_end))
+
+        intervals: List[Dict[str, Any]] = []
+        for s, e in raw_intervals:
+            abs_s = s + frame_offset
+            abs_e = e + frame_offset
             intervals.append({
                 "start_frame": abs_s,
                 "end_frame": abs_e,
@@ -608,6 +718,9 @@ def _build_object_tracking(
         abs_last = (active_frames[-1] + frame_offset) if active_frames else None
         total_dur = round(active_count / fps, 3) if active_count else 0.0
 
+        mean_area = round(sum(area_fractions) / len(area_fractions) * 100, 4) if area_fractions else None
+        max_area = round(max(area_fractions) * 100, 4) if area_fractions else None
+
         entry: Dict[str, Any] = {
             "object_id": oid,
             "intervals": intervals,
@@ -621,6 +734,8 @@ def _build_object_tracking(
             "last_timestamp": round(abs_last / fps, 3) if abs_last is not None else None,
             "first_timecode": _ts(abs_first / fps) if abs_first is not None else None,
             "last_timecode": _ts(abs_last / fps) if abs_last is not None else None,
+            "mean_mask_area_pct": mean_area,
+            "max_mask_area_pct": max_area,
         }
 
         tracking.append(entry)
@@ -645,20 +760,53 @@ def _process_video(
     keep_temp: bool,
     frame_range: Optional[Tuple[int, int]] = None,
     time_range: Optional[Tuple[str, str]] = None,
+    max_vram_gb: Optional[float] = None,
+    max_ram_gb: Optional[float] = None,
 ):
-    """Full video processing pipeline."""
+    """Full video processing pipeline with adaptive dynamic chunking."""
     from datetime import datetime
     import torch
     from sam3.utils.ffmpeglib import ffmpeg_lib
     from sam3.utils.helpers import sanitize_filename
     from sam3.__globals import TEMP_DIR, DEFAULT_MIN_CHUNK_OVERLAP
     from sam3.utils.memory_sampler import MemorySampler
+    from sam3.memory_predictor import MemoryPredictor, StopLevel
+    from sam3.memory_optimizer import clear_memory, AdaptiveChunkManager, IntraChunkMonitor
+    from sam3.async_io import AsyncIOWorker
+
+    # Convert simulated limits to bytes
+    max_vram_bytes = int(max_vram_gb * 1024**3) if max_vram_gb else None
+    max_ram_bytes = int(max_ram_gb * 1024**3) if max_ram_gb else None
+
+    # ── Clear stale CUDA cache from any previous runs ──
+    clear_memory(device, full_gc=True)
 
     # ── Timing & memory instrumentation ──
     pipeline_start = time.time()
     pipeline_start_iso = datetime.now().isoformat()
     mem_sampler = MemorySampler(interval=1.0, device=device)
     mem_sampler.start()
+
+    # ── OOM predictor (async, non-blocking) ──
+    _oom_stop_requested = False
+
+    def _on_soft():
+        nonlocal _oom_stop_requested
+        print("\033[93m⚠ Memory warning: headroom < 20% — consider reducing chunk size\033[0m")
+
+    def _on_hard():
+        nonlocal _oom_stop_requested
+        _oom_stop_requested = True
+        print("\033[91m✗ Memory critical: headroom < 5% — requesting early stop\033[0m")
+
+    mem_predictor = MemoryPredictor(
+        device=device,
+        safety_factor=0.85,
+        on_soft_stop=_on_soft,
+        on_hard_stop=_on_hard,
+    )
+    mem_predictor.start()
+    frames_processed = 0  # running counter for record_frame
 
     video_name = video_path.stem
 
@@ -675,7 +823,11 @@ def _process_video(
         print(f"  Sub-clip: {video_path}  ({ef - sf + 1} frames)\n")
 
     # ----- Memory check -----
-    mem_info = _validate_video_memory(video_path, device)
+    # Use simulated VRAM limit if testing with a smaller GPU
+    _mem_cap = max_vram_bytes if device == "cuda" else max_ram_bytes
+    mem_info = _validate_video_memory(video_path, device, max_memory_bytes=_mem_cap)
+    if _mem_cap:
+        mem_info["simulated_limit_gb"] = round(_mem_cap / (1024**3), 1)
     _show_video_memory_table(mem_info)
     print()
 
@@ -686,9 +838,22 @@ def _process_video(
 
     # ----- Chunk plan -----
     print("Creating chunk plan...")
-    video_metadata, chunk_list = _make_chunk_plan(video_path, device, chunk_spread)
+    video_metadata, chunk_list = _make_chunk_plan(
+        video_path, device, chunk_spread, max_memory_bytes=_mem_cap,
+    )
+    initial_chunk_size = mem_info.get("max_frames_per_chunk", 200)
     n_chunks = len(chunk_list)
-    print(f"  {n_chunks} chunk(s), {mem_info.get('max_frames_per_chunk', '?')} frames/chunk")
+    print(f"  {n_chunks} chunk(s), {initial_chunk_size} frames/chunk")
+
+    # ----- Adaptive chunk manager -----
+    adaptive = AdaptiveChunkManager(
+        initial_chunk_size=initial_chunk_size,
+        device=device,
+        vram_limit_bytes=max_vram_bytes,
+        ram_limit_bytes=max_ram_bytes,
+    )
+    if _mem_cap:
+        print(f"  Simulated memory limit: {_mem_cap / (1024**3):.1f} GB")
     print()
 
     # ----- Directories -----
@@ -714,6 +879,11 @@ def _process_video(
     driver = Sam3VideoDriver(device=device)
     model_load_s = round(time.time() - t_model_start, 3)
     print(f"Model loaded in {model_load_s:.1f}s.\n")
+    mem_predictor.record_frame(0)  # baseline after model load
+
+    # ----- Async I/O worker for overlapping writes -----
+    async_worker = AsyncIOWorker()
+    async_worker.start()
 
     # ----- Validate mask dimensions (if masks provided) -----
     if mask_paths:
@@ -739,21 +909,36 @@ def _process_video(
     chunk_meta_list: List[Dict[str, Any]] = []
     cross_chunk_iou: Dict[str, Dict[str, Any]] = {}
 
+    total_frames_in_video = video_metadata.get("nb_frames", 0)
+
     t_chunks_start = time.time()
 
-    for ci, cinfo in enumerate(chunk_list):
-        chunk_id = cinfo["chunk"]
+    # ── Dynamic chunk loop with OOM recovery ──
+    # Instead of iterating a fixed list, we maintain a cursor and can
+    # replan remaining chunks after each chunk completes (or on OOM).
+    ci = 0  # chunk counter
+    chunk_cursor = 0  # index into chunk_list
+
+    while chunk_cursor < len(chunk_list):
+        # ── OOM predictor: check if we should bail ──
+        if _oom_stop_requested:
+            print(f"\033[91m✗ Stopping after chunk {ci} — OOM predictor triggered hard stop\033[0m")
+            break
+
+        cinfo = chunk_list[chunk_cursor]
+        chunk_id = ci
         start_frame = cinfo["start"]
         end_frame = cinfo["end"]
+        current_chunk_frames = end_frame - start_frame + 1
         t_chunk_start = time.time()
 
-        print(f"── Chunk {ci + 1}/{n_chunks} (frames {start_frame}–{end_frame}) ──")
+        print(f"── Chunk {ci + 1}/{len(chunk_list)} (frames {start_frame}–{end_frame}, size={current_chunk_frames}) ──")
 
         chunk_dir = chunks_dir / f"chunk_{chunk_id}"
         chunk_dir.mkdir(exist_ok=True)
 
         # Extract chunk video
-        if n_chunks == 1:
+        if len(chunk_list) == 1 and chunk_cursor == 0:
             chunk_video = video_path  # use original
         else:
             chunk_video = chunk_dir / f"chunk_{chunk_id}.mp4"
@@ -766,10 +951,21 @@ def _process_video(
         chunk_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
 
+        # Reset peak memory stats for this chunk
+        if device.startswith("cuda"):
+            import torch as _t
+            if _t.cuda.is_available():
+                _t.cuda.reset_peak_memory_stats()
+
         # Start session
         session_id = driver.start_session(video_path=str(chunk_video))
 
         chunk_objects: Dict[str, Any] = {}  # per-prompt objects for this chunk
+        chunk_n_objects = 0  # total objects across all prompts
+        _chunk_oom = False  # flag for OOM during this chunk
+        _chunk_early_stop = False  # flag for proactive early stop
+        _early_stop_monitor = None  # monitor that triggered early stop
+        _chunk_monitor_results: List[Dict] = []  # monitor metadata per prompt
 
         try:
             # ----- Text prompts -----
@@ -781,9 +977,35 @@ def _process_video(
                     driver.reset_session(session_id)
                     driver.add_prompt(session_id, prompt)
 
-                    result, obj_ids, frame_objs = driver.propagate_in_video(
-                        session_id, propagation_direction="both"
+                    # ── Monitored streaming propagation ──
+                    expected_iters = chunk_frames * 2  # "both" → forward + backward
+                    monitor = IntraChunkMonitor(
+                        expected_iterations=expected_iters,
+                        device=device,
+                        vram_limit_bytes=max_vram_bytes,
                     )
+                    monitor.start()
+
+                    result, obj_ids, frame_objs, early_stopped = _propagate_with_monitoring(
+                        driver, session_id, monitor, propagation_direction="both"
+                    )
+                    _chunk_monitor_results.append(monitor.to_dict())
+
+                    if early_stopped:
+                        mon_result = monitor.finalize()
+                        if mon_result.stop_reason == "oom_exception":
+                            _chunk_oom = True
+                            print(f"\033[91m    ✗ CUDA OOM during '{prompt}' propagation\033[0m")
+                        else:
+                            _chunk_early_stop = True
+                            _early_stop_monitor = monitor
+                            print(f"\033[93m    ⚠ Proactive stop during '{prompt}': "
+                                  f"{mon_result.stop_reason} at iter {mon_result.iterations_completed}/{expected_iters}\033[0m")
+                        clear_memory(device, full_gc=True)
+                        break
+
+                    frames_processed += chunk_frames
+                    mem_predictor.record_frame(frames_processed)
 
                     prev_masks = carry.get(prompt, {})
                     gnid = global_next_ids.get(prompt, 0)
@@ -804,6 +1026,7 @@ def _process_video(
 
                     # Track all IDs
                     all_object_ids.setdefault(prompt, set()).update(obj_ids)
+                    chunk_n_objects += len(obj_ids)
 
                     chunk_objects[prompt] = {
                         "object_ids": sorted(obj_ids),
@@ -811,10 +1034,12 @@ def _process_video(
                         "id_mapping": {str(k): v for k, v in mapping.items()},
                     }
 
-                    # Save masks
+                    # Save masks (async — overlap I/O with next prompt's GPU work)
                     masks_dir = chunk_dir / "masks" / safe
                     masks_dir.mkdir(parents=True, exist_ok=True)
-                    _save_chunk_masks(
+                    _ensure_cpu_masks(result)
+                    async_worker.submit(
+                        _save_chunk_masks,
                         result, obj_ids, masks_dir,
                         video_metadata["width"], video_metadata["height"],
                         chunk_frames,
@@ -824,8 +1049,12 @@ def _process_video(
                     carry[prompt] = _extract_last_frame_masks(result, obj_ids)
                     print(f"    {len(obj_ids)} object(s)")
 
+                    # Free result tensors so GPU memory is available for next prompt
+                    del result, obj_ids, frame_objs, mapping, iou_mat
+                    clear_memory(device, full_gc=False)
+
             # ----- Point prompts -----
-            if points:
+            if points and not _chunk_oom and not _chunk_early_stop:
                 prompt_key = "__points__"
                 safe = "points"
                 vid_info = video_metadata
@@ -844,44 +1073,77 @@ def _process_video(
                         point_labels=[lbl],
                     )
 
-                result, obj_ids, frame_objs = driver.propagate_in_video(
-                    session_id, propagation_direction="both"
+                # ── Monitored streaming propagation ──
+                expected_iters = chunk_frames * 2
+                monitor = IntraChunkMonitor(
+                    expected_iterations=expected_iters,
+                    device=device,
+                    vram_limit_bytes=max_vram_bytes,
                 )
+                monitor.start()
 
-                prev_masks = carry.get(prompt_key, {})
-                gnid = global_next_ids.get(prompt_key, 0)
-                result, obj_ids, mapping, gnid, iou_mat = _match_and_remap(
-                    result, obj_ids, prev_masks, gnid
+                result, obj_ids, frame_objs, early_stopped = _propagate_with_monitoring(
+                    driver, session_id, monitor, propagation_direction="both"
                 )
-                global_next_ids[prompt_key] = gnid
-                all_object_ids.setdefault(prompt_key, set()).update(obj_ids)
+                _chunk_monitor_results.append(monitor.to_dict())
 
-                if iou_mat and ci > 0:
-                    key = f"chunk_{ci-1}_to_{ci}"
-                    cross_chunk_iou.setdefault(key, {})[prompt_key] = {
-                        "matrix": {str(k): {str(pk): v for pk, v in row.items()} for k, row in iou_mat.items()},
-                        "matched": {str(k): v for k, v in mapping.items()},
-                        "threshold": 0.25,
+                if early_stopped:
+                    mon_result = monitor.finalize()
+                    if mon_result.stop_reason == "oom_exception":
+                        _chunk_oom = True
+                        print(f"\033[91m    ✗ CUDA OOM during points propagation\033[0m")
+                    else:
+                        _chunk_early_stop = True
+                        _early_stop_monitor = monitor
+                        print(f"\033[93m    ⚠ Proactive stop during points: "
+                              f"{mon_result.stop_reason} at iter {mon_result.iterations_completed}/{expected_iters}\033[0m")
+                    clear_memory(device, full_gc=True)
+
+                if not _chunk_oom and not _chunk_early_stop:
+                    frames_processed += chunk_frames
+                    mem_predictor.record_frame(frames_processed)
+
+                    prev_masks = carry.get(prompt_key, {})
+                    gnid = global_next_ids.get(prompt_key, 0)
+                    result, obj_ids, mapping, gnid, iou_mat = _match_and_remap(
+                        result, obj_ids, prev_masks, gnid
+                    )
+                    global_next_ids[prompt_key] = gnid
+                    all_object_ids.setdefault(prompt_key, set()).update(obj_ids)
+                    chunk_n_objects += len(obj_ids)
+
+                    if iou_mat and ci > 0:
+                        key = f"chunk_{ci-1}_to_{ci}"
+                        cross_chunk_iou.setdefault(key, {})[prompt_key] = {
+                            "matrix": {str(k): {str(pk): v for pk, v in row.items()} for k, row in iou_mat.items()},
+                            "matched": {str(k): v for k, v in mapping.items()},
+                            "threshold": 0.25,
+                        }
+
+                    chunk_objects[prompt_key] = {
+                        "object_ids": sorted(obj_ids),
+                        "num_objects": len(obj_ids),
+                        "id_mapping": {str(k): v for k, v in mapping.items()},
                     }
 
-                chunk_objects[prompt_key] = {
-                    "object_ids": sorted(obj_ids),
-                    "num_objects": len(obj_ids),
-                    "id_mapping": {str(k): v for k, v in mapping.items()},
-                }
+                    masks_dir = chunk_dir / "masks" / safe
+                    masks_dir.mkdir(parents=True, exist_ok=True)
+                    _ensure_cpu_masks(result)
+                    async_worker.submit(
+                        _save_chunk_masks,
+                        result, obj_ids, masks_dir,
+                        vid_info["width"], vid_info["height"],
+                        chunk_frames,
+                    )
+                    carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
+                    print(f"    {len(obj_ids)} object(s)")
 
-                masks_dir = chunk_dir / "masks" / safe
-                masks_dir.mkdir(parents=True, exist_ok=True)
-                _save_chunk_masks(
-                    result, obj_ids, masks_dir,
-                    vid_info["width"], vid_info["height"],
-                    chunk_frames,
-                )
-                carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
-                print(f"    {len(obj_ids)} object(s)")
+                    # Free result tensors so GPU memory is available for next prompt
+                    del result, obj_ids, frame_objs, mapping, iou_mat
+                    clear_memory(device, full_gc=False)
 
             # ----- Mask prompts -----
-            if mask_paths:
+            if mask_paths and not _chunk_oom and not _chunk_early_stop:
                 prompt_key = "__masks__"
                 safe = "masks"
                 vid_info = video_metadata
@@ -899,44 +1161,193 @@ def _process_video(
 
                 driver.inject_masks(session_id, frame_idx=0, masks=mask_dict, object_ids=obj_id_list)
 
-                result, obj_ids, frame_objs = driver.propagate_in_video(
-                    session_id, propagation_direction="both"
+                # ── Monitored streaming propagation ──
+                expected_iters = chunk_frames * 2
+                monitor = IntraChunkMonitor(
+                    expected_iterations=expected_iters,
+                    device=device,
+                    vram_limit_bytes=max_vram_bytes,
                 )
+                monitor.start()
 
-                prev_masks_cf = carry.get(prompt_key, {})
-                gnid = global_next_ids.get(prompt_key, 0)
-                result, obj_ids, mapping, gnid, iou_mat = _match_and_remap(
-                    result, obj_ids, prev_masks_cf, gnid
+                result, obj_ids, frame_objs, early_stopped = _propagate_with_monitoring(
+                    driver, session_id, monitor, propagation_direction="both"
                 )
-                global_next_ids[prompt_key] = gnid
-                all_object_ids.setdefault(prompt_key, set()).update(obj_ids)
+                _chunk_monitor_results.append(monitor.to_dict())
 
-                if iou_mat and ci > 0:
-                    key = f"chunk_{ci-1}_to_{ci}"
-                    cross_chunk_iou.setdefault(key, {})[prompt_key] = {
-                        "matrix": {str(k): {str(pk): v for pk, v in row.items()} for k, row in iou_mat.items()},
-                        "matched": {str(k): v for k, v in mapping.items()},
-                        "threshold": 0.25,
+                if early_stopped:
+                    mon_result = monitor.finalize()
+                    if mon_result.stop_reason == "oom_exception":
+                        _chunk_oom = True
+                        print(f"\033[91m    ✗ CUDA OOM during mask propagation\033[0m")
+                    else:
+                        _chunk_early_stop = True
+                        _early_stop_monitor = monitor
+                        print(f"\033[93m    ⚠ Proactive stop during masks: "
+                              f"{mon_result.stop_reason} at iter {mon_result.iterations_completed}/{expected_iters}\033[0m")
+                    clear_memory(device, full_gc=True)
+
+                if not _chunk_oom and not _chunk_early_stop:
+                    frames_processed += chunk_frames
+                    mem_predictor.record_frame(frames_processed)
+
+                    prev_masks_cf = carry.get(prompt_key, {})
+                    gnid = global_next_ids.get(prompt_key, 0)
+                    result, obj_ids, mapping, gnid, iou_mat = _match_and_remap(
+                        result, obj_ids, prev_masks_cf, gnid
+                    )
+                    global_next_ids[prompt_key] = gnid
+                    all_object_ids.setdefault(prompt_key, set()).update(obj_ids)
+                    chunk_n_objects += len(obj_ids)
+
+                    if iou_mat and ci > 0:
+                        key = f"chunk_{ci-1}_to_{ci}"
+                        cross_chunk_iou.setdefault(key, {})[prompt_key] = {
+                            "matrix": {str(k): {str(pk): v for pk, v in row.items()} for k, row in iou_mat.items()},
+                            "matched": {str(k): v for k, v in mapping.items()},
+                            "threshold": 0.25,
+                        }
+
+                    chunk_objects[prompt_key] = {
+                        "object_ids": sorted(obj_ids),
+                        "num_objects": len(obj_ids),
+                        "id_mapping": {str(k): v for k, v in mapping.items()},
                     }
 
-                chunk_objects[prompt_key] = {
-                    "object_ids": sorted(obj_ids),
-                    "num_objects": len(obj_ids),
-                    "id_mapping": {str(k): v for k, v in mapping.items()},
-                }
+                    masks_dir = chunk_dir / "masks" / safe
+                    masks_dir.mkdir(parents=True, exist_ok=True)
+                    _ensure_cpu_masks(result)
+                    async_worker.submit(
+                        _save_chunk_masks,
+                        result, obj_ids, masks_dir,
+                        vid_info["width"], vid_info["height"],
+                        chunk_frames,
+                    )
+                    carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
+                    print(f"    {len(obj_ids)} object(s)")
 
-                masks_dir = chunk_dir / "masks" / safe
-                masks_dir.mkdir(parents=True, exist_ok=True)
-                _save_chunk_masks(
-                    result, obj_ids, masks_dir,
-                    vid_info["width"], vid_info["height"],
-                    chunk_frames,
-                )
-                carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
-                print(f"    {len(obj_ids)} object(s)")
+                    # Free result tensors
+                    del result, obj_ids, frame_objs, mapping, iou_mat
+                    clear_memory(device, full_gc=False)
 
         finally:
             driver.close_session(session_id)
+
+        # ── Measure peak memory for this chunk ──
+        peak_vram = 0
+        peak_ram = 0
+        if device.startswith("cuda"):
+            import torch as _t
+            if _t.cuda.is_available():
+                peak_vram = _t.cuda.max_memory_allocated()
+        try:
+            peak_ram = psutil.Process().memory_info().rss
+        except Exception:
+            pass
+
+        # ── Handle OOM: rechunk remaining frames with smaller chunks ──
+        if _chunk_oom:
+            print(f"\033[93m  ⚠ OOM on chunk {ci + 1} (size={current_chunk_frames}). "
+                  f"Reducing chunk size and replanning...\033[0m")
+            try:
+                new_size = adaptive.handle_oom(chunk_id, current_chunk_frames)
+            except RuntimeError as exc:
+                print(f"\033[91m  ✗ {exc}\033[0m")
+                break
+            # Replan from this chunk's start_frame with reduced size
+            adaptive.current_chunk_size = new_size
+            new_chunks = adaptive.replan_remaining(
+                start_frame, total_frames_in_video, overlap
+            )
+            if not new_chunks:
+                print(f"\033[91m  ✗ No viable chunks after OOM reduction\033[0m")
+                break
+            # Replace remaining chunk_list
+            chunk_list = chunk_list[:chunk_cursor] + new_chunks
+            n_chunks = len(chunk_list)
+            print(f"  Replanned: {len(new_chunks)} chunk(s) remaining, "
+                  f"new chunk size = {new_size} frames")
+            # Don't advance chunk_cursor — retry from same position
+            ci += 1  # but increment chunk counter for directory naming
+            continue
+
+        # ── Handle proactive early stop: use calibration for smart replan ──
+        if _chunk_early_stop and _early_stop_monitor is not None:
+            mon_result = _early_stop_monitor.finalize()
+            cal = mon_result.calibration
+
+            # Use calibration to pick a safe chunk size
+            if cal and cal.safe_iterations > 0:
+                # safe_iterations is for total iterations; "both" = 2× frames
+                safe_frames = cal.safe_iterations // 2
+                safe_frames = int(safe_frames * 0.8)  # 80% safety margin
+            else:
+                safe_frames = current_chunk_frames // 2  # fallback: halve
+
+            safe_frames = max(safe_frames, adaptive.min_chunk_frames)
+
+            print(f"\033[93m  ⚠ Proactive stop on chunk {ci + 1}: {mon_result.stop_reason}. "
+                  f"Calibration → {safe_frames} frames/chunk (was {current_chunk_frames})\033[0m")
+
+            adaptive.current_chunk_size = safe_frames
+            adaptive.rechunk_events.append({
+                "chunk_id": chunk_id,
+                "from_size": current_chunk_frames,
+                "to_size": safe_frames,
+                "reason": f"proactive_{mon_result.stop_reason}",
+                "calibration": {
+                    "growth_rate_mb": round(cal.growth_rate_per_iter / (1024**2), 3) if cal else None,
+                    "safe_iters": cal.safe_iterations if cal else None,
+                    "confidence": cal.confidence if cal else None,
+                },
+            })
+
+            # Replan from this chunk's start_frame with calibrated size
+            new_chunks = adaptive.replan_remaining(
+                start_frame, total_frames_in_video, overlap
+            )
+            if not new_chunks:
+                print(f"\033[91m  ✗ No viable chunks after proactive resizing\033[0m")
+                break
+            chunk_list = chunk_list[:chunk_cursor] + new_chunks
+            n_chunks = len(chunk_list)
+            print(f"  Replanned: {len(new_chunks)} chunk(s) remaining, "
+                  f"new chunk size = {safe_frames} frames")
+            ci += 1
+            continue
+
+        # ── Adaptive sizing: evaluate pressure and adjust for next chunk ──
+        rec = adaptive.record_chunk(
+            chunk_id=chunk_id,
+            chunk_size=current_chunk_frames,
+            peak_vram_bytes=peak_vram,
+            peak_ram_bytes=peak_ram,
+            n_objects=chunk_n_objects,
+        )
+
+        if rec.action == "SHRINK":
+            print(f"\033[93m  ⚠ Memory pressure {rec.pressure} "
+                  f"({rec.vram_usage_pct:.0f}% of limit). "
+                  f"Reducing next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m")
+            # Replan remaining chunks with smaller size
+            next_start = end_frame + 1 - overlap
+            if next_start < total_frames_in_video:
+                new_chunks = adaptive.replan_remaining(
+                    next_start, total_frames_in_video, overlap
+                )
+                chunk_list = chunk_list[:chunk_cursor + 1] + new_chunks
+                n_chunks = len(chunk_list)
+                print(f"  Replanned: {len(new_chunks)} chunk(s) remaining")
+        elif rec.action == "GROW":
+            print(f"\033[92m  ↑ Under-utilised ({rec.vram_usage_pct:.0f}% of limit). "
+                  f"Growing next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m")
+            next_start = end_frame + 1 - overlap
+            if next_start < total_frames_in_video:
+                new_chunks = adaptive.replan_remaining(
+                    next_start, total_frames_in_video, overlap
+                )
+                chunk_list = chunk_list[:chunk_cursor + 1] + new_chunks
+                n_chunks = len(chunk_list)
 
         chunk_dur = round(time.time() - t_chunk_start, 3)
         chunk_timing.append({
@@ -944,6 +1355,12 @@ def _process_video(
             "frames": chunk_frames,
             "duration_s": chunk_dur,
             "s_per_frame": round(chunk_dur / max(chunk_frames, 1), 3),
+            "peak_vram_mb": round(peak_vram / (1024**2), 1),
+            "peak_ram_mb": round(peak_ram / (1024**2), 1),
+            "n_objects": chunk_n_objects,
+            "pressure": rec.pressure,
+            "action": rec.action,
+            "intra_chunk_monitors": _chunk_monitor_results,
         })
         chunk_meta_list.append({
             "chunk_id": chunk_id,
@@ -953,11 +1370,29 @@ def _process_video(
             "end_frame_original": end_frame + frame_offset,
             "total_frames": chunk_frames,
             "processing_time_s": chunk_dur,
+            "peak_vram_mb": round(peak_vram / (1024**2), 1),
+            "peak_ram_mb": round(peak_ram / (1024**2), 1),
+            "n_objects": chunk_n_objects,
+            "memory_pressure": rec.pressure,
+            "adaptive_action": rec.action,
+            "next_chunk_size": rec.adjusted_chunk_size,
             "objects_by_prompt": chunk_objects,
+            "intra_chunk_monitors": _chunk_monitor_results,
         })
-        print(f"  Chunk {ci + 1} done in {chunk_dur:.1f}s ({chunk_dur / max(chunk_frames, 1):.2f} s/frame)\n")
+        print(f"  Chunk {ci + 1} done in {chunk_dur:.1f}s "
+              f"({chunk_dur / max(chunk_frames, 1):.2f} s/frame, "
+              f"peak VRAM: {peak_vram / (1024**2):.0f} MB, "
+              f"pressure: {rec.pressure})\n")
+
+        chunk_cursor += 1
+        ci += 1
 
     chunk_processing_s = round(time.time() - t_chunks_start, 3)
+
+    # ----- Drain async I/O before stitching -----
+    io_errors = async_worker.drain()
+    if io_errors:
+        print(f"\033[93m  ⚠ {io_errors} async I/O error(s) during mask writing\033[0m")
 
     # ----- Stitch masks and create overlay -----
     print("Stitching masks...")
@@ -1007,6 +1442,7 @@ def _process_video(
 
     # ----- Cleanup -----
     driver.cleanup()
+    async_worker.shutdown()
 
     if keep_temp:
         dest = video_output / "temp_files"
@@ -1017,9 +1453,11 @@ def _process_video(
     if temp_base.exists():
         shutil.rmtree(temp_base)
 
-    # ── Stop memory sampler ──
+    # ── Stop memory sampler & predictor ──
     mem_sampler.stop()
     mem_summary = mem_sampler.summary()
+    mem_predictor.stop()
+    predictor_summary = mem_predictor.summary()
 
     # ── Timing summary ──
     pipeline_end = time.time()
@@ -1042,8 +1480,11 @@ def _process_video(
         pass
 
     # ----- Save enriched final metadata -----
+    adaptive_summary = adaptive.to_dict()
+    async_io_summary = async_worker.to_dict()
+
     final_meta = {
-        "schema_version": "2.0.0",
+        "schema_version": "2.2.0",
         "sam3_version": sam3_version,
         "video": str(original_video),
         "video_name": video_name,
@@ -1061,7 +1502,12 @@ def _process_video(
         "points": points,
         "mask_paths": [str(p) for p in mask_paths] if mask_paths else None,
         "num_chunks": n_chunks,
+        "num_chunks_processed": ci,
         "overlap_frames": overlap,
+        "simulated_limits": {
+            "max_vram_gb": max_vram_gb,
+            "max_ram_gb": max_ram_gb,
+        } if (max_vram_gb or max_ram_gb) else None,
         "timing": {
             "pipeline_start": pipeline_start_iso,
             "pipeline_end": pipeline_end_iso,
@@ -1076,8 +1522,11 @@ def _process_video(
             "pre_run": mem_info,
             **mem_summary,
         },
+        "adaptive_chunking": adaptive_summary,
+        "async_io": async_io_summary,
         "chunks": chunk_meta_list,
         "cross_chunk_iou": cross_chunk_iou if cross_chunk_iou else None,
+        "memory_predictor": predictor_summary,
         "objects": objects_tracking,
     }
     with open(video_output / "metadata.json", "w") as f:
@@ -1093,10 +1542,21 @@ def _process_video(
         with open(meta_dir / "object_tracking.json", "w") as f:
             json.dump(objects_tracking, f, indent=2, default=str)
 
+    # Save memory predictor data separately for analysis
+    with open(meta_dir / "memory_predictor.json", "w") as f:
+        json.dump(predictor_summary, f, indent=2, default=str)
+
+    # Save adaptive chunking data separately for analysis
+    with open(meta_dir / "adaptive_chunking.json", "w") as f:
+        json.dump(adaptive_summary, f, indent=2, default=str)
+
     print()
     print("=" * 70)
     print(f"  ✓ Video processing complete → {video_output}")
     print(f"    Total: {total_s:.1f}s  (model: {model_load_s:.1f}s, chunks: {chunk_processing_s:.1f}s, stitch: {stitching_s:.1f}s)")
+    if adaptive.rechunk_events:
+        print(f"    Adaptive rechunks: {len(adaptive.rechunk_events)}  "
+              f"(initial: {adaptive.initial_chunk_size}, final: {adaptive.current_chunk_size} frames/chunk)")
     print("=" * 70)
 
 
@@ -1161,6 +1621,14 @@ Examples:
     parser.add_argument(
         "--time-range", nargs=2, type=str, metavar=("START", "END"),
         help="Process a time segment (seconds, MM:SS, or HH:MM:SS)",
+    )
+    parser.add_argument(
+        "--max-vram-gb", type=float, default=None,
+        help="Simulate a smaller GPU by capping VRAM (GB). For testing adaptive chunking.",
+    )
+    parser.add_argument(
+        "--max-ram-gb", type=float, default=None,
+        help="Simulate a smaller system by capping RAM (GB). For testing adaptive chunking.",
     )
 
     args = parser.parse_args()
@@ -1230,6 +1698,10 @@ Examples:
     print(f"  Output  : {args.output}")
     print(f"  Alpha   : {args.alpha}")
     print(f"  Chunking: {args.chunk_spread}")
+    if args.max_vram_gb:
+        print(f"  Max VRAM: {args.max_vram_gb} GB (simulated)")
+    if args.max_ram_gb:
+        print(f"  Max RAM : {args.max_ram_gb} GB (simulated)")
     print("=" * 70)
     print()
 
@@ -1246,6 +1718,8 @@ Examples:
         keep_temp=args.keep_temp,
         frame_range=tuple(args.frame_range) if args.frame_range else None,
         time_range=tuple(args.time_range) if args.time_range else None,
+        max_vram_gb=args.max_vram_gb,
+        max_ram_gb=args.max_ram_gb,
     )
 
 

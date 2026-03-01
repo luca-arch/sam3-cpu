@@ -196,7 +196,7 @@ class TestIDRemapping:
                 "out_binary_masks": [_make_mask(), _make_mask(), _make_mask()],
             }
         }
-        remapped, new_ids, mapping, next_id = cp._match_and_remap_ids(
+        remapped, new_ids, mapping, next_id, _iou = cp._match_and_remap_ids(
             result_prompt,
             object_ids={0, 1, 2},
             prev_masks={},
@@ -225,7 +225,7 @@ class TestIDRemapping:
                 "out_binary_masks": [(mask_a > 0), (mask_b > 0)],
             }
         }
-        _, _, mapping, _ = cp._match_and_remap_ids(
+        _, _, mapping, _, _iou = cp._match_and_remap_ids(
             result_prompt,
             object_ids={0, 1},
             prev_masks=prev_masks,
@@ -252,7 +252,7 @@ class TestIDRemapping:
                 "out_binary_masks": [new_mask],
             }
         }
-        _, _, mapping, next_id = cp._match_and_remap_ids(
+        _, _, mapping, next_id, _iou = cp._match_and_remap_ids(
             result_prompt,
             object_ids={0},
             prev_masks=prev_masks,

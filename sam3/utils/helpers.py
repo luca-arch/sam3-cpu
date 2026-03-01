@@ -67,7 +67,28 @@ def sanitize_filename(filename: str, replacement: str = "-") -> str:
     return filename
 
 def vram_stat():
-    """Get VRAM usage statistics using nvidia-smi."""
+    """Get VRAM usage statistics.
+    
+    Uses ``torch.cuda.mem_get_info`` when available (zero-overhead, no
+    subprocess).  Falls back to nvidia-smi only if torch is not importable
+    or CUDA is not available.
+    """
+    # Prefer torch.cuda — it reads cached CUDA driver counters (near zero cost)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info(0)
+            used = total - free
+            return {
+                'total': total,
+                'used': used,
+                'free': free,
+                'percent': round((used / total) * 100, 2) if total else 0,
+            }
+    except Exception:
+        pass
+
+    # Fallback: nvidia-smi subprocess (slower, but works without torch)
     try:
         output = run_cmd([
             "nvidia-smi",

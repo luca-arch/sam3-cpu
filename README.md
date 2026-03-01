@@ -33,6 +33,7 @@
   - [video\_prompter.py](#video_prompterpy)
 - [Python API](#python-api)
 - [Video Chunking](#video-chunking)
+  - [Memory Management Architecture](#memory-management-architecture)
 - [Output Structure](#output-structure)
 - [Metadata Reference](#metadata-reference)
   - [Schema Version](#schema-version)
@@ -393,6 +394,86 @@ results back together.
 | `min_frames` | 25 | Minimum frames per chunk |
 | `chunk_overlap` | 1 | Overlap frames between chunks (`DEFAULT_MIN_CHUNK_OVERLAP` in `__globals.py`) |
 | `CHUNK_MASK_MATCHING_IOU_THRESHOLD` | 0.75 | IoU threshold for cross-chunk ID matching |
+
+### Memory Management Architecture
+
+SAM3 uses a **two-tier adaptive memory management system** that combines
+proactive intra-chunk monitoring with reactive inter-chunk adaptation:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    VIDEO PROCESSING PIPELINE                     │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │  Tier 1: IntraChunkMonitor (proactive, per-frame)        │  │
+│   │                                                          │  │
+│   │  Phase 1 — CALIBRATE (first 5 frames)                    │  │
+│   │  ├─ Sample VRAM after each frame                         │  │
+│   │  ├─ Fit linear growth model (slope, R²)                  │  │
+│   │  └─ Predict safe frame count                             │  │
+│   │                                                          │  │
+│   │  Phase 2 — PROGRESSIVE CHECKPOINTS                       │  │
+│   │  ├─ Check at N/2, 3N/4, 7N/8, … iterations              │  │
+│   │  ├─ Verify predictions against observed data             │  │
+│   │  └─ ~10µs overhead per checkpoint                        │  │
+│   │                                                          │  │
+│   │  Phase 3 — HARD STOP (≥ 95% VRAM)                       │  │
+│   │  ├─ Immediate propagation halt                           │  │
+│   │  ├─ Use calibration for smart replan                     │  │
+│   │  └─ Resume from stop point in next chunk                 │  │
+│   │                                                          │  │
+│   │  Overhead: ~50ns/frame + ~10µs/checkpoint                │  │
+│   └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │  Tier 2: AdaptiveChunkManager (reactive, post-chunk)     │  │
+│   │                                                          │  │
+│   │  After each chunk completes:                             │  │
+│   │  ├─ Classify pressure: NORMAL / ELEVATED / WARNING /     │  │
+│   │  │   CRITICAL based on peak VRAM usage                   │  │
+│   │  ├─ SHRINK chunk size if WARNING or CRITICAL             │  │
+│   │  ├─ GROW chunk size if under-utilised (< 50%)            │  │
+│   │  └─ CONTINUE if NORMAL or ELEVATED                       │  │
+│   │                                                          │  │
+│   │  OOM recovery (safety net):                              │  │
+│   │  ├─ 40% aggressive reduction on actual OOM               │  │
+│   │  ├─ Max 3 consecutive retries                            │  │
+│   │  └─ Falls back if proactive monitoring misses            │  │
+│   └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │  Async I/O Pipeline                                      │  │
+│   │                                                          │  │
+│   │  ┌──────────┐  submit()  ┌───────────────┐              │  │
+│   │  │ GPU      │──────────>│ AsyncIOWorker  │              │  │
+│   │  │ Compute  │           │ (1 thread)     │              │  │
+│   │  │          │  overlap  │                │              │  │
+│   │  │ Next     │<────────>│ Write masks    │              │  │
+│   │  │ prompt   │           │ Write JSON     │              │  │
+│   │  └──────────┘  drain()  └───────────────┘              │  │
+│   │                before stitching                          │  │
+│   └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key files:**
+
+| Module | Purpose |
+|---|---|
+| `sam3/memory_optimizer.py` | `IntraChunkMonitor`, `AdaptiveChunkManager`, memory utilities |
+| `sam3/async_io.py` | `AsyncIOWorker` — background thread for disk writes |
+| `sam3/memory_manager.py` | Static chunk planning (`compute_memory_safe_frames`) |
+| `sam3/memory_predictor.py` | Background OOM predictor (soft/hard stop callbacks) |
+| `video_prompter.py` | Main processing pipeline integrating all components |
+
+**Memory pressure thresholds:**
+
+| Level | Usage % | Action |
+|---|---|---|
+| NORMAL | < 60% | May grow chunk size |
+| ELEVATED | 60–80% | Keep current size |
+| WARNING | 80–90% | Reduce chunk size |
+| CRITICAL | > 90% | Aggressively reduce |
 
 ---
 

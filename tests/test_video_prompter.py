@@ -126,7 +126,7 @@ class TestMatchAndRemap:
         """First chunk with no prev_masks should assign sequential global IDs."""
         masks = np.array([np.ones((5, 5), dtype=bool)])
         result = {0: {"out_obj_ids": np.array([0]), "out_binary_masks": masks}}
-        remapped, ids, mapping, gnid = _match_and_remap(result, {0}, {}, 0)
+        remapped, ids, mapping, gnid, _iou = _match_and_remap(result, {0}, {}, 0)
         assert mapping == {0: 0}
         assert gnid == 1
 
@@ -147,7 +147,7 @@ class TestMatchAndRemap:
         cur_masks = np.array([mask_a, mask_b])
         result = {0: {"out_obj_ids": np.array([0, 1]), "out_binary_masks": cur_masks}}
 
-        remapped, ids, mapping, gnid = _match_and_remap(result, {0, 1}, prev, 2)
+        remapped, ids, mapping, gnid, _iou = _match_and_remap(result, {0, 1}, prev, 2)
         # Should match: new 0→global 0, new 1→global 1
         assert mapping[0] == 0
         assert mapping[1] == 1
@@ -161,13 +161,13 @@ class TestMatchAndRemap:
         new_mask = np.zeros((10, 10), dtype=bool)  # completely different
         cur = {0: {"out_obj_ids": np.array([0]), "out_binary_masks": np.array([new_mask])}}
 
-        _, _, mapping, gnid = _match_and_remap(cur, {0}, prev, 1)
+        _, _, mapping, gnid, _iou = _match_and_remap(cur, {0}, prev, 1)
         # IoU is 0 → no match → new ID
         assert mapping[0] == 1
         assert gnid == 2
 
     def test_empty_result(self):
-        result, ids, mapping, gnid = _match_and_remap({}, {0, 1}, {}, 0)
+        result, ids, mapping, gnid, _iou = _match_and_remap({}, {0, 1}, {}, 0)
         assert result == {}
         assert 0 in ids and 1 in ids
         assert gnid == 2
