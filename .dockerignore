@@ -1,0 +1,69 @@
+# ──────────────────────────────────────────────────────────────
+# .dockerignore — keep the build context small & fast
+# ──────────────────────────────────────────────────────────────
+
+# Version control
+.git
+.github
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[codz]
+*.egg-info
+dist
+build
+*.egg
+
+# Virtual environments
+.venv
+venv
+env
+
+# IDE / editor
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.cursor*
+
+# Test / dev artifacts
+htmlcov
+.coverage
+.pytest_cache
+.ruff_cache
+test-results-*.xml
+profile_results.*
+
+# Documentation / non-essential
+*.md
+!README.md
+LICENSE
+SECURITY.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+CHANGELOG.md
+
+# Notebooks (not needed in production)
+notebook/
+
+# Large assets — mount at runtime instead
+assets/videos/
+assets/images/
+
+# Output directories
+results/
+rough/
+docs/local/
+
+# Scripts not needed in container
+scripts/
+Makefile
+setup.sh
+update_version.sh
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore

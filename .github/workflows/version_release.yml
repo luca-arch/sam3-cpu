@@ -1,0 +1,180 @@
+# ──────────────────────────────────────────────────────────────
+# Version Update & Release
+# Triggers on push to main (non-merge commits).
+#
+# Version bump: controlled by commit message tags:
+#   [major]  → 1.0.0 → 2.0.0
+#   [minor]  → 1.0.0 → 1.1.0
+#   [patch]  → (default) 1.0.0 → 1.0.1
+#
+# Release creation: add "tag-release" to commit message.
+# Tag only (no GH release): add "tag-repo" to commit message.
+#
+# Security: uses the default GITHUB_TOKEN which is:
+#   - Auto-provisioned per workflow run
+#   - Scoped to this repository only
+#   - Cannot access other repos or org secrets
+#   - Cannot push to branch-protection-rule-enforced branches
+#     (unless explicitly allowed in branch protection settings)
+# ──────────────────────────────────────────────────────────────
+name: Version & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      release:
+        description: "Create a GitHub release?"
+        required: false
+        default: false
+        type: boolean
+
+# Ensure only one version job runs at a time
+concurrency:
+  group: version-release
+  cancel-in-progress: false            # don't cancel — version bumps must complete
+
+permissions:
+  contents: write                      # push commits, tags, create releases
+
+jobs:
+  version:
+    name: Bump version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # Skip the bot's own "[skip ci]" commits to prevent loops
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+
+    steps:
+      - name: Checkout (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Detect merge commits and skip ──
+      - name: Check if merge commit
+        id: check_merge
+        run: |
+          PARENT_COUNT=$(git rev-list --parents -n 1 HEAD | wc -w)
+          # A merge commit has 3+ words (the commit hash + 2+ parents)
+          if [ "$PARENT_COUNT" -gt 2 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Determine bump type ──
+      - name: Determine bump type
+        if: steps.check_merge.outputs.skip == 'false'
+        id: bump
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "type=${{ inputs.bump }}" >> "$GITHUB_OUTPUT"
+          else
+            MSG=$(git log -1 --pretty=%B)
+            if echo "$MSG" | grep -iq '\[major\]'; then
+              echo "type=major" >> "$GITHUB_OUTPUT"
+            elif echo "$MSG" | grep -iq '\[minor\]'; then
+              echo "type=minor" >> "$GITHUB_OUTPUT"
+            else
+              echo "type=patch" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      # ── Determine release intent ──
+      - name: Determine release intent
+        if: steps.check_merge.outputs.skip == 'false'
+        id: intent
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "create_release=${{ inputs.release }}" >> "$GITHUB_OUTPUT"
+            echo "create_tag=${{ inputs.release }}" >> "$GITHUB_OUTPUT"
+          else
+            MSG=$(git log -1 --pretty=%B)
+            if echo "$MSG" | grep -iq 'tag-release'; then
+              echo "create_release=true" >> "$GITHUB_OUTPUT"
+              echo "create_tag=true" >> "$GITHUB_OUTPUT"
+            elif echo "$MSG" | grep -iq 'tag-repo'; then
+              echo "create_release=false" >> "$GITHUB_OUTPUT"
+              echo "create_tag=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "create_release=false" >> "$GITHUB_OUTPUT"
+              echo "create_tag=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      # ── Bump version ──
+      - name: Bump VERSION file
+        if: steps.check_merge.outputs.skip == 'false'
+        id: version
+        run: |
+          chmod +x ./update_version.sh
+          ./update_version.sh ${{ steps.bump.outputs.type }}
+          NEW_VERSION=$(cat VERSION)
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "### Version bumped to $NEW_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Generate changelog ──
+      - name: Generate changelog
+        if: steps.check_merge.outputs.skip == 'false'
+        id: changelog
+        uses: TriPSs/conventional-changelog-action@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          preset: conventionalcommits
+          version-file: VERSION
+          skip-bump: true
+          skip-version-file: true
+          skip-commit: true
+          skip-tag: true
+          output-file: CHANGELOG.md
+          skip-on-empty: true
+          release-count: 0
+
+      # ── Commit & push ──
+      - name: Commit version + changelog
+        if: steps.check_merge.outputs.skip == 'false'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION CHANGELOG.md
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new_version }} [skip ci]"
+          git push
+
+      # ── Tag ──
+      - name: Create tag
+        if: steps.check_merge.outputs.skip == 'false' && steps.intent.outputs.create_tag == 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.new_version }}
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+
+      # ── GitHub Release (uses gh CLI — pre-installed on runners) ──
+      - name: Create GitHub release
+        if: steps.check_merge.outputs.skip == 'false' && steps.intent.outputs.create_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.new_version }}
+          # Extract latest changelog section for release notes
+          NOTES=$(awk '/^## \[/{if(found) exit; found=1; next} found{print}' CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release v${VERSION}"
+          fi
+          gh release create "v${VERSION}" \
+            --title "Release v${VERSION}" \
+            --notes "$NOTES" \
+            --target main

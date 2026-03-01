@@ -57,7 +57,44 @@ exclude = ["build*", "scripts*", "notebook*"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "ruff>=0.9.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "notebook",
+    "sam3/model",          # upstream model code — don't lint
+    "sam3/sam",            # upstream SAM code
+    "sam3/train",          # training code
+    "sam3/eval/hota_eval_toolkit",
+    "sam3/eval/teta_eval_toolkit",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",       # pycodestyle errors
+    "W",       # pycodestyle warnings
+    "F",       # pyflakes
+    "I",       # isort
+    "B",       # flake8-bugbear
+    "UP",      # pyupgrade
+    "S",       # flake8-bandit (security)
+]
+ignore = [
+    "E501",    # line too long — handled by formatter
+    "S101",    # assert used — fine in tests
+    "S603",    # subprocess without shell=True check — we control inputs
+    "S607",    # partial executable path — acceptable
+    "B008",    # function call in default arg — used by argparse
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S106"]

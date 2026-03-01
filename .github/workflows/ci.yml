@@ -1,0 +1,127 @@
+# ──────────────────────────────────────────────────────────────
+# CI — Lint & Test
+# Runs on every PR and push to main / develop / release/*
+# ──────────────────────────────────────────────────────────────
+name: CI
+
+on:
+  push:
+    branches: [main, develop, "release/*"]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel in-progress runs for the same PR / branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read          # least-privilege — only needs to read code
+
+jobs:
+  # ────────────── Lint ──────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true          # caches ~/.cache/uv across runs
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Ruff check
+        run: uv run ruff check sam3/ video_prompter.py image_prompter.py
+
+      - name: Ruff format check
+        run: uv run ruff format --check sam3/ video_prompter.py image_prompter.py
+
+  # ────────────── Tests ──────────────
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install project dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: |
+          uv run python -m pytest tests/ \
+            -v \
+            --tb=short \
+            -k "not test_all_scenarios" \
+            --junitxml=test-results-${{ matrix.python-version }}.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: test-results-${{ matrix.python-version }}.xml
+          retention-days: 30
+
+  # ────────────── Compile check ──────────────
+  compile-check:
+    name: Compile check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Verify all Python files compile
+        run: |
+          uv run python -c "
+          import py_compile, pathlib, sys
+          errors = []
+          for p in sorted(pathlib.Path('.').rglob('*.py')):
+              if '.venv' in str(p):
+                  continue
+              try:
+                  py_compile.compile(str(p), doraise=True)
+              except py_compile.PyCompileError as e:
+                  errors.append(str(e))
+          if errors:
+              print('Compile errors found:')
+              for e in errors:
+                  print(f'  {e}')
+              sys.exit(1)
+          print(f'All Python files compile OK')
+          "

@@ -1,0 +1,79 @@
+# ──────────────────────────────────────────────────────────────
+# docker-compose.yml — SAM3 CPU
+#
+# Services:
+#   sam3        — Run inference (video/image)
+#   dev         — Development shell with tests, linting, etc.
+#
+# Usage:
+#   # Build
+#   docker compose build
+#
+#   # Video segmentation
+#   docker compose run --rm sam3 video_prompter.py \
+#     --video /app/assets/videos/myvideo.mp4 \
+#     --prompts "person" "car" \
+#     --output /app/results/myvideo
+#
+#   # Image segmentation
+#   docker compose run --rm sam3 image_prompter.py \
+#     --images /app/assets/images/photo.jpg \
+#     --prompts "dog" \
+#     --output /app/results/photo
+#
+#   # Development shell
+#   docker compose run --rm dev bash
+#
+#   # Run tests inside container
+#   docker compose run --rm dev pytest tests/ -v -k "not test_all_scenarios"
+# ──────────────────────────────────────────────────────────────
+
+services:
+  # ── Inference service ──
+  sam3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: sam3-cpu:latest
+    volumes:
+      - ./assets:/app/assets:ro          # input assets (read-only)
+      - ./results:/app/results           # output results
+      - model-cache:/root/.cache         # persist downloaded model weights
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Override entrypoint args per run:
+    #   docker compose run --rm sam3 video_prompter.py --video ...
+    entrypoint: ["python"]
+    command: ["--help"]
+    deploy:
+      resources:
+        limits:
+          memory: 32G                    # adjust based on your machine
+        reservations:
+          memory: 4G
+
+  # ── Development service ──
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder                    # full build stage with dev tools
+    image: sam3-cpu:dev
+    volumes:
+      - .:/app                           # mount full source for live editing
+      - model-cache:/root/.cache
+    environment:
+      - PYTHONUNBUFFERED=1
+    working_dir: /app
+    entrypoint: []
+    command: ["bash"]
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+
+volumes:
+  model-cache:                           # named volume for HuggingFace model cache
