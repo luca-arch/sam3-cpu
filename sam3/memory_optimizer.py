@@ -287,6 +287,82 @@ def memory_cleanup_context(device: str = "cuda"):
 
 
 # ---------------------------------------------------------------------------
+# Memory tier auto-detection
+# ---------------------------------------------------------------------------
+
+def get_memory_tier(vram_bytes: int = 0, ram_bytes: int = 0) -> dict:
+    """Auto-select threshold profile based on hardware capabilities.
+
+    Returns a dict of recommended growth-strategy parameters for the
+    detected memory tier.  The tier system ensures safe, efficient
+    operation across a wide range of hardware — from 8 GB consumer GPUs
+    to 80 GB data-centre cards.
+
+    Tiers
+    -----
+    * **S**  (≤ 12 GB VRAM): Conservative.  Model weights (~3 GB) eat a
+      large fraction; headroom is precious.
+    * **M**  (12–24 GB): Balanced.  RTX 3090 / 4090 class.
+    * **L**  (24–48 GB): Generous.  A6000, RTX 6000 Ada class.
+    * **XL** (> 48 GB): Aggressive.  A100, H100 — ample headroom.
+    * **CPU_S / CPU_M / CPU_L**: CPU-only tiers keyed on system RAM.
+
+    The tiers control the *adaptive chunk manager* (growth factor,
+    min/max chunk sizes).  Runtime safety thresholds (soft/hard limits)
+    remain under user control in ``__globals.py``.
+    """
+    vram_gb = vram_bytes / (1024**3) if vram_bytes > 0 else 0.0
+    ram_gb = ram_bytes / (1024**3) if ram_bytes > 0 else 0.0
+
+    # ── GPU tiers ──
+    if vram_gb > 0:
+        if vram_gb <= 12:
+            return {
+                "tier": "S", "vram_gb": round(vram_gb, 1),
+                "min_chunk_frames": 15, "grow_factor": 1.30,
+                "max_growth_factor": 2.0, "grow_threshold": 0.50,
+            }
+        elif vram_gb <= 24:
+            return {
+                "tier": "M", "vram_gb": round(vram_gb, 1),
+                "min_chunk_frames": 25, "grow_factor": 1.40,
+                "max_growth_factor": 2.5, "grow_threshold": 0.55,
+            }
+        elif vram_gb <= 48:
+            return {
+                "tier": "L", "vram_gb": round(vram_gb, 1),
+                "min_chunk_frames": 50, "grow_factor": 1.50,
+                "max_growth_factor": 3.0, "grow_threshold": 0.60,
+            }
+        else:
+            return {
+                "tier": "XL", "vram_gb": round(vram_gb, 1),
+                "min_chunk_frames": 100, "grow_factor": 1.50,
+                "max_growth_factor": 3.0, "grow_threshold": 0.65,
+            }
+
+    # ── CPU-only tiers (keyed on system RAM) ──
+    if ram_gb <= 16:
+        return {
+            "tier": "CPU_S", "vram_gb": 0, "ram_gb": round(ram_gb, 1),
+            "min_chunk_frames": 15, "grow_factor": 1.20,
+            "max_growth_factor": 1.5, "grow_threshold": 0.40,
+        }
+    elif ram_gb <= 32:
+        return {
+            "tier": "CPU_M", "vram_gb": 0, "ram_gb": round(ram_gb, 1),
+            "min_chunk_frames": 25, "grow_factor": 1.30,
+            "max_growth_factor": 2.0, "grow_threshold": 0.50,
+        }
+    else:
+        return {
+            "tier": "CPU_L", "vram_gb": 0, "ram_gb": round(ram_gb, 1),
+            "min_chunk_frames": 50, "grow_factor": 1.40,
+            "max_growth_factor": 2.5, "grow_threshold": 0.55,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Memory pressure levels
 # ---------------------------------------------------------------------------
 
@@ -346,14 +422,18 @@ class AdaptiveChunkManager:
         Absolute minimum chunk size (to avoid degenerate 1-frame chunks).
     max_growth_factor : float
         Maximum factor by which chunk size can grow between chunks.
+    tier : dict, optional
+        Output of :func:`get_memory_tier`.  When provided the tier's
+        growth-strategy parameters override the class defaults.
     """
 
-    # Region: tuning constants
+    # Region: tuning constants (may be overridden per-instance by tier)
     SHRINK_CRITICAL_FACTOR = 0.50   # halve on critical
     SHRINK_WARNING_FACTOR = 0.75    # reduce 25% on warning
-    GROW_FACTOR = 1.25              # grow 25% when underutilised
+    GROW_FACTOR = 1.25              # default grow 25% (tier may override)
     OOM_SHRINK_FACTOR = 0.40        # aggressive shrink on actual OOM
     MAX_CONSECUTIVE_OOMS = 3        # give up after 3 OOMs on same chunk
+    GROW_THRESHOLD = 0.50           # grow only when usage < this (tier may override)
 
     def __init__(
         self,
@@ -364,6 +444,7 @@ class AdaptiveChunkManager:
         ram_limit_bytes: Optional[int] = None,
         min_chunk_frames: int = 25,
         max_growth_factor: float = 1.5,
+        tier: Optional[dict] = None,
     ):
         self.device = device
         self.initial_chunk_size = initial_chunk_size
@@ -386,6 +467,17 @@ class AdaptiveChunkManager:
         else:
             snap = get_cpu_memory()
             self.ram_limit = snap.total
+
+        # Apply tier-specific growth strategy (explicit params take precedence)
+        self._tier = tier or get_memory_tier(self.vram_limit, self.ram_limit)
+        self.GROW_FACTOR = self._tier.get("grow_factor", self.GROW_FACTOR)
+        self.GROW_THRESHOLD = self._tier.get("grow_threshold", self.GROW_THRESHOLD)
+        # Only override min/max if caller used defaults (sentinel-free: tier
+        # refines but explicit params always win — callers that pass
+        # min_chunk_frames=25 intentionally should subclass or pass tier=None).
+        if tier is not None:
+            self.min_chunk_frames = tier.get("min_chunk_frames", self.min_chunk_frames)
+            self.max_growth_factor = tier.get("max_growth_factor", self.max_growth_factor)
 
         # Track history
         self.chunk_history: list = []
@@ -431,8 +523,19 @@ class AdaptiveChunkManager:
         peak_vram_bytes: int,
         peak_ram_bytes: int = 0,
         n_objects: int = 0,
+        soft_warning_seen: bool = False,
     ) -> ChunkMemoryRecord:
         """Record a completed chunk and compute next chunk size.
+
+        Parameters
+        ----------
+        soft_warning_seen : bool
+            If *True*, at least one per-prompt intra-chunk monitor
+            triggered a VRAM or RAM soft-limit warning during this
+            chunk.  When set, the adaptive manager will never GROW —
+            even if the aggregated peak falls under the NORMAL
+            threshold — because a prompt was genuinely close to the
+            limit at runtime.
 
         Returns a :class:`ChunkMemoryRecord` with the recommended
         ``adjusted_chunk_size`` for the next chunk.
@@ -459,10 +562,43 @@ class AdaptiveChunkManager:
                 self.min_chunk_frames,
             )
             action = "SHRINK"
-        elif pressure == MemoryPressure.NORMAL and usage_pct < 0.50:
-            # Under-utilised: grow but cap at max_growth_factor × initial
+        elif (
+            pressure == MemoryPressure.NORMAL
+            and usage_pct < self.GROW_THRESHOLD
+            and not soft_warning_seen
+        ):
+            # Under-utilised: grow but cap at max_growth_factor × initial.
+            # Dampen growth when many objects are tracked — SAM3 memory
+            # per frame scales roughly with object count, so the naive
+            # growth that is safe for 1 object would be dangerous for 29.
+            # Formula: growth = 1 + (G-1) / (1 + log2(N))
+            #
+            # Object-count trend: if objects are increasing between chunks
+            # (scene getting busier), further dampen.  If decreasing
+            # (objects leaving), boost growth slightly.
+            #
+            # Growth is suppressed entirely when soft_warning_seen is
+            # True — a per-prompt monitor flagged VRAM/RAM pressure
+            # even though the post-chunk peak may look tame.
+            import math
+            n = max(n_objects, 1)
+            dampened_growth = 1.0 + (self.GROW_FACTOR - 1.0) / (1.0 + math.log2(n))
+
+            # Trend adjustment: compare current n_objects with previous chunk
+            if len(self.chunk_history) >= 1:
+                prev_obj = self.chunk_history[-1].n_objects
+                if prev_obj > 0 and n_objects > prev_obj * 1.2:
+                    # Objects increasing >20% → further dampen
+                    dampened_growth = 1.0 + (dampened_growth - 1.0) * 0.5
+                elif prev_obj > 0 and n_objects < prev_obj * 0.8:
+                    # Objects decreasing >20% → boost (but cap to full factor)
+                    dampened_growth = min(
+                        dampened_growth * 1.3,
+                        1.0 + (self.GROW_FACTOR - 1.0),
+                    )
+
             new_size = min(
-                int(chunk_size * self.GROW_FACTOR),
+                int(chunk_size * dampened_growth),
                 int(self.initial_chunk_size * self.max_growth_factor),
             )
             action = "GROW"
@@ -553,10 +689,14 @@ class AdaptiveChunkManager:
             "initial_chunk_size": self.initial_chunk_size,
             "final_chunk_size": self.current_chunk_size,
             "device": self.device,
+            "tier": self._tier,
+            "grow_factor": self.GROW_FACTOR,
+            "grow_threshold": self.GROW_THRESHOLD,
             "vram_limit_bytes": self.vram_limit,
             "ram_limit_bytes": self.ram_limit,
             "effective_vram_limit_bytes": self.effective_vram_limit,
             "min_chunk_frames": self.min_chunk_frames,
+            "max_growth_factor": self.max_growth_factor,
             "chunk_history": [
                 {
                     "chunk_id": r.chunk_id,
@@ -610,10 +750,11 @@ def _linear_regression(xs: List[float], ys: List[float]):
 
 @dataclass
 class FrameMemorySample:
-    """Single VRAM snapshot taken during frame propagation."""
+    """Single memory snapshot taken during frame propagation."""
     iteration: int = 0          # 0-based processing step
     frame_idx: int = 0          # video frame index (may repeat for "both")
     vram_allocated: int = 0     # bytes from torch.cuda.memory_allocated()
+    ram_allocated: int = 0      # bytes from psutil.Process().memory_info().rss
     timestamp: float = 0.0      # time.time()
 
 
@@ -639,7 +780,7 @@ class MonitorResult:
     iterations_planned: int = 0
     iterations_completed: int = 0
     early_stopped: bool = False
-    stop_reason: str = "completed"      # completed|hard_limit|predicted_oom|oom_exception
+    stop_reason: str = "completed"      # completed|hard_limit|predictive_soft_stop|ram_hard_limit|ram_soft_limit|oom_exception
     peak_vram_bytes: int = 0
     peak_ram_bytes: int = 0
     calibration: Optional[GrowthCalibration] = None
@@ -648,23 +789,37 @@ class MonitorResult:
 
 
 class IntraChunkMonitor:
-    """Proactive per-frame memory monitor for video propagation.
+    """Per-frame VRAM **and** RAM guard for video propagation.
 
-    Replaces reactive post-chunk OOM detection with real-time monitoring
-    during frame-by-frame propagation.  Three phases:
+    Checks memory utilisation **after every single frame** — the overhead
+    is ~10 µs per call vs ~0.4–1 s per frame of SAM3 inference (<0.01%).
 
-    **Phase 1 — Calibration** (first *N* iterations):
-        Sample VRAM after every frame.  Fit a linear growth model to
-        estimate bytes-per-frame.  Compute how many frames fit before
-        hitting the hard-stop threshold.
+    Dual-resource, dual-threshold design
+    ------------------------------------
+    Both VRAM and RAM are monitored with soft / hard limits:
 
-    **Phase 2 — Progressive checkpoints**:
-        Check memory at exponential-decay intervals (total/2, 3·total/4,
-        7·total/8, …).  Re-evaluate predictions against observed data.
+    * **Soft limit** (default 80% VRAM, 70% RAM):
+      Issues a warning and — once a reliable calibration exists — predicts
+      how many frames remain before the hard limit.  If the prediction
+      says < ``PREDICTIVE_STOP_FRAMES`` frames, triggers an early stop.
 
-    **Phase 3 — Hard stop** (≥ 95 % of effective VRAM limit):
-        Signal the caller to break immediately.  Partial results are
-        discarded and remaining frames become a new, smaller chunk.
+    * **Hard limit** (default 92% VRAM, 85% RAM):
+      Signals immediate stop.  The headroom above this prevents
+      PyTorch's caching allocator (VRAM) or the Linux OOM-killer (RAM)
+      from triggering a catastrophic failure.
+
+    Calibration & recalibration
+    --------------------------
+    During the first ``CALIBRATION_FRAMES`` iterations, VRAM is sampled
+    every frame and a linear growth model (slope + intercept) is fitted.
+    The model is **re-fitted every ``RECALIBRATE_INTERVAL`` frames** so
+    the slope converges to steady-state behaviour and is not dominated by
+    the steep warmup (model init / cache fill) gradient.
+
+    The calibration is used **only** inside the soft-limit zone to
+    estimate frames-until-hard-limit.  There is no speculative
+    "predicted OOM" check based purely on extrapolation — that approach
+    produces false positives from warmup data.
 
     Usage::
 
@@ -675,18 +830,12 @@ class IntraChunkMonitor:
                 break
             collect(outputs)
         result = monitor.finalize()
-
-    Overhead
-    --------
-    ~50 ns per non-checkpoint frame (counter + set lookup).
-    ~10 µs per checkpoint (CUDA memory query).  Negligible compared to
-    ~100 ms per-frame inference.
     """
 
     # --- Tuning constants ---
-    CALIBRATION_FRAMES: int = 5       # first N iterations: sample every one
-    HARD_STOP_PCT: float = 0.95       # stop if usage ≥ this fraction
-    PREDICT_STOP_PCT: float = 0.92    # stop if *predicted* peak ≥ this
+    CALIBRATION_FRAMES: int = 5       # first N iterations: always sample
+    RECALIBRATE_INTERVAL: int = 50    # re-fit calibration every N frames
+    PREDICTIVE_STOP_FRAMES: int = 50  # stop early if predicted < this many frames left
     MIN_CALIBRATION_SAMPLES: int = 3  # minimum for valid prediction
 
     def __init__(
@@ -695,10 +844,34 @@ class IntraChunkMonitor:
         device: str = "cuda",
         *,
         vram_limit_bytes: Optional[int] = None,
+        ram_limit_bytes: Optional[int] = None,
+        soft_limit_pct: Optional[float] = None,
+        hard_limit_pct: Optional[float] = None,
+        ram_soft_limit_pct: Optional[float] = None,
+        ram_hard_limit_pct: Optional[float] = None,
     ):
         self.expected_iterations = expected_iterations
         self.device = device
-        self.vram_limit = self._resolve_limit(vram_limit_bytes)
+        self.vram_limit = self._resolve_vram_limit(vram_limit_bytes)
+
+        # ── VRAM thresholds ──
+        try:
+            from sam3.__globals import VRAM_SOFT_LIMIT_PCT, VRAM_HARD_LIMIT_PCT
+            self._soft_pct = soft_limit_pct if soft_limit_pct is not None else VRAM_SOFT_LIMIT_PCT
+            self._hard_pct = hard_limit_pct if hard_limit_pct is not None else VRAM_HARD_LIMIT_PCT
+        except ImportError:
+            self._soft_pct = soft_limit_pct if soft_limit_pct is not None else 0.80
+            self._hard_pct = hard_limit_pct if hard_limit_pct is not None else 0.92
+
+        # ── RAM limits and thresholds ──
+        self.ram_limit = self._resolve_ram_limit(ram_limit_bytes)
+        try:
+            from sam3.__globals import RAM_SOFT_LIMIT_PCT, RAM_HARD_LIMIT_PCT
+            self._ram_soft_pct = ram_soft_limit_pct if ram_soft_limit_pct is not None else RAM_SOFT_LIMIT_PCT
+            self._ram_hard_pct = ram_hard_limit_pct if ram_hard_limit_pct is not None else RAM_HARD_LIMIT_PCT
+        except ImportError:
+            self._ram_soft_pct = ram_soft_limit_pct if ram_soft_limit_pct is not None else 0.70
+            self._ram_hard_pct = ram_hard_limit_pct if ram_hard_limit_pct is not None else 0.85
 
         # State
         self._samples: List[FrameMemorySample] = []
@@ -706,13 +879,15 @@ class IntraChunkMonitor:
         self._baseline_vram: int = 0
         self._iteration: int = 0
         self._peak_vram: int = 0
+        self._peak_ram: int = 0
         self._stop_reason: Optional[str] = None
-        self._checkpoints: set = self._build_checkpoints()
-        self._checkpoints_evaluated: int = 0
+        self._soft_warning_issued: bool = False
+        self._ram_soft_warning_issued: bool = False
+        self._frames_at_soft_warning: int = 0
 
     # ── Setup ────────────────────────────────────────────────────────────
 
-    def _resolve_limit(self, override: Optional[int]) -> int:
+    def _resolve_vram_limit(self, override: Optional[int]) -> int:
         """Determine effective VRAM limit."""
         if override:
             return override
@@ -720,6 +895,15 @@ class IntraChunkMonitor:
             snap = get_gpu_memory()
             return snap.total if snap.total > 0 else 0
         return 0
+
+    def _resolve_ram_limit(self, override: Optional[int]) -> int:
+        """Determine total system RAM."""
+        if override:
+            return override
+        try:
+            return psutil.virtual_memory().total
+        except Exception:
+            return 0
 
     @property
     def effective_limit(self) -> int:
@@ -733,24 +917,17 @@ class IntraChunkMonitor:
             reserve = 0.05
         return int(self.vram_limit * (1 - reserve))
 
-    def _build_checkpoints(self) -> set:
-        """Exponential-decay checkpoint schedule.
-
-        Checks at: every frame during calibration, then at
-        N/2, 3N/4, 7N/8, 15N/16, … iterations.
-        """
-        n = self.expected_iterations
-        cps = set(range(min(self.CALIBRATION_FRAMES, n)))
-        k = 1
-        while True:
-            cp = int(n * (1 - 1 / (2 ** k)))
-            if cp >= n - 1 or (cp in cps and k > 1):
-                break
-            cps.add(cp)
-            k += 1
-        if n > 0:
-            cps.add(n - 1)
-        return cps
+    @property
+    def effective_ram_limit(self) -> int:
+        """RAM budget = total RAM minus OS reserve."""
+        if self.ram_limit <= 0:
+            return 0
+        try:
+            from sam3.__globals import CPU_MEMORY_RESERVE_PERCENT
+            reserve = CPU_MEMORY_RESERVE_PERCENT
+        except ImportError:
+            reserve = 0.30
+        return int(self.ram_limit * (1 - reserve))
 
     # ── Runtime ──────────────────────────────────────────────────────────
 
@@ -768,38 +945,43 @@ class IntraChunkMonitor:
     def check(self, frame_idx: int = -1) -> bool:
         """Check memory at current iteration.  Returns *True* to continue.
 
-        This is the hot-path method called after every frame.  It is
-        near-zero-cost except at checkpoint iterations.
+        Called **after every frame**.  Per-frame overhead is one
+        ``torch.cuda.memory_allocated()`` call (~10 µs) plus one
+        ``psutil`` RSS query (~5 µs).  Negligible compared to frame time.
         """
         iteration = self._iteration
         self._iteration += 1
-
-        if iteration not in self._checkpoints:
-            return True
-
         return self._evaluate(iteration, frame_idx)
 
     # ── Evaluation ───────────────────────────────────────────────────────
 
     def _evaluate(self, iteration: int, frame_idx: int) -> bool:
-        """Full memory evaluation at a checkpoint."""
+        """Full memory evaluation — called every frame."""
         sample = self._take_sample(iteration, frame_idx)
-        self._checkpoints_evaluated += 1
-
         self._peak_vram = max(self._peak_vram, sample.vram_allocated)
+        self._peak_ram = max(self._peak_ram, sample.ram_allocated)
 
-        # Calibrate after collecting enough samples
+        # Initial calibration after collecting enough samples
         if (len(self._samples) >= self.CALIBRATION_FRAMES
                 and self._calibration is None):
             self._calibrate()
 
+        # Periodic recalibration so slope converges to steady-state
+        # (initial calibration from warmup frames is unreliable)
+        elif (self._calibration is not None
+              and iteration > 0
+              and iteration % self.RECALIBRATE_INTERVAL == 0
+              and len(self._samples) > self._calibration.n_samples):
+            self._calibrate()
+
+        # CPU mode with no VRAM limit — still check RAM
         if self.effective_limit <= 0:
-            return True  # no limit to check
+            return self._check_ram_limits(sample, iteration)
 
         return self._check_limits(sample, iteration)
 
     def _take_sample(self, iteration: int, frame_idx: int) -> FrameMemorySample:
-        """Record a VRAM snapshot."""
+        """Record a VRAM + RAM snapshot."""
         vram = 0
         if self.device.startswith("cuda"):
             try:
@@ -809,31 +991,85 @@ class IntraChunkMonitor:
             except Exception:
                 pass
 
+        ram = 0
+        try:
+            ram = psutil.Process().memory_info().rss
+        except Exception:
+            pass
+
         sample = FrameMemorySample(
             iteration=iteration,
             frame_idx=frame_idx,
             vram_allocated=vram,
+            ram_allocated=ram,
             timestamp=time.time(),
         )
-        self._samples.append(sample)
+        # Keep all calibration samples; after calibration keep every 10th
+        # to bound memory for very long chunks while preserving key points
+        if iteration < self.CALIBRATION_FRAMES or iteration % 10 == 0:
+            self._samples.append(sample)
         return sample
 
     def _check_limits(self, sample: FrameMemorySample, iteration: int) -> bool:
-        """Evaluate hard-stop and predicted-OOM thresholds."""
+        """Evaluate VRAM and RAM hard-stop and soft-stop thresholds."""
         usage_pct = sample.vram_allocated / self.effective_limit
 
-        # Hard stop: current allocation is dangerously high
-        if usage_pct >= self.HARD_STOP_PCT:
+        # ── VRAM HARD LIMIT: current allocation is dangerously high ──
+        if usage_pct >= self._hard_pct:
             self._stop_reason = "hard_limit"
             return False
 
-        # Predicted OOM: calibration says we'll exceed limit
-        if (self._calibration is not None
-                and self._calibration.confidence > 0.3
-                and iteration >= self.CALIBRATION_FRAMES):
-            predicted = self._predict_at(self.expected_iterations)
-            if predicted / self.effective_limit >= self.PREDICT_STOP_PCT:
-                self._stop_reason = "predicted_oom"
+        # ── VRAM SOFT LIMIT: approaching danger zone ──
+        if usage_pct >= self._soft_pct:
+            if not self._soft_warning_issued:
+                self._soft_warning_issued = True
+                self._frames_at_soft_warning = iteration
+                import sys
+                print(f"\033[93m⚠ VRAM warning: {usage_pct:.0%} used "
+                      f"(soft limit {self._soft_pct:.0%}) at frame {iteration}\033[0m",
+                      file=sys.stderr)
+
+            # Predictive stop: use calibration to estimate frames until hard limit
+            if (self._calibration is not None
+                    and self._calibration.confidence > 0.3
+                    and self._calibration.growth_rate_per_iter > 0):
+                headroom_bytes = self.effective_limit * self._hard_pct - sample.vram_allocated
+                frames_until_hard = headroom_bytes / self._calibration.growth_rate_per_iter
+                if frames_until_hard < self.PREDICTIVE_STOP_FRAMES:
+                    self._stop_reason = "predictive_soft_stop"
+                    return False
+
+            # Fallback: if no calibration, check if we're very close to hard
+            elif usage_pct >= (self._soft_pct + self._hard_pct) / 2:
+                # Midpoint between soft and hard — stop without calibration
+                self._stop_reason = "soft_limit_no_calibration"
+                return False
+
+        # ── RAM checks (same dual-threshold logic) ──
+        return self._check_ram_limits(sample, iteration)
+
+    def _check_ram_limits(self, sample: FrameMemorySample, iteration: int) -> bool:
+        """Evaluate RAM hard-stop and soft-stop thresholds."""
+        if self.effective_ram_limit <= 0:
+            return True  # cannot determine RAM limit
+
+        ram_pct = sample.ram_allocated / self.effective_ram_limit
+
+        if ram_pct >= self._ram_hard_pct:
+            self._stop_reason = "ram_hard_limit"
+            return False
+
+        if ram_pct >= self._ram_soft_pct:
+            if not self._ram_soft_warning_issued:
+                self._ram_soft_warning_issued = True
+                import sys
+                print(f"\033[93m⚠ RAM warning: {ram_pct:.0%} used "
+                      f"(soft limit {self._ram_soft_pct:.0%}) at frame {iteration}\033[0m",
+                      file=sys.stderr)
+
+            # Midpoint heuristic (no calibration model for RAM)
+            if ram_pct >= (self._ram_soft_pct + self._ram_hard_pct) / 2:
+                self._stop_reason = "ram_soft_limit"
                 return False
 
         return True
@@ -841,7 +1077,12 @@ class IntraChunkMonitor:
     # ── Calibration ──────────────────────────────────────────────────────
 
     def _calibrate(self) -> None:
-        """Fit linear model: vram = intercept + slope × iteration."""
+        """Fit linear model: vram = intercept + slope × iteration.
+
+        Called once after initial calibration frames, then periodically
+        every ``RECALIBRATE_INTERVAL`` frames so the slope converges to
+        steady-state and is not dominated by steep warmup growth.
+        """
         samples = self._samples
         n = len(samples)
         if n < self.MIN_CALIBRATION_SAMPLES:
@@ -855,7 +1096,7 @@ class IntraChunkMonitor:
         # Predict safe iterations (how many until hard-stop threshold)
         safe_iters = self.expected_iterations
         if slope > 0 and self.effective_limit > 0:
-            headroom = self.effective_limit * self.HARD_STOP_PCT - intercept
+            headroom = self.effective_limit * self._hard_pct - intercept
             safe_iters = max(0, int(headroom / slope))
 
         confidence = min(1.0, n / 10) * max(0.0, r_sq)
@@ -891,9 +1132,8 @@ class IntraChunkMonitor:
             except Exception:
                 pass
 
-        peak_ram = 0
         try:
-            peak_ram = psutil.Process().memory_info().rss
+            self._peak_ram = max(self._peak_ram, psutil.Process().memory_info().rss)
         except Exception:
             pass
 
@@ -903,9 +1143,9 @@ class IntraChunkMonitor:
             early_stopped=self._stop_reason is not None,
             stop_reason=self._stop_reason or "completed",
             peak_vram_bytes=self._peak_vram,
-            peak_ram_bytes=peak_ram,
+            peak_ram_bytes=self._peak_ram,
             calibration=self._calibration,
-            checkpoints_evaluated=self._checkpoints_evaluated,
+            checkpoints_evaluated=self._iteration,  # every frame evaluated
             samples=list(self._samples),
         )
 
@@ -921,6 +1161,12 @@ class IntraChunkMonitor:
             "peak_vram_mb": round(r.peak_vram_bytes / (1024**2), 1),
             "peak_ram_mb": round(r.peak_ram_bytes / (1024**2), 1),
             "checkpoints_evaluated": r.checkpoints_evaluated,
+            "soft_limit_pct": self._soft_pct,
+            "hard_limit_pct": self._hard_pct,
+            "ram_soft_limit_pct": self._ram_soft_pct,
+            "ram_hard_limit_pct": self._ram_hard_pct,
+            "soft_warning_issued": self._soft_warning_issued,
+            "ram_soft_warning_issued": self._ram_soft_warning_issued,
             "calibration": {
                 "growth_rate_mb_per_iter": round(cal.growth_rate_per_iter / (1024**2), 3),
                 "baseline_mb": round(cal.baseline_bytes / (1024**2), 1),
@@ -933,6 +1179,7 @@ class IntraChunkMonitor:
                     "iteration": s.iteration,
                     "frame_idx": s.frame_idx,
                     "vram_mb": round(s.vram_allocated / (1024**2), 1),
+                    "ram_mb": round(s.ram_allocated / (1024**2), 1),
                 }
                 for s in r.samples
             ],

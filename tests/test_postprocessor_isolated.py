@@ -73,7 +73,7 @@ def trace_object_1_mappings(postprocessor: VideoPostProcessor):
     print("MANUAL TRACE: What SHOULD happen to chunk_0/object_1")
     print(f"{'='*90}\n")
     
-    from PIL import Image
+    import cv2
     import numpy as np
     
     def compute_iou(mask1, mask2):
@@ -83,7 +83,9 @@ def trace_object_1_mappings(postprocessor: VideoPostProcessor):
     
     def load_mask(png_path):
         try:
-            img = np.array(Image.open(png_path))
+            img = cv2.imread(str(png_path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                return None
             return (img > 0).astype(np.uint8)
         except:
             return None

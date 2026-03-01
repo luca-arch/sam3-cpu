@@ -104,9 +104,14 @@ def temp_output_dir():
 
 @pytest.fixture(scope="session")
 def sam3_instance():
-    """Create a SAM3 instance for testing."""
-    from sam3 import Sam3
-    return Sam3(verbose=True)
+    """Create a SAM3 instance for testing.
+    
+    Uses Sam3Entrypoint (full API) instead of Sam3API because
+    test_all_scenarios exercises video points, refine, remove, and
+    segments — methods only available on the entrypoint class.
+    """
+    from sam3 import Sam3Entrypoint
+    return Sam3Entrypoint(verbose=True)
 
 
 def pytest_configure(config):

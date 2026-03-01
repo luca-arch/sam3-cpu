@@ -74,7 +74,8 @@ class Sam3API:
         num_workers: Optional[int] = None,
         device: Optional[str] = None,
         temp_dir: Optional[str] = None,
-        output_dir: Optional[str] = None
+        output_dir: Optional[str] = None,
+        verbose: bool = True
     ):
         """Initialize the SAM3 API."""
         self.bpe_path = bpe_path or BPE_PATH
@@ -82,6 +83,7 @@ class Sam3API:
         self.device = device or DEVICE.type
         self.temp_dir = Path(temp_dir or TEMP_DIR)
         self.output_dir = Path(output_dir or DEFAULT_OUTPUT_DIR)
+        self.verbose = verbose
         
         # Ensure directories exist
         self.temp_dir.mkdir(parents=True, exist_ok=True)

@@ -476,6 +476,6 @@ class TestImportAliases:
         assert instance is not None
     
     def test_sam3_equals_sam3_entrypoint(self):
-        """Test that Sam3 and Sam3Entrypoint are the same class."""
-        from sam3 import Sam3, Sam3Entrypoint
-        assert Sam3 is Sam3Entrypoint
+        """Test that Sam3 and Sam3API are the same class."""
+        from sam3 import Sam3, Sam3API
+        assert Sam3 is Sam3API

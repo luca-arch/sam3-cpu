@@ -47,17 +47,25 @@ TENSOR_SIZE_BYTES = 1008*1008*3*4 # Approximate size of a 1008x1008 RGB tensor i
 MODEL_STATE_MULTIPLIER = 4.5
 
 # Memory usage for chunking (percentage of available memory to use)
-RAM_USAGE_PERCENT = 0.45   # Use 45% of available RAM for CPU video chunking (conservative)
-# RAM_USAGE_PERCENT = 0.65   # Use 65% of available RAM for CPU video chunking (conservative)
-VRAM_USAGE_PERCENT = 0.70  # Use 70% of available VRAM for GPU video chunking
-                            # (raised from 0.45 — the AdaptiveChunkManager in
-                            # memory_optimizer.py dynamically shrinks chunks if
-                            # actual peak usage exceeds safe thresholds)
+RAM_USAGE_PERCENT = 0.975   # Use 97.5% of available RAM for CPU video chunking (conservative)
+VRAM_USAGE_PERCENT = 0.975  # Use 97.5% of available VRAM for initial GPU chunk planning
+                            # (the IntraChunkMonitor enforces tighter per-frame
+                            # limits during actual propagation — see below)
 CPU_CORES_PERCENT = 0.90   # Use 90% of CPU cores for parallel processing (leave some for OS and other tasks)
 
 MEMORY_SAFETY_MULTIPLIER = 1.5  # Require 1.5x estimated memory for safety (reduced from 3x)
 CPU_MEMORY_RESERVE_PERCENT = 0.3  # Reserve 30% for OS
 GPU_MEMORY_RESERVE_PERCENT = 0.05  # Reserve 5% for display
+
+# Intra-chunk memory guard thresholds (enforced per-frame during propagation)
+# These are the live safety limits.  VRAM_USAGE_PERCENT above is only for
+# initial chunk *planning*; the guard below is the runtime enforcement.
+VRAM_SOFT_LIMIT_PCT = 0.85   # Warn + predict frames-to-limit
+VRAM_HARD_LIMIT_PCT = 0.975   # Immediate stop — 2.5% headroom prevents actual OOM
+
+# RAM guard thresholds (same dual-threshold design as VRAM)
+RAM_SOFT_LIMIT_PCT = 0.85    # Warn when process RSS reaches 85% of available RAM
+RAM_HARD_LIMIT_PCT = 0.975    # Immediate stop — leave 2.5% headroom for OS/other
 
 # Parallel processing
 PARALLEL_CHUNK_THRESHOLD = 0.90  # Start loading next chunk at 90% completion

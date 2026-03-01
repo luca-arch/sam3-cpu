@@ -16,7 +16,7 @@
 - **Video segment processing** — process a specific frame range or time range instead of the full video
 - **Interval-based object tracking** — appearance / disappearance intervals with timestamps and timecodes for every detected object
 - **Full cross-chunk IoU matrix** — complete pairwise IoU data for every chunk boundary, enabling offline evaluation
-- **Enriched metadata (v2.0.0)** — schema-versioned JSON with timing breakdown, peak / min memory tracking, per-chunk details, mask area statistics, and thread configuration
+- **Enriched metadata (v2.2.0)** — schema-versioned JSON with timing breakdown, peak / min memory tracking, per-chunk details, mask area statistics, async I/O stats, and thread configuration
 - **Background memory sampling** — tracks peak and minimum RSS (and GPU peak) throughout the pipeline
 - **CLI tools** — `image_prompter.py` and `video_prompter.py` for quick experiments
 
@@ -189,6 +189,8 @@ All `make` variables:
 | `DEVICE` | both | `cpu` or `cuda` |
 | `CHUNK_SPREAD` | `video-prompter` | `even` |
 | `KEEP_TEMP` | `video-prompter` | `1` (any non-empty value) |
+| `MAX_VRAM_GB` | `video-prompter` | `10` (cap VRAM budget in GB) |
+| `MAX_RAM_GB` | `video-prompter` | `16` (cap RAM budget in GB) |
 | `VIDEO_RES` | `run-*` examples | `480p`, `720p`, `1080p` |
 | `ARGS` | all | extra flags passed through |
 
@@ -215,6 +217,7 @@ Segment one or more images with text prompts, click points, or bounding boxes.
 | `--output` | `str` | `results` | Output directory |
 | `--alpha` | `float` | `0.5` | Overlay alpha for mask visualisation (`0.0`–`1.0`) |
 | `--device` | `str` | auto | Force `cpu` or `cuda` (auto-detected if omitted) |
+| `--profile` | flag | off | Enable the built-in profiler (writes `profile_results.json` / `.txt`) |
 
 At least one of `--prompts`, `--points`, or `--bbox` is required.
 
@@ -276,6 +279,9 @@ and generates per-object tracking metadata.
 | `--keep-temp` | flag | off | Preserve intermediate chunk files in output |
 | `--frame-range` | `int int` | `None` | Process only frames `START..END` (0-based, inclusive) |
 | `--time-range` | `str str` | `None` | Process a time segment (seconds, `MM:SS`, or `HH:MM:SS`) |
+| `--max-vram-gb` | `float` | `None` | Cap VRAM budget (GB) — useful for testing adaptive chunking on large GPUs |
+| `--max-ram-gb` | `float` | `None` | Cap RAM budget (GB) — useful for testing adaptive chunking |
+| `--profile` | flag | off | Enable the built-in profiler (writes `profile_results.json` / `.txt`) |
 
 At least one of `--prompts`, `--points`, or `--masks` is required.
 `--frame-range` and `--time-range` are mutually exclusive.
@@ -532,7 +538,7 @@ to format changes.
 
 | Field | Type | Description |
 |---|---|---|
-| `schema_version` | `string` | Metadata format version — currently `"2.0.0"` |
+| `schema_version` | `string` | Metadata format version — `"2.2.0"` for video, `"2.0.0"` for image |
 | `sam3_version` | `string` | SAM3-CPU release version (read from `VERSION` file) |
 
 ### Video Metadata
@@ -542,7 +548,7 @@ complete run record:
 
 ```jsonc
 {
-  "schema_version": "2.0.0",
+  "schema_version": "2.2.0",
   "sam3_version": "0.1.0",
 
   // ── Video info ──
@@ -613,6 +619,12 @@ complete run record:
       }
     }
   ],
+
+  // ── Async I/O stats (v2.2.0+) ──
+  "async_io": {
+    "tasks_submitted": 2,
+    "errors": 0
+  },
 
   // ── Cross-chunk IoU (multi-chunk videos only) ──
   "cross_chunk_iou": null,          // see Cross-Chunk IoU section
@@ -903,7 +915,10 @@ sam3-cpu/
 │   ├── video_processor.py     # VideoProcessor
 │   ├── chunk_processor.py     # ChunkProcessor (cross-chunk logic)
 │   ├── postprocessor.py       # VideoPostProcessor
-│   ├── memory_manager.py      # MemoryManager
+│   ├── memory_manager.py      # MemoryManager (static chunk planning)
+│   ├── memory_optimizer.py    # IntraChunkMonitor, AdaptiveChunkManager
+│   ├── memory_predictor.py    # Background OOM predictor
+│   ├── async_io.py            # AsyncIOWorker (background disk writes)
 │   ├── model_builder.py       # Model loading
 │   ├── __globals.py           # Constants & defaults
 │   ├── utils/                 # Utility modules
@@ -940,6 +955,9 @@ stitching, and metadata generation using synthetic data.
 | `test_iou_matching.py` | IoU computation, mask matching between chunks |
 | `test_cross_chunk.py` | Cross-chunk ID remapping and continuity |
 | `test_video_prompter.py` | Video prompter helpers — stitching, overlay, timestamp parsing, range resolution, object tracking |
+| `test_chunks_injection.py` | Chunk injection and boundary handling |
+| `test_postprocessor_isolated.py` | Post-processing logic in isolation |
+| `test_intra_chunk_monitor.py` | IntraChunkMonitor calibration, checkpoints, and hard-stop logic |
 | `test_all_scenarios.py` | End-to-end scenarios (requires model + assets — skipped when unavailable) |
 | `conftest.py` | Shared fixtures: asset paths, temp directories, markers |
 

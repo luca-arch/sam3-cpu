@@ -1017,7 +1017,10 @@ class Sam3Entrypoint:
                     
                     # Extract and save masks
                     if "masks" in state and len(state["masks"]) > 0:
-                        masks = np.array(state["masks"])
+                        _masks = state["masks"]
+                        if hasattr(_masks, 'cpu'):
+                            _masks = _masks.cpu()
+                        masks = np.array(_masks)
                         obj_ids = list(range(len(masks)))
                         
                         saved_files = self._save_image_masks(

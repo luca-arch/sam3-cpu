@@ -341,11 +341,18 @@ def _process_image_with_points(
     processor.reset_all_prompts(inference_state)
 
     width, height = image.size
+    # Point-size fraction of the image used to construct a tiny box
+    POINT_BOX_FRACTION = 0.02  # 2% of image dimension
+    box_half_w = POINT_BOX_FRACTION / 2.0
+    box_half_h = POINT_BOX_FRACTION / 2.0
+
     for pt, lbl in zip(points, point_labels):
-        # Normalise point to [0, 1]
-        norm_pt = [pt[0] / width, pt[1] / height]
+        # Normalise point to [0, 1] and build a small box in CXCYWH normalised form
+        cx = pt[0] / width
+        cy = pt[1] / height
+        small_box = [cx, cy, POINT_BOX_FRACTION, POINT_BOX_FRACTION]
         inference_state = processor.add_geometric_prompt(
-            state=inference_state, point=norm_pt, label=lbl
+            state=inference_state, box=small_box, label=bool(lbl)
         )
 
     masks = inference_state.get("masks")

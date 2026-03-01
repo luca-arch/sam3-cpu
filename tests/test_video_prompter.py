@@ -193,12 +193,11 @@ class TestSaveChunkMasks:
         assert len(pngs) == 3  # 3 frames
 
         # Frame 0 should be white (mask), frame 2 should be black (no data)
-        from PIL import Image
-
-        arr0 = np.array(Image.open(pngs[0]))
+        from PIL import Image as _PILImage
+        arr0 = np.array(_PILImage.open(pngs[0]))
         assert arr0.max() == 255
 
-        arr2 = np.array(Image.open(pngs[2]))
+        arr2 = np.array(_PILImage.open(pngs[2]))
         assert arr2.max() == 0  # frame 2 not in result → black
 
 
@@ -225,11 +224,9 @@ class TestStitchMasks:
                 obj_dir = chunks_dir / f"chunk_{ci}" / "masks" / "test" / f"object_{oid}"
                 obj_dir.mkdir(parents=True)
                 for fidx in range(frames_per_chunk):
-                    from PIL import Image
-
-                    # Fill with gray (128) so we can detect non-black
+                    # Use cv2 to write PNGs (avoids PIL/zlib incompatibility with cv2 reader)
                     arr = np.full((10, 10), 128, dtype=np.uint8)
-                    Image.fromarray(arr, mode="L").save(obj_dir / f"frame_{fidx:06d}.png")
+                    cv2.imwrite(str(obj_dir / f"frame_{fidx:06d}.png"), arr)
 
         return chunks_dir, chunk_infos
 
@@ -267,13 +264,11 @@ class TestStitchMasks:
         chunk0_dir.mkdir(parents=True)
 
         # Chunk 1: has object 0
-        from PIL import Image
-
         obj_dir = chunks_dir / "chunk_1" / "masks" / "test" / "object_0"
         obj_dir.mkdir(parents=True)
         for i in range(10):
             arr = np.full((10, 10), 200, dtype=np.uint8)
-            Image.fromarray(arr, mode="L").save(obj_dir / f"frame_{i:06d}.png")
+            cv2.imwrite(str(obj_dir / f"frame_{i:06d}.png"), arr)
 
         chunk_infos = [
             {"chunk": 0, "start": 0, "end": 9},

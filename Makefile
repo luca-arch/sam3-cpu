@@ -292,6 +292,8 @@ video-prompter: check-uv ## Run video_prompter.py (VIDEO, PROMPTS, POINTS, MASKS
 	if [ -n "$(FRAME_RANGE)" ]; then CMD="$$CMD --frame-range $(FRAME_RANGE)"; fi; \
 	if [ -n "$(TIME_RANGE)" ]; then CMD="$$CMD --time-range $(TIME_RANGE)"; fi; \
 	if [ -n "$(KEEP_TEMP)" ]; then CMD="$$CMD --keep-temp"; fi; \
+	if [ -n "$(MAX_VRAM_GB)" ]; then CMD="$$CMD --max-vram-gb $(MAX_VRAM_GB)"; fi; \
+	if [ -n "$(MAX_RAM_GB)" ]; then CMD="$$CMD --max-ram-gb $(MAX_RAM_GB)"; fi; \
 	if [ -n "$(OUTPUT)" ]; then CMD="$$CMD --output $(OUTPUT)"; else CMD="$$CMD --output $(OUTPUT_DIR)"; fi; \
 	echo "$(BLUE)Running video_prompter...$(NC)"; \
 	$$CMD $(ARGS)

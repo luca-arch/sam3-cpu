@@ -31,7 +31,6 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
-from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -76,7 +75,7 @@ def get_video_info(video_path: Path) -> dict:
 def save_mask_png(mask: np.ndarray, path: Path):
     """Save a uint8 mask as grayscale PNG."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(mask, mode="L").save(path, format="PNG", compress_level=1)
+    cv2.imwrite(str(path), mask)
 
 
 def extract_frame_masks(
