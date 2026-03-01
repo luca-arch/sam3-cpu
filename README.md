@@ -1133,7 +1133,7 @@ commercial use.
 
 ---
 
-## Contributors
+## Core Authors
 
 **Dr Prashant Aparajeya**
 Email: p.aparajeya@gmail.com
