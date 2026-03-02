@@ -401,16 +401,28 @@ def _save_chunk_masks(
     width: int,
     height: int,
     total_frames: int,
+    fps: float = 25.0,
 ):
-    """Save per-object per-frame PNG masks."""
-    for oid in object_ids:
-        obj_dir = masks_dir / f"object_{oid}"
-        obj_dir.mkdir(parents=True, exist_ok=True)
+    """Save per-object mask videos (lossless MP4) — replaces old PNG pipeline.
+
+    Each object gets a single ``object_{id}_mask.mp4`` in *masks_dir*,
+    containing grayscale frames (0=bg, 255=object).  This is ~100× fewer
+    I/O operations than the per-frame PNG approach and produces files that
+    are directly usable by the cross-chunk stitcher.
+    """
+    from sam3.streaming_masks import EmptyMaskPool, MaskVideoWriter
+
+    pool = EmptyMaskPool(width, height)
+    writers: dict[int, MaskVideoWriter] = {}
+
+    for oid in sorted(object_ids):
+        out_path = masks_dir / f"object_{oid}_mask.mp4"
+        writers[oid] = MaskVideoWriter(out_path, fps, width, height)
 
     for fidx in range(total_frames):
         output = result_prompt.get(fidx)
-        for oid in object_ids:
-            mask_u8 = np.zeros((height, width), dtype=np.uint8)
+        for oid in sorted(object_ids):
+            writer = writers[oid]
             if output is not None:
                 out_ids = output.get("out_obj_ids", [])
                 if isinstance(out_ids, np.ndarray):
@@ -420,8 +432,12 @@ def _save_chunk_masks(
                     m = output["out_binary_masks"][idx]
                     if m.any():
                         mask_u8 = m.astype(np.uint8) * 255
-            png = masks_dir / f"object_{oid}" / f"frame_{fidx:06d}.png"
-            cv2.imwrite(str(png), mask_u8)
+                        writer.write_frame(mask_u8)
+                        continue
+            writer.write_black(1, pool=pool)
+
+    for w in writers.values():
+        w.close()
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +558,10 @@ def _get_mp_context():
 
 
 # ---------------------------------------------------------------------------
-# Stitching and overlay
+# Stitching and overlay (LEGACY — PNG-based fallback)
+# These functions are deprecated and no longer used by the main pipeline.
+# The production pipeline uses sam3.streaming_masks for MP4-based streaming.
+# Retained for backward compatibility and testing.
 # ---------------------------------------------------------------------------
 
 
@@ -1111,6 +1130,11 @@ def _process_video(
         ram_limit_bytes=max_ram_bytes,
         tier=memory_tier,
     )
+    # Initialise adaptive per-frame multiplier (learns from actual execution)
+    _vid_w = video_metadata.get("width", 1920)
+    _vid_h = video_metadata.get("height", 1080)
+    adaptive.init_adaptive_multiplier(_vid_w, _vid_h)
+
     if _mem_cap:
         print(f"  Simulated memory limit: {_mem_cap / (1024**3):.1f} GB")
     print()
@@ -1323,6 +1347,7 @@ def _process_video(
                                 video_metadata["width"],
                                 video_metadata["height"],
                                 new_cap,
+                                video_metadata.get("fps", 25),
                             )
                             carry[prompt] = _extract_last_frame_masks(result, obj_ids)
                             print(f"    {len(obj_ids)} object(s) (partial)")
@@ -1378,6 +1403,7 @@ def _process_video(
                         video_metadata["width"],
                         video_metadata["height"],
                         save_frame_count,
+                        video_metadata.get("fps", 25),
                     )
 
                     # Extract carry-forward
@@ -1476,6 +1502,7 @@ def _process_video(
                             vid_info["width"],
                             vid_info["height"],
                             new_cap,
+                            video_metadata.get("fps", 25),
                         )
                         carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
                         print(f"    {len(obj_ids)} object(s) (partial)")
@@ -1525,6 +1552,7 @@ def _process_video(
                         vid_info["width"],
                         vid_info["height"],
                         save_frame_count,
+                        video_metadata.get("fps", 25),
                     )
                     carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
                     print(f"    {len(obj_ids)} object(s)")
@@ -1620,6 +1648,7 @@ def _process_video(
                             vid_info["width"],
                             vid_info["height"],
                             new_cap,
+                            video_metadata.get("fps", 25),
                         )
                         carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
                         print(f"    {len(obj_ids)} object(s) (partial)")
@@ -1669,6 +1698,7 @@ def _process_video(
                         vid_info["width"],
                         vid_info["height"],
                         save_frame_count,
+                        video_metadata.get("fps", 25),
                     )
                     carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
                     print(f"    {len(obj_ids)} object(s)")
@@ -1948,6 +1978,7 @@ def _process_video(
         _baseline_vram = 0
         _growth_rate = 0.0
         _heaviest_peak = 0
+        _calibration_confidence = 0.0
         for mres in _chunk_monitor_results:
             cal_data = mres.get("calibration") if isinstance(mres, dict) else None
             mres_peak = mres.get("peak_vram_mb", 0) if isinstance(mres, dict) else 0
@@ -1957,6 +1988,7 @@ def _process_video(
                     _baseline_vram = int(cal_data["baseline_mb"] * (1024**2))
                 if cal_data.get("growth_rate_mb_per_iter"):
                     _growth_rate = cal_data["growth_rate_mb_per_iter"] * (1024**2)
+                _calibration_confidence = cal_data.get("r_squared", 0.0)
 
         rec = adaptive.record_chunk(
             chunk_id=chunk_id,
@@ -1967,6 +1999,7 @@ def _process_video(
             soft_warning_seen=any_soft_warning,
             baseline_vram_bytes=_baseline_vram,
             growth_rate_per_iter=_growth_rate,
+            calibration_confidence=_calibration_confidence,
         )
 
         if rec.action == "SHRINK":
@@ -2066,13 +2099,17 @@ def _process_video(
         safe = sanitize_filename(pk) if not pk.startswith("__") else pk.strip("_")
         oids = all_object_ids.get(pk, set())
         out = video_output / "masks" / safe
-        _stitch_masks_to_video(chunks_dir, safe, oids, chunk_list, overlap, out, fps, w, h)
+
+        # ── Stitch per-chunk mask MP4s into final per-object mask MP4s ──
+        from sam3.streaming_masks import create_overlay_from_masks, stitch_chunk_mask_videos
+
+        stitch_chunk_mask_videos(chunks_dir, safe, oids, chunk_list, overlap, out, fps, w, h)
 
         # Overlay
         mask_vids = sorted(out.glob("object_*_mask.mp4"))
         if mask_vids:
             overlay_path = video_output / f"overlay_{safe}.mp4"
-            _create_overlay_video(video_path, mask_vids, overlay_path, alpha)
+            create_overlay_from_masks(video_path, mask_vids, overlay_path, alpha)
 
     stitching_s = round(time.time() - t_stitch_start, 3)
 
@@ -2183,23 +2220,35 @@ def _process_video(
     with open(video_output / "metadata.json", "w") as f:
         json.dump(final_meta, f, indent=2, default=str)
 
-    # Also save the detailed cross-chunk IoU separately for evaluation
-    if cross_chunk_iou:
-        with open(meta_dir / "cross_chunk_iou.json", "w") as f:
-            json.dump(cross_chunk_iou, f, indent=2, default=str)
+    # Defensively re-create metadata/ — the directory is created early in the
+    # pipeline (line ~1152) but may vanish during very long runs (filesystem
+    # pressure, external cleanup, or OS reclamation).  The top-level
+    # metadata.json already contains everything; these files are convenience
+    # copies, so we also guard each write so a metadata-dir failure never
+    # crashes the pipeline after masks are already saved.
+    meta_dir.mkdir(parents=True, exist_ok=True)
 
-    # Also save object tracking separately for easy access
-    if objects_tracking:
-        with open(meta_dir / "object_tracking.json", "w") as f:
-            json.dump(objects_tracking, f, indent=2, default=str)
+    try:
+        # Also save the detailed cross-chunk IoU separately for evaluation
+        if cross_chunk_iou:
+            with open(meta_dir / "cross_chunk_iou.json", "w") as f:
+                json.dump(cross_chunk_iou, f, indent=2, default=str)
 
-    # Save memory predictor data separately for analysis
-    with open(meta_dir / "memory_predictor.json", "w") as f:
-        json.dump(predictor_summary, f, indent=2, default=str)
+        # Also save object tracking separately for easy access
+        if objects_tracking:
+            with open(meta_dir / "object_tracking.json", "w") as f:
+                json.dump(objects_tracking, f, indent=2, default=str)
 
-    # Save adaptive chunking data separately for analysis
-    with open(meta_dir / "adaptive_chunking.json", "w") as f:
-        json.dump(adaptive_summary, f, indent=2, default=str)
+        # Save memory predictor data separately for analysis
+        with open(meta_dir / "memory_predictor.json", "w") as f:
+            json.dump(predictor_summary, f, indent=2, default=str)
+
+        # Save adaptive chunking data separately for analysis
+        with open(meta_dir / "adaptive_chunking.json", "w") as f:
+            json.dump(adaptive_summary, f, indent=2, default=str)
+    except OSError as exc:
+        print(f"  ⚠ Could not write supplementary metadata files: {exc}")
+        print("    (All data is still available in metadata.json)")
 
     print()
     print("=" * 70)

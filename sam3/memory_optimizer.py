@@ -171,6 +171,156 @@ def clear_memory(device: str = "cuda", *, full_gc: bool = True) -> None:
 # ---------------------------------------------------------------------------
 
 
+class AdaptiveMultiplier:
+    """Learns per-frame memory cost from actual chunk execution.
+
+    The hard-coded ``MODEL_STATE_MULTIPLIER`` is a one-size-fits-all
+    heuristic.  It works reasonably for the prompt + resolution it was
+    calibrated on, but can be wildly wrong when the prompt changes (e.g.
+    "person" → "player") or when object count varies.
+
+    ``AdaptiveMultiplier`` replaces the static guess after the first
+    chunk completes by computing the *actual* bytes-per-iteration from
+    the ``IntraChunkMonitor``'s linear calibration.
+
+    Usage::
+
+        am = AdaptiveMultiplier(width=1920, height=1080)
+        # After each chunk, feed calibration:
+        am.update(growth_rate_per_iter=..., baseline_bytes=..., n_objects=...)
+        # Use for next chunk planning:
+        per_frame = am.estimate_per_frame_bytes()
+
+    The multiplier adapts automatically: prompt changes, resolution
+    changes, and object-count changes all get reflected immediately.
+    """
+
+    # Number of recent samples to keep for rolling average
+    _WINDOW: int = 5
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        device: str = "cuda",
+    ):
+        self.width = width
+        self.height = height
+        self.device = device
+        self._samples: list[dict] = []  # [{growth_rate, baseline, n_objects}]
+        self._calibrated: bool = False
+
+    def update(
+        self,
+        growth_rate_per_iter: float,
+        baseline_bytes: int,
+        n_objects: int = 1,
+        confidence: float = 0.0,
+    ) -> None:
+        """Feed calibration data from the most recent chunk.
+
+        Parameters
+        ----------
+        growth_rate_per_iter : float
+            VRAM growth per propagation iteration (bytes).  "both"
+            direction counts 2 iterations per frame.
+        baseline_bytes : int
+            VRAM allocated before propagation started (model + context).
+        n_objects : int
+            Number of tracked objects in the chunk.
+        confidence : float
+            R² confidence of the linear fit (0–1).
+        """
+        if growth_rate_per_iter <= 0 or confidence < 0.3:
+            return  # unreliable sample — skip
+
+        self._samples.append(
+            {
+                "growth_rate": growth_rate_per_iter,
+                "baseline": baseline_bytes,
+                "n_objects": max(n_objects, 1),
+                "confidence": confidence,
+            }
+        )
+        # Keep only recent window
+        if len(self._samples) > self._WINDOW:
+            self._samples = self._samples[-self._WINDOW :]
+        self._calibrated = True
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self._calibrated
+
+    def estimate_per_frame_bytes(self) -> int:
+        """Estimate per-frame cost using adaptive data or static fallback.
+
+        When calibrated, uses the rolling average of measured growth rate
+        (adjusted to per-frame via ×2 for "both" direction).  When not
+        calibrated, falls back to ``estimate_per_frame_bytes()`` with the
+        static ``MODEL_STATE_MULTIPLIER``.
+        """
+        if not self._calibrated or not self._samples:
+            return estimate_per_frame_bytes(self.width, self.height, self.device)
+
+        # Weighted average by confidence
+        total_weight = 0.0
+        total_rate = 0.0
+        for s in self._samples:
+            w = s["confidence"]
+            total_rate += s["growth_rate"] * w
+            total_weight += w
+
+        if total_weight <= 0:
+            return estimate_per_frame_bytes(self.width, self.height, self.device)
+
+        avg_rate = total_rate / total_weight
+        # growth_rate is per-iteration; "both" direction ≈ 2 iters/frame
+        per_frame = int(avg_rate * 2)
+        return max(per_frame, MIN_PER_FRAME_BYTES)
+
+    def compute_safe_frames(
+        self,
+        available_bytes: int,
+        baseline_bytes: int = 0,
+    ) -> int:
+        """Compute how many frames fit in *available_bytes*.
+
+        When calibrated, uses measured growth rate.  Otherwise uses the
+        static heuristic.
+        """
+        per_frame = self.estimate_per_frame_bytes()
+        if per_frame <= 0:
+            return 25  # minimum fallback
+
+        # Subtract baseline from available budget
+        effective = available_bytes - baseline_bytes
+        if effective <= 0:
+            return 25
+
+        frames = int(effective / per_frame)
+        return max(frames, 25)
+
+    def to_dict(self) -> dict:
+        """Export for metadata."""
+        static_est = estimate_per_frame_bytes(self.width, self.height, self.device)
+        adaptive_est = self.estimate_per_frame_bytes() if self._calibrated else None
+        return {
+            "calibrated": self._calibrated,
+            "n_samples": len(self._samples),
+            "static_per_frame_mb": round(static_est / (1024**2), 2),
+            "adaptive_per_frame_mb": (round(adaptive_est / (1024**2), 2) if adaptive_est else None),
+            "samples": [
+                {
+                    "growth_rate_mb": round(s["growth_rate"] / (1024**2), 3),
+                    "baseline_mb": round(s["baseline"] / (1024**2), 1),
+                    "n_objects": s["n_objects"],
+                    "confidence": s["confidence"],
+                }
+                for s in self._samples
+            ],
+        }
+
+
 def estimate_per_frame_bytes(
     width: int,
     height: int,
@@ -537,6 +687,9 @@ class AdaptiveChunkManager:
         self.rechunk_events: list = []
         self._consecutive_ooms = 0
 
+        # Adaptive per-frame multiplier — learns from actual propagation
+        self.adaptive_multiplier: AdaptiveMultiplier | None = None
+
     @property
     def effective_vram_limit(self) -> int:
         """Maximum total GPU allocation before we consider memory critical.
@@ -554,6 +707,42 @@ class AdaptiveChunkManager:
         except ImportError:
             reserve_pct = 0.05
         return int(self.vram_limit * (1 - reserve_pct))
+
+    def init_adaptive_multiplier(self, width: int, height: int) -> None:
+        """Initialise the adaptive per-frame multiplier for this video.
+
+        Call once after video metadata is known (before the first chunk).
+        """
+        self.adaptive_multiplier = AdaptiveMultiplier(
+            width=width,
+            height=height,
+            device=self.device,
+        )
+
+    def feed_calibration(
+        self,
+        growth_rate_per_iter: float,
+        baseline_bytes: int,
+        n_objects: int = 1,
+        confidence: float = 0.0,
+    ) -> None:
+        """Feed a chunk's calibration into the adaptive multiplier.
+
+        Safe to call even when adaptive_multiplier is *None* (no-op).
+        """
+        if self.adaptive_multiplier is not None and growth_rate_per_iter > 0:
+            self.adaptive_multiplier.update(
+                growth_rate_per_iter=growth_rate_per_iter,
+                baseline_bytes=baseline_bytes,
+                n_objects=n_objects,
+                confidence=confidence,
+            )
+
+    def get_adaptive_per_frame_bytes(self) -> int | None:
+        """Return calibrated per-frame estimate, or *None* if not ready."""
+        if self.adaptive_multiplier is not None and self.adaptive_multiplier.is_calibrated:
+            return self.adaptive_multiplier.estimate_per_frame_bytes()
+        return None
 
     def evaluate_pressure(self, peak_vram_bytes: int) -> str:
         """Classify memory pressure based on peak VRAM usage."""
@@ -631,6 +820,7 @@ class AdaptiveChunkManager:
         soft_warning_seen: bool = False,
         baseline_vram_bytes: int = 0,
         growth_rate_per_iter: float = 0.0,
+        calibration_confidence: float = 0.0,
     ) -> ChunkMemoryRecord:
         """Record a completed chunk and compute next chunk size.
 
@@ -663,6 +853,16 @@ class AdaptiveChunkManager:
         ``adjusted_chunk_size`` for the next chunk.
         """
         self._consecutive_ooms = 0  # reset on success
+
+        # ── Feed adaptive multiplier with calibration from this chunk ──
+        self.feed_calibration(
+            growth_rate_per_iter=growth_rate_per_iter,
+            baseline_bytes=baseline_vram_bytes,
+            n_objects=n_objects,
+            confidence=calibration_confidence
+            if calibration_confidence > 0
+            else (0.8 if growth_rate_per_iter > 0 else 0.0),
+        )
 
         pressure = self.evaluate_pressure(peak_vram_bytes)
         usage_pct = peak_vram_bytes / self.effective_vram_limit if self.effective_vram_limit > 0 else 0.0
@@ -822,7 +1022,7 @@ class AdaptiveChunkManager:
 
     def to_dict(self) -> dict:
         """Serialise full state for metadata export."""
-        return {
+        result = {
             "initial_chunk_size": self.initial_chunk_size,
             "final_chunk_size": self.current_chunk_size,
             "device": self.device,
@@ -852,6 +1052,10 @@ class AdaptiveChunkManager:
             ],
             "rechunk_events": self.rechunk_events,
         }
+        # Include adaptive multiplier data when available
+        if self.adaptive_multiplier is not None:
+            result["adaptive_multiplier"] = self.adaptive_multiplier.to_dict()
+        return result
 
 
 # ---------------------------------------------------------------------------

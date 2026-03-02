@@ -12,12 +12,16 @@
 - **Zero GPU footprint** — `--device cpu` hides GPUs completely (0 MiB VRAM used)
 - **Memory-aware chunking** — automatically splits long videos into chunks sized to available RAM / VRAM
 - **Cross-chunk continuity** — IoU-based mask remapping keeps object IDs consistent across chunks
+- **Streaming MP4 mask pipeline** — per-object mask videos written in real-time via queue-based GPU→CPU bridge (replaces legacy per-frame PNGs — ~100× fewer I/O operations)
+- **Simultaneous overlay compositing** — colour overlay is composited incrementally during propagation, not as a separate post-processing pass
+- **Adaptive memory multiplier** — learns actual per-frame VRAM cost from chunk execution instead of relying on a hardcoded estimate, improving chunk sizing accuracy after the first chunk
 - **Text, point, box & mask prompts** — unified API for all prompt types
 - **Video segment processing** — process a specific frame range or time range instead of the full video
 - **Interval-based object tracking** — appearance / disappearance intervals with timestamps and timecodes for every detected object
 - **Full cross-chunk IoU matrix** — complete pairwise IoU data for every chunk boundary, enabling offline evaluation
-- **Enriched metadata (v2.2.0)** — schema-versioned JSON with timing breakdown, peak / min memory tracking, per-chunk details, mask area statistics, async I/O stats, and thread configuration
+- **Enriched metadata (v2.2.0)** — schema-versioned JSON with timing breakdown, peak / min memory tracking, per-chunk details, mask area statistics, async I/O stats, adaptive multiplier data, and thread configuration
 - **Background memory sampling** — tracks peak and minimum RSS (and GPU peak) throughout the pipeline
+- **Pre-allocated empty mask pool** — reusable read-only black frames avoid repeated allocation when new objects appear mid-chunk
 - **CLI tools** — `image_prompter.py` and `video_prompter.py` for quick experiments
 
 ---
@@ -34,6 +38,8 @@
 - [Python API](#python-api)
 - [Video Chunking](#video-chunking)
   - [Memory Management Architecture](#memory-management-architecture)
+  - [Streaming Mask Pipeline](#streaming-mask-pipeline)
+  - [Adaptive Memory Multiplier](#adaptive-memory-multiplier)
 - [Output Structure](#output-structure)
 - [Metadata Reference](#metadata-reference)
   - [Schema Version](#schema-version)
@@ -466,7 +472,8 @@ proactive intra-chunk monitoring with reactive inter-chunk adaptation:
 
 | Module | Purpose |
 |---|---|
-| `sam3/memory_optimizer.py` | `IntraChunkMonitor`, `AdaptiveChunkManager`, memory utilities |
+| `sam3/memory_optimizer.py` | `IntraChunkMonitor`, `AdaptiveChunkManager`, `AdaptiveMultiplier`, memory utilities |
+| `sam3/streaming_masks.py` | `StreamingMaskWriter`, `MaskVideoWriter`, `EmptyMaskPool`, `StreamingOverlayCompositor` |
 | `sam3/async_io.py` | `AsyncIOWorker` — background thread for disk writes |
 | `sam3/memory_manager.py` | Static chunk planning (`compute_memory_safe_frames`) |
 | `sam3/memory_predictor.py` | Background OOM predictor (soft/hard stop callbacks) |
@@ -477,9 +484,91 @@ proactive intra-chunk monitoring with reactive inter-chunk adaptation:
 | Level | Usage % | Action |
 |---|---|---|
 | NORMAL | < 60% | May grow chunk size |
-| ELEVATED | 60–80% | Keep current size |
-| WARNING | 80–90% | Reduce chunk size |
-| CRITICAL | > 90% | Aggressively reduce |
+| ELEVATED | 60–85% | Keep current size |
+| WARNING | 85–95% | Reduce chunk size |
+| CRITICAL | ≥ 95% | Aggressively reduce |
+
+### Streaming Mask Pipeline
+
+The **streaming mask pipeline** (`sam3/streaming_masks.py`) replaces the legacy
+per-frame PNG approach with real-time MP4 encoding.  For a 1080p video with
+1125 frames and 3 objects, this reduces the output from **3,375 PNG files** to
+just **3 MP4 files**.
+
+**Architecture:**
+
+```
+┌──────────────┐    Queue     ┌────────────────────────────────┐
+│  GPU Thread  │─────────────>│  StreamingMaskWriter           │
+│  (propagate) │  MaskFrame   │  (background consumer thread)  │
+│              │  dataclass   │                                │
+│  push_frame()│              │  ├─ MaskVideoWriter per object │
+│              │              │  │  (mp4v, grayscale, lossless) │
+│              │              │  │                              │
+│              │              │  ├─ EmptyMaskPool               │
+│              │              │  │  (shared read-only black     │
+│              │              │  │   frame, zero-copy)          │
+│              │              │  │                              │
+│              │              │  └─ StreamingOverlayCompositor  │
+│              │              │     (incremental colour overlay)│
+└──────────────┘   finish()   └────────────────────────────────┘
+                   ─────>       flush + close all writers
+```
+
+**Key components:**
+
+| Class | Purpose |
+|---|---|
+| `EmptyMaskPool` | Shared read-only black frame — avoids repeated `np.zeros()` allocation when new objects appear mid-chunk |
+| `MaskVideoWriter` | Thread-safe per-object MP4 writer with `write_frame()` and `write_black()` |
+| `StreamingOverlayCompositor` | Reads original video frames in lockstep and composites colour masks incrementally |
+| `StreamingMaskWriter` | Queue-based GPU→CPU bridge: GPU thread pushes mask data, background consumer encodes MP4s and composites overlay simultaneously |
+| `stitch_chunk_mask_videos()` | Cross-chunk MP4 stitcher (reads chunk-level mask MP4s, skips overlap, writes final output) |
+| `create_overlay_from_masks()` | Fallback overlay builder from stitched mask MP4 files |
+
+**Performance gains:**
+- ~100× fewer I/O operations (1 MP4 per object vs. N PNGs per object)
+- GPU and CPU work in parallel via the queue bridge
+- Zero-copy black frame pool eliminates allocation overhead for new objects
+- Overlay compositing happens during propagation, not as a separate pass
+
+### Adaptive Memory Multiplier
+
+The initial chunk size is computed using `MODEL_STATE_MULTIPLIER` (default 4.5),
+a static heuristic for how many bytes of VRAM each video frame requires.  This
+works well for the resolution and prompt it was calibrated on, but can be
+inaccurate when object count, resolution, or prompt complexity changes.
+
+The **`AdaptiveMultiplier`** (`sam3/memory_optimizer.py`) fixes this by
+learning from actual chunk execution:
+
+```
+Chunk 0 (static estimate)
+  │ MODEL_STATE_MULTIPLIER = 4.5
+  │ estimate: 70 MB/frame
+  ▼
+IntraChunkMonitor calibrates:
+  │ Measured growth_rate = 35 MB/iter
+  │ Effective per-frame = 35 × 2 = 70 MB  ← confirms static estimate
+  │ R² = 0.94 (high confidence)
+  ▼
+AdaptiveMultiplier.update()
+  │ Stores sample: {growth_rate, baseline, n_objects, confidence}
+  │ Rolling window of last 5 chunks
+  ▼
+Chunk 1+ (adaptive estimate)
+  │ Uses weighted average of measured growth rates
+  │ Weighted by confidence (R²)
+  │ Replaces static 4.5× with actual cost
+  ▼
+Better chunk sizing → fewer OOMs, fewer unnecessary boundaries
+```
+
+**Key properties:**
+- **Zero overhead on chunk 0** — falls back to static `MODEL_STATE_MULTIPLIER`
+- **Self-correcting** — rolling window of last 5 chunks, weighted by confidence (R²)
+- **Reject bad data** — samples with R² < 0.3 or negative growth are silently dropped
+- **Exported in metadata** — `adaptive_multiplier` section in `metadata.json` shows static vs. adaptive estimates and all calibration samples
 
 ---
 
@@ -510,11 +599,11 @@ results/images/
 
 ```
 results/<video_name>/
-├── metadata.json                   # enriched run metadata (schema v2.0.0)
+├── metadata.json                   # enriched run metadata (schema v2.2.0)
 ├── overlay_<prompt>.mp4            # coloured overlay on original video
 ├── masks/
 │   └── <prompt>/
-│       ├── object_0_mask.mp4       # binary mask video per object
+│       ├── object_0_mask.mp4       # binary mask video per object (lossless MP4)
 │       └── object_1_mask.mp4
 ├── metadata/
 │   ├── video_metadata.json         # fps, resolution, frame count, chunk plan
@@ -524,7 +613,7 @@ results/<video_name>/
 └── temp_files/                     # only when --keep-temp is set
     └── chunks/
         └── chunk_<id>/
-            └── masks/<prompt>/object_<id>/*.png
+            └── masks/<prompt>/object_<id>_mask.mp4  # per-chunk mask MP4
 ```
 
 ---
@@ -916,8 +1005,9 @@ sam3-cpu/
 │   ├── chunk_processor.py     # ChunkProcessor (cross-chunk logic)
 │   ├── postprocessor.py       # VideoPostProcessor
 │   ├── memory_manager.py      # MemoryManager (static chunk planning)
-│   ├── memory_optimizer.py    # IntraChunkMonitor, AdaptiveChunkManager
+│   ├── memory_optimizer.py    # IntraChunkMonitor, AdaptiveChunkManager, AdaptiveMultiplier
 │   ├── memory_predictor.py    # Background OOM predictor
+│   ├── streaming_masks.py     # StreamingMaskWriter, MaskVideoWriter, EmptyMaskPool
 │   ├── async_io.py            # AsyncIOWorker (background disk writes)
 │   ├── model_builder.py       # Model loading
 │   ├── __globals.py           # Constants & defaults
@@ -954,10 +1044,10 @@ stitching, and metadata generation using synthetic data.
 |---|---|
 | `test_iou_matching.py` | IoU computation, mask matching between chunks |
 | `test_cross_chunk.py` | Cross-chunk ID remapping and continuity |
-| `test_video_prompter.py` | Video prompter helpers — stitching, overlay, timestamp parsing, range resolution, object tracking |
+| `test_video_prompter.py` | Video prompter helpers — streaming mask pipeline, stitching, overlay, timestamp parsing, range resolution, object tracking, EmptyMaskPool, MaskVideoWriter |
 | `test_chunks_injection.py` | Chunk injection and boundary handling |
 | `test_postprocessor_isolated.py` | Post-processing logic in isolation |
-| `test_intra_chunk_monitor.py` | IntraChunkMonitor calibration, checkpoints, and hard-stop logic |
+| `test_intra_chunk_monitor.py` | IntraChunkMonitor calibration, checkpoints, hard-stop logic, AdaptiveMultiplier learning |
 | `test_all_scenarios.py` | End-to-end scenarios (requires model + assets — skipped when unavailable) |
 | `conftest.py` | Shared fixtures: asset paths, temp directories, markers |
 
@@ -1074,8 +1164,12 @@ channel for all project-level discussions.
 - **Performance optimisation** — Further speed-up through model quantisation,
   batched inference, and frame-level parallelism to reduce wall-clock time
   on CPU.
-- **CI/CD pipeline** — GitHub Actions for automated testing, linting, and
-  release packaging.
+- **H.265 mask encoding** — Investigate H.265 (HEVC) for mask videos to
+  further reduce file size while maintaining lossless quality.
+- **Real-time preview** — Leverage the streaming mask pipeline to provide
+  live preview of segmentation during processing.
+- **Multi-GPU batch processing** — Distribute chunks across multiple GPUs
+  for linear speed-up on multi-GPU servers.
 
 ---
 

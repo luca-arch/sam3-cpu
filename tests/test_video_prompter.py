@@ -5,10 +5,6 @@ Exercises the stitching, overlay, IoU remapping, mask saving, and
 memory-table helpers WITHOUT loading the SAM3 model.
 """
 
-import shutil
-import tempfile
-from pathlib import Path
-
 import cv2
 import numpy as np
 import pytest
@@ -28,10 +24,10 @@ from video_prompter import (
     _table,
 )
 
-
 # ---------------------------------------------------------------------------
 # _fmt
 # ---------------------------------------------------------------------------
+
 
 class TestFmt:
     def test_bytes(self):
@@ -48,6 +44,7 @@ class TestFmt:
 # _table (just ensure no crash)
 # ---------------------------------------------------------------------------
 
+
 class TestTable:
     def test_empty(self, capsys):
         _table([])
@@ -63,15 +60,18 @@ class TestTable:
 # _extract_last_frame_masks
 # ---------------------------------------------------------------------------
 
+
 class TestExtractLastFrameMasks:
     def test_empty(self):
         assert _extract_last_frame_masks({}, {0, 1}) == {}
 
     def test_single_frame(self):
-        masks = np.array([
-            np.ones((10, 10), dtype=bool),
-            np.zeros((10, 10), dtype=bool),
-        ])
+        masks = np.array(
+            [
+                np.ones((10, 10), dtype=bool),
+                np.zeros((10, 10), dtype=bool),
+            ]
+        )
         result = {
             0: {
                 "out_obj_ids": np.array([0, 1]),
@@ -81,7 +81,7 @@ class TestExtractLastFrameMasks:
         out = _extract_last_frame_masks(result, {0, 1})
         assert 0 in out and 1 in out
         assert out[0].max() == 255  # All-ones mask → 255
-        assert out[1].max() == 0   # All-zeros mask → 0
+        assert out[1].max() == 0  # All-zeros mask → 0
 
     def test_last_frame_picked(self):
         m0 = np.zeros((5, 5), dtype=bool)
@@ -98,6 +98,7 @@ class TestExtractLastFrameMasks:
 # ---------------------------------------------------------------------------
 # _compute_iou  (mirrors test_iou_matching tests for prompter's local copy)
 # ---------------------------------------------------------------------------
+
 
 class TestComputeIoU:
     def test_identical(self):
@@ -120,6 +121,7 @@ class TestComputeIoU:
 # ---------------------------------------------------------------------------
 # _match_and_remap
 # ---------------------------------------------------------------------------
+
 
 class TestMatchAndRemap:
     def test_first_chunk_increments(self):
@@ -177,33 +179,35 @@ class TestMatchAndRemap:
 # _save_chunk_masks
 # ---------------------------------------------------------------------------
 
+
 class TestSaveChunkMasks:
-    def test_creates_pngs(self, tmp_path):
+    def test_creates_mask_videos(self, tmp_path):
+        """_save_chunk_masks writes per-object MP4 mask videos."""
         masks = np.array([np.ones((10, 10), dtype=bool)])
         result = {
             0: {"out_obj_ids": np.array([0]), "out_binary_masks": masks},
             1: {"out_obj_ids": np.array([0]), "out_binary_masks": masks},
         }
         masks_dir = tmp_path / "masks" / "prompt"
-        _save_chunk_masks(result, {0}, masks_dir, 10, 10, 3)
+        _save_chunk_masks(result, {0}, masks_dir, 10, 10, 3, fps=10.0)
 
-        obj_dir = masks_dir / "object_0"
-        assert obj_dir.exists()
-        pngs = sorted(obj_dir.glob("frame_*.png"))
-        assert len(pngs) == 3  # 3 frames
+        # Should create one MP4 per object (no per-frame PNGs)
+        mp4 = masks_dir / "object_0_mask.mp4"
+        assert mp4.exists()
 
-        # Frame 0 should be white (mask), frame 2 should be black (no data)
-        from PIL import Image as _PILImage
-        arr0 = np.array(_PILImage.open(pngs[0]))
-        assert arr0.max() == 255
+        # Verify frame count via OpenCV
+        import cv2
 
-        arr2 = np.array(_PILImage.open(pngs[2]))
-        assert arr2.max() == 0  # frame 2 not in result → black
+        cap = cv2.VideoCapture(str(mp4))
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        assert n_frames == 3  # 3 total frames
 
 
 # ---------------------------------------------------------------------------
 # _stitch_masks_to_video (multi-chunk)
 # ---------------------------------------------------------------------------
+
 
 class TestStitchMasks:
     def _setup_chunks(self, tmp_path, n_chunks, frames_per_chunk, overlap, obj_ids):
@@ -300,6 +304,7 @@ class TestStitchMasks:
 # _create_overlay_video
 # ---------------------------------------------------------------------------
 
+
 class TestOverlay:
     def test_overlay_produces_video(self, tmp_path):
         """Overlay with a synthetic video and mask."""
@@ -335,6 +340,7 @@ class TestOverlay:
 # _parse_timestamp
 # ---------------------------------------------------------------------------
 
+
 class TestParseTimestamp:
     def test_plain_float(self):
         assert _parse_timestamp("4.5") == 4.5
@@ -367,6 +373,7 @@ class TestParseTimestamp:
 # _resolve_range
 # ---------------------------------------------------------------------------
 
+
 class TestResolveRange:
     def test_no_range_returns_none(self, tmp_path):
         assert _resolve_range(tmp_path / "v.mp4", None, None) is None
@@ -379,6 +386,7 @@ class TestResolveRange:
 # ---------------------------------------------------------------------------
 # _build_object_tracking
 # ---------------------------------------------------------------------------
+
 
 class TestBuildObjectTracking:
     def test_empty_set(self, tmp_path):
@@ -464,6 +472,7 @@ class TestBuildObjectTracking:
 # Parallel postprocessing tests
 # ---------------------------------------------------------------------------
 
+
 class TestParallelStitching:
     """Verify that multi-object stitching works with parallel workers."""
 
@@ -490,13 +499,19 @@ class TestParallelStitching:
     def test_parallel_stitch_multi_objects(self, tmp_path):
         """5 objects should be stitched in parallel (max_workers > 1)."""
         n_obj = 5
-        chunks_dir, chunk_infos = self._setup_multi_object_chunks(
-            tmp_path, n_obj, 2, 10, 3
-        )
+        chunks_dir, chunk_infos = self._setup_multi_object_chunks(tmp_path, n_obj, 2, 10, 3)
         out = tmp_path / "out"
         _stitch_masks_to_video(
-            chunks_dir, "test", set(range(n_obj)), chunk_infos, 3,
-            out, 25, 10, 10, max_workers=4,
+            chunks_dir,
+            "test",
+            set(range(n_obj)),
+            chunk_infos,
+            3,
+            out,
+            25,
+            10,
+            10,
+            max_workers=4,
         )
         # All 5 mask videos should exist
         for oid in range(n_obj):
@@ -510,13 +525,19 @@ class TestParallelStitching:
 
     def test_sequential_fallback_one_object(self, tmp_path):
         """Single object should use sequential path (no subprocess spawn)."""
-        chunks_dir, chunk_infos = self._setup_multi_object_chunks(
-            tmp_path, 1, 1, 8, 0
-        )
+        chunks_dir, chunk_infos = self._setup_multi_object_chunks(tmp_path, 1, 1, 8, 0)
         out = tmp_path / "out"
         _stitch_masks_to_video(
-            chunks_dir, "test", {0}, chunk_infos, 0,
-            out, 25, 10, 10, max_workers=1,
+            chunks_dir,
+            "test",
+            {0},
+            chunk_infos,
+            0,
+            out,
+            25,
+            10,
+            10,
+            max_workers=1,
         )
         mp4 = out / "object_0_mask.mp4"
         assert mp4.exists()
@@ -527,13 +548,19 @@ class TestParallelStitching:
 
     def test_forced_max_workers_1(self, tmp_path):
         """max_workers=1 forces sequential even with multiple objects."""
-        chunks_dir, chunk_infos = self._setup_multi_object_chunks(
-            tmp_path, 3, 1, 5, 0
-        )
+        chunks_dir, chunk_infos = self._setup_multi_object_chunks(tmp_path, 3, 1, 5, 0)
         out = tmp_path / "out"
         _stitch_masks_to_video(
-            chunks_dir, "test", {0, 1, 2}, chunk_infos, 0,
-            out, 25, 10, 10, max_workers=1,
+            chunks_dir,
+            "test",
+            {0, 1, 2},
+            chunk_infos,
+            0,
+            out,
+            25,
+            10,
+            10,
+            max_workers=1,
         )
         for oid in range(3):
             assert (out / f"object_{oid}_mask.mp4").exists()
@@ -561,7 +588,11 @@ class TestParallelTracking:
         n_obj = 6
         fps = self._make_mask_videos(tmp_path, n_obj, 20)
         result = _build_object_tracking(
-            tmp_path, set(range(n_obj)), fps, 0, max_workers=4,
+            tmp_path,
+            set(range(n_obj)),
+            fps,
+            0,
+            max_workers=4,
         )
         assert len(result) == n_obj
         ids = [r["object_id"] for r in result]
@@ -576,8 +607,114 @@ class TestParallelTracking:
         """max_workers=1 forces sequential processing."""
         fps = self._make_mask_videos(tmp_path, 3, 10)
         result = _build_object_tracking(
-            tmp_path, {0, 1, 2}, fps, 0, max_workers=1,
+            tmp_path,
+            {0, 1, 2},
+            fps,
+            0,
+            max_workers=1,
         )
         assert len(result) == 3
         ids = [r["object_id"] for r in result]
         assert ids == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Streaming Mask Infrastructure
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyMaskPool:
+    """Tests for EmptyMaskPool shared black frame."""
+
+    def test_returns_black_frame(self):
+        from sam3.streaming_masks import EmptyMaskPool
+
+        pool = EmptyMaskPool(32, 24)
+        frame = pool.get_black_frame()
+        assert frame.shape == (24, 32)
+        assert frame.dtype == np.uint8
+        assert frame.max() == 0
+
+    def test_read_only(self):
+        from sam3.streaming_masks import EmptyMaskPool
+
+        pool = EmptyMaskPool(16, 16)
+        frame = pool.get_black_frame()
+        assert not frame.flags.writeable
+
+
+class TestMaskVideoWriter:
+    """Tests for per-object lossless mask MP4 writer."""
+
+    def test_write_and_read_back(self, tmp_path):
+        import cv2
+
+        from sam3.streaming_masks import MaskVideoWriter
+
+        out = tmp_path / "mask.mp4"
+        writer = MaskVideoWriter(out, 10.0, 32, 32)
+
+        # Write 5 white frames
+        white = np.ones((32, 32), dtype=np.uint8) * 255
+        for _ in range(5):
+            writer.write_frame(white)
+        writer.close()
+
+        assert out.exists()
+        cap = cv2.VideoCapture(str(out))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        assert n == 5
+
+    def test_write_black_with_pool(self, tmp_path):
+        import cv2
+
+        from sam3.streaming_masks import EmptyMaskPool, MaskVideoWriter
+
+        out = tmp_path / "mask.mp4"
+        pool = EmptyMaskPool(20, 20)
+        writer = MaskVideoWriter(out, 10.0, 20, 20)
+        writer.write_black(3, pool=pool)
+        writer.close()
+
+        cap = cv2.VideoCapture(str(out))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        assert n == 3
+
+    def test_frame_count_tracked(self, tmp_path):
+        from sam3.streaming_masks import MaskVideoWriter
+
+        out = tmp_path / "mask.mp4"
+        writer = MaskVideoWriter(out, 10.0, 16, 16)
+        white = np.ones((16, 16), dtype=np.uint8) * 255
+        writer.write_frame(white)
+        writer.write_frame(white)
+        assert writer.frames_written == 2
+        writer.close()
+
+
+class TestStreamingMaskWriterIntegration:
+    """Integration test: save_chunk_masks with multi-object streaming."""
+
+    def test_multi_object_masks(self, tmp_path):
+        """Multiple objects produce separate MP4 files."""
+        import cv2
+
+        masks_dir = tmp_path / "masks"
+        # Two objects, 4 frames total
+        mask0 = np.array([np.ones((10, 10), dtype=bool)])
+        mask1 = np.array([np.zeros((10, 10), dtype=bool)])
+        result = {
+            0: {"out_obj_ids": np.array([0, 1]), "out_binary_masks": np.stack([mask0[0], mask1[0]])},
+            1: {"out_obj_ids": np.array([0, 1]), "out_binary_masks": np.stack([mask0[0], mask1[0]])},
+        }
+        _save_chunk_masks(result, {0, 1}, masks_dir, 10, 10, 4, fps=10.0)
+
+        for oid in [0, 1]:
+            mp4 = masks_dir / f"object_{oid}_mask.mp4"
+            assert mp4.exists()
+            cap = cv2.VideoCapture(str(mp4))
+            n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            assert n == 4  # all 4 frames written (2 with data, 2 black)

@@ -5,25 +5,25 @@ import math
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sam3.async_io import AsyncIOWorker
 from sam3.memory_optimizer import (
-    IntraChunkMonitor,
     AdaptiveChunkManager,
     FrameMemorySample,
     GrowthCalibration,
+    IntraChunkMonitor,
     MonitorResult,
     _linear_regression,
     get_memory_tier,
 )
-from sam3.async_io import AsyncIOWorker
-
 
 # ---------------------------------------------------------------------------
 # _linear_regression
 # ---------------------------------------------------------------------------
+
 
 class TestLinearRegression:
     """Tests for the pure-Python linear regression helper."""
@@ -59,6 +59,7 @@ class TestLinearRegression:
 # ---------------------------------------------------------------------------
 # IntraChunkMonitor
 # ---------------------------------------------------------------------------
+
 
 class TestIntraChunkMonitor:
     """Tests for the proactive intra-chunk memory monitor."""
@@ -310,6 +311,7 @@ class TestIntraChunkMonitor:
         steady_vram = 19.5  # GB — after init, growth is near-zero
 
         call_count = [0]
+
         def memory_allocated():
             idx = call_count[0]
             call_count[0] += 1
@@ -324,9 +326,7 @@ class TestIntraChunkMonitor:
             # Run 20 frames — should NOT stop (19.5GB on 80GB = 24%)
             for i in range(20):
                 result = monitor.check(frame_idx=i)
-                assert result is True, (
-                    f"False stop at frame {i}: {monitor._stop_reason}"
-                )
+                assert result is True, f"False stop at frame {i}: {monitor._stop_reason}"
 
     def test_recalibration_updates_slope(self):
         """Calibration should be re-fitted periodically."""
@@ -339,21 +339,27 @@ class TestIntraChunkMonitor:
         # Inject steep warmup samples
         base = 1_000_000_000
         for i in range(5):
-            monitor._samples.append(FrameMemorySample(
-                iteration=i, frame_idx=i,
-                vram_allocated=base + 500_000_000 * i,  # 500MB/iter startup
-                timestamp=time.time(),
-            ))
+            monitor._samples.append(
+                FrameMemorySample(
+                    iteration=i,
+                    frame_idx=i,
+                    vram_allocated=base + 500_000_000 * i,  # 500MB/iter startup
+                    timestamp=time.time(),
+                )
+            )
         monitor._calibrate()
         initial_slope = monitor._calibration.growth_rate_per_iter
 
         # Inject steady-state samples (much flatter)
         for i in range(10, 60, 10):
-            monitor._samples.append(FrameMemorySample(
-                iteration=i, frame_idx=i,
-                vram_allocated=base + 3_000_000_000 + 5_000_000 * (i - 10),
-                timestamp=time.time(),
-            ))
+            monitor._samples.append(
+                FrameMemorySample(
+                    iteration=i,
+                    frame_idx=i,
+                    vram_allocated=base + 3_000_000_000 + 5_000_000 * (i - 10),
+                    timestamp=time.time(),
+                )
+            )
         monitor._calibrate()
         recal_slope = monitor._calibration.growth_rate_per_iter
 
@@ -373,13 +379,9 @@ class TestIntraChunkMonitor:
         # Simulate RSS = 20GB → 89% of effective → above 85%
         with patch("sam3.memory_optimizer.psutil") as mock_psutil:
             mock_process = MagicMock()
-            mock_process.memory_info.return_value = MagicMock(
-                rss=int(20 * 1024**3)
-            )
+            mock_process.memory_info.return_value = MagicMock(rss=int(20 * 1024**3))
             mock_psutil.Process.return_value = mock_process
-            mock_psutil.virtual_memory.return_value = MagicMock(
-                total=32 * 1024**3
-            )
+            mock_psutil.virtual_memory.return_value = MagicMock(total=32 * 1024**3)
 
             monitor.start()
             result = monitor.check(frame_idx=0)
@@ -399,13 +401,9 @@ class TestIntraChunkMonitor:
         # 4GB RSS = ~18% → well below limits
         with patch("sam3.memory_optimizer.psutil") as mock_psutil:
             mock_process = MagicMock()
-            mock_process.memory_info.return_value = MagicMock(
-                rss=int(4 * 1024**3)
-            )
+            mock_process.memory_info.return_value = MagicMock(rss=int(4 * 1024**3))
             mock_psutil.Process.return_value = mock_process
-            mock_psutil.virtual_memory.return_value = MagicMock(
-                total=32 * 1024**3
-            )
+            mock_psutil.virtual_memory.return_value = MagicMock(total=32 * 1024**3)
 
             monitor.start()
             result = monitor.check(frame_idx=0)
@@ -416,6 +414,7 @@ class TestIntraChunkMonitor:
 # ---------------------------------------------------------------------------
 # AdaptiveChunkManager — object-aware growth
 # ---------------------------------------------------------------------------
+
 
 class TestObjectAwareGrowth:
     """Tests for damped growth when many objects are tracked.
@@ -434,7 +433,8 @@ class TestObjectAwareGrowth:
         )
         gf = mgr.GROW_FACTOR
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
+            chunk_id=0,
+            chunk_size=500,
             peak_vram_bytes=int(80 * 1024**3 * 0.95 * 0.3),  # 30% usage
             n_objects=1,
         )
@@ -451,7 +451,8 @@ class TestObjectAwareGrowth:
         )
         gf = mgr.GROW_FACTOR
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
+            chunk_id=0,
+            chunk_size=500,
             peak_vram_bytes=int(80 * 1024**3 * 0.95 * 0.3),
             n_objects=29,
         )
@@ -471,7 +472,8 @@ class TestObjectAwareGrowth:
         )
         gf = mgr.GROW_FACTOR
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
+            chunk_id=0,
+            chunk_size=500,
             peak_vram_bytes=int(80 * 1024**3 * 0.95 * 0.3),
             n_objects=2,
         )
@@ -488,7 +490,8 @@ class TestObjectAwareGrowth:
         )
         gf = mgr.GROW_FACTOR
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
+            chunk_id=0,
+            chunk_size=500,
             peak_vram_bytes=int(80 * 1024**3 * 0.95 * 0.3),
             n_objects=0,
         )
@@ -506,14 +509,13 @@ class TestObjectAwareGrowth:
         # Low peak_vram (30%) would normally trigger GROW
         low_peak = int(80 * 1024**3 * 0.95 * 0.3)
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
+            chunk_id=0,
+            chunk_size=500,
             peak_vram_bytes=low_peak,
             n_objects=1,
             soft_warning_seen=True,
         )
-        assert rec.action == "CONTINUE", (
-            f"Expected CONTINUE when soft_warning_seen=True, got {rec.action}"
-        )
+        assert rec.action == "CONTINUE", f"Expected CONTINUE when soft_warning_seen=True, got {rec.action}"
         assert rec.adjusted_chunk_size == 500  # unchanged
 
     def test_soft_warning_allows_shrink(self):
@@ -525,10 +527,13 @@ class TestObjectAwareGrowth:
         )
         # On CPU, vram_limit defaults to 0.  Override for pressure eval.
         mgr.vram_limit = 80 * 1024**3
-        # High peak_vram (85%) → WARNING → SHRINK regardless of flag
-        high_peak = int(80 * 1024**3 * 0.95 * 0.85)
+        # High peak_vram (87%) → WARNING → SHRINK regardless of flag
+        # (use 0.87, safely above WARNING_THRESHOLD=0.85 to avoid
+        # floating-point truncation with int())
+        high_peak = int(80 * 1024**3 * 0.95 * 0.87)
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
+            chunk_id=0,
+            chunk_size=500,
             peak_vram_bytes=high_peak,
             n_objects=1,
             soft_warning_seen=True,
@@ -539,6 +544,7 @@ class TestObjectAwareGrowth:
 # ---------------------------------------------------------------------------
 # AsyncIOWorker
 # ---------------------------------------------------------------------------
+
 
 class TestAsyncIOWorker:
     """Tests for the background I/O worker."""
@@ -630,6 +636,7 @@ class TestAsyncIOWorker:
         worker.start()
 
         import threading
+
         event = threading.Event()
 
         def blocking():
@@ -662,6 +669,7 @@ class TestAsyncIOWorker:
 # ---------------------------------------------------------------------------
 # Memory tier detection
 # ---------------------------------------------------------------------------
+
 
 class TestMemoryTier:
     """Tests for get_memory_tier auto-detection."""
@@ -723,6 +731,7 @@ class TestMemoryTier:
 # Object count trend in growth
 # ---------------------------------------------------------------------------
 
+
 class TestObjectCountTrend:
     """Tests for chunk-to-chunk object count trend adjustment."""
 
@@ -735,11 +744,9 @@ class TestObjectCountTrend:
         )
         low_peak = int(80 * 1024**3 * 0.95 * 0.2)
         # Chunk 0: 10 objects
-        rec0 = mgr.record_chunk(chunk_id=0, chunk_size=500,
-                                peak_vram_bytes=low_peak, n_objects=10)
+        rec0 = mgr.record_chunk(chunk_id=0, chunk_size=500, peak_vram_bytes=low_peak, n_objects=10)
         # Chunk 1: 20 objects (100% increase)
-        rec1 = mgr.record_chunk(chunk_id=1, chunk_size=rec0.adjusted_chunk_size,
-                                peak_vram_bytes=low_peak, n_objects=20)
+        rec1 = mgr.record_chunk(chunk_id=1, chunk_size=rec0.adjusted_chunk_size, peak_vram_bytes=low_peak, n_objects=20)
         assert rec1.action == "GROW"
         # The dampened growth for 20 objects with increasing trend should be
         # less than the dampened growth for 20 objects without trend
@@ -748,8 +755,7 @@ class TestObjectCountTrend:
             device="cpu",
             vram_limit_bytes=80 * 1024**3,
         )
-        ref = mgr2.record_chunk(chunk_id=0, chunk_size=rec0.adjusted_chunk_size,
-                                peak_vram_bytes=low_peak, n_objects=20)
+        ref = mgr2.record_chunk(chunk_id=0, chunk_size=rec0.adjusted_chunk_size, peak_vram_bytes=low_peak, n_objects=20)
         assert rec1.adjusted_chunk_size <= ref.adjusted_chunk_size
 
     def test_decreasing_objects_boosts_growth(self):
@@ -761,11 +767,9 @@ class TestObjectCountTrend:
         )
         low_peak = int(80 * 1024**3 * 0.95 * 0.2)
         # Chunk 0: 20 objects
-        rec0 = mgr.record_chunk(chunk_id=0, chunk_size=500,
-                                peak_vram_bytes=low_peak, n_objects=20)
+        rec0 = mgr.record_chunk(chunk_id=0, chunk_size=500, peak_vram_bytes=low_peak, n_objects=20)
         # Chunk 1: 5 objects (75% decrease)
-        rec1 = mgr.record_chunk(chunk_id=1, chunk_size=rec0.adjusted_chunk_size,
-                                peak_vram_bytes=low_peak, n_objects=5)
+        rec1 = mgr.record_chunk(chunk_id=1, chunk_size=rec0.adjusted_chunk_size, peak_vram_bytes=low_peak, n_objects=5)
         assert rec1.action == "GROW"
         # With decreasing objects, growth should be higher than baseline
         mgr2 = AdaptiveChunkManager(
@@ -773,8 +777,7 @@ class TestObjectCountTrend:
             device="cpu",
             vram_limit_bytes=80 * 1024**3,
         )
-        ref = mgr2.record_chunk(chunk_id=0, chunk_size=rec0.adjusted_chunk_size,
-                                peak_vram_bytes=low_peak, n_objects=5)
+        ref = mgr2.record_chunk(chunk_id=0, chunk_size=rec0.adjusted_chunk_size, peak_vram_bytes=low_peak, n_objects=5)
         assert rec1.adjusted_chunk_size >= ref.adjusted_chunk_size
 
     def test_stable_objects_no_trend_effect(self):
@@ -786,11 +789,9 @@ class TestObjectCountTrend:
         )
         low_peak = int(80 * 1024**3 * 0.95 * 0.2)
         # Chunk 0: 10 objects
-        rec0 = mgr.record_chunk(chunk_id=0, chunk_size=500,
-                                peak_vram_bytes=low_peak, n_objects=10)
+        rec0 = mgr.record_chunk(chunk_id=0, chunk_size=500, peak_vram_bytes=low_peak, n_objects=10)
         # Chunk 1: 11 objects (10% increase, within ±20%)
-        rec1 = mgr.record_chunk(chunk_id=1, chunk_size=rec0.adjusted_chunk_size,
-                                peak_vram_bytes=low_peak, n_objects=11)
+        rec1 = mgr.record_chunk(chunk_id=1, chunk_size=rec0.adjusted_chunk_size, peak_vram_bytes=low_peak, n_objects=11)
         assert rec1.action == "GROW"
         # Compare with fresh manager (no history)
         mgr2 = AdaptiveChunkManager(
@@ -798,8 +799,7 @@ class TestObjectCountTrend:
             device="cpu",
             vram_limit_bytes=80 * 1024**3,
         )
-        ref = mgr2.record_chunk(chunk_id=0, chunk_size=rec0.adjusted_chunk_size,
-                                peak_vram_bytes=low_peak, n_objects=11)
+        ref = mgr2.record_chunk(chunk_id=0, chunk_size=rec0.adjusted_chunk_size, peak_vram_bytes=low_peak, n_objects=11)
         # Same result — no trend penalty/bonus
         assert rec1.adjusted_chunk_size == ref.adjusted_chunk_size
 
@@ -807,6 +807,7 @@ class TestObjectCountTrend:
 # ---------------------------------------------------------------------------
 # Baseline-aware shrink targeting
 # ---------------------------------------------------------------------------
+
 
 class TestBaselineAwareShrink:
     """Tests for proportional, baseline-aware shrink in record_chunk."""
@@ -830,14 +831,17 @@ class TestBaselineAwareShrink:
         return int(self.VRAM_LIMIT * 0.95)
 
     def test_critical_with_baseline_targets_shrink_pct(self):
-        """CRITICAL (>90%) with baseline should target SHRINK_TARGET_PCT."""
+        """CRITICAL (>=95%) with baseline should target SHRINK_TARGET_PCT."""
         mgr = self._make_mgr(975)
         baseline = int(self.eff * 0.78)  # 78% baseline (model weights)
-        peak = int(self.eff * 0.93)      # 93% peak → CRITICAL
+        # Use 0.96 for peak — safely above CRITICAL_THRESHOLD (0.95)
+        peak = int(self.eff * 0.96)  # 96% peak → CRITICAL
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=975,
-            peak_vram_bytes=peak, n_objects=5,
+            chunk_id=0,
+            chunk_size=975,
+            peak_vram_bytes=peak,
+            n_objects=5,
             baseline_vram_bytes=baseline,
         )
 
@@ -845,13 +849,7 @@ class TestBaselineAwareShrink:
         assert rec.pressure == "CRITICAL"
         assert rec.target_utilization_pct == round(mgr.SHRINK_TARGET_PCT * 100, 1)
 
-        # Baseline-aware: target_growth = eff * 0.80 - eff * 0.78 = eff * 0.02
-        # growth = eff * 0.93 - eff * 0.78 = eff * 0.15
-        # raw = 975 * (0.02 / 0.15) = 975 * 0.133 = 130
-        # * 0.95 safety = 123.  But floor is 975 * 0.50 = 487.
-        # So floor wins: new_size = min(123, 487) = 123 → capped to min_chunk_frames=25
-        # Actually 130 * 0.95 = 123.5 → 123.  That's >= min_chunk_frames.
-        # 123 < 487 (floor) → min(123, 487) = 123.
+        # Baseline-aware targeting SHRINK_TARGET_PCT (0.80)
         expected_raw = int(975 * ((self.eff * 0.80 - baseline) / (peak - baseline)) * 0.95)
         floor_size = int(975 * mgr.SHRINK_CRITICAL_FACTOR)
         expected = min(expected_raw, floor_size)
@@ -861,43 +859,46 @@ class TestBaselineAwareShrink:
     def test_critical_without_baseline_proportional(self):
         """CRITICAL without baseline uses proportional fallback."""
         mgr = self._make_mgr(975)
-        peak = int(self.eff * 0.93)
+        # Use 0.96 peak — safely above CRITICAL_THRESHOLD (0.95)
+        peak = int(self.eff * 0.96)
+        usage_pct = peak / mgr.effective_vram_limit
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=975,
-            peak_vram_bytes=peak, n_objects=5,
+            chunk_id=0,
+            chunk_size=975,
+            peak_vram_bytes=peak,
+            n_objects=5,
             baseline_vram_bytes=0,  # no baseline
         )
 
         assert rec.action == "SHRINK"
-        # Proportional: 975 * (0.80 / 0.93) * 0.95 = 975 * 0.818 = 797
+        assert rec.pressure == "CRITICAL"
+        # Proportional: 975 * (0.80 / usage_pct) * 0.95
         # Floor: 975 * 0.50 = 487.5 → 487
-        # min(797, 487) = 487
-        proportional = int(975 * (mgr.SHRINK_TARGET_PCT / 0.93) * 0.95)
+        proportional = int(975 * (mgr.SHRINK_TARGET_PCT / max(usage_pct, 0.01)) * 0.95)
         floor_size = int(975 * mgr.SHRINK_CRITICAL_FACTOR)
         expected = min(proportional, floor_size)
         assert rec.adjusted_chunk_size == expected
 
     def test_warning_with_baseline(self):
-        """WARNING (80-90%) with baseline → milder than CRITICAL."""
+        """WARNING (85-95%) with baseline → milder than CRITICAL."""
         mgr = self._make_mgr(500)
         baseline = int(self.eff * 0.50)  # 50% baseline
-        peak = int(self.eff * 0.85)      # 85% peak → WARNING
+        # Use 0.88 — safely above WARNING_THRESHOLD (0.85), below CRITICAL (0.95)
+        peak = int(self.eff * 0.88)  # 88% peak → WARNING
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
-            peak_vram_bytes=peak, n_objects=3,
+            chunk_id=0,
+            chunk_size=500,
+            peak_vram_bytes=peak,
+            n_objects=3,
             baseline_vram_bytes=baseline,
         )
 
         assert rec.action == "SHRINK"
         assert rec.pressure == "WARNING"
 
-        # Baseline-aware: target_growth = eff * 0.80 - eff * 0.50 = eff * 0.30
-        # growth = eff * 0.85 - eff * 0.50 = eff * 0.35
-        # raw = 500 * (0.30 / 0.35) * 0.95 = 500 * 0.814 = 407
-        # Floor: 500 * 0.75 = 375
-        # min(407, 375) = 375
+        # Baseline-aware computation
         target_growth = self.eff * 0.80 - baseline
         actual_growth = peak - baseline
         raw = int(500 * (target_growth / actual_growth) * 0.95)
@@ -909,11 +910,13 @@ class TestBaselineAwareShrink:
         """When baseline alone exceeds target_pct, use minimum chunk."""
         mgr = self._make_mgr(500)
         baseline = int(self.eff * 0.85)  # 85% baseline > 80% target
-        peak = int(self.eff * 0.93)      # CRITICAL
+        peak = int(self.eff * 0.93)  # CRITICAL
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
-            peak_vram_bytes=peak, n_objects=1,
+            chunk_id=0,
+            chunk_size=500,
+            peak_vram_bytes=peak,
+            n_objects=1,
             baseline_vram_bytes=baseline,
         )
 
@@ -923,38 +926,42 @@ class TestBaselineAwareShrink:
     def test_low_baseline_proportional_wins(self):
         """With low baseline, baseline-aware gives larger chunk than floor."""
         mgr = self._make_mgr(1000)
-        baseline = int(self.eff * 0.10)   # 10% baseline
-        peak = int(self.eff * 0.91)       # CRITICAL
+        baseline = int(self.eff * 0.10)  # 10% baseline
+        # Use 0.96 — safely above CRITICAL_THRESHOLD (0.95)
+        peak = int(self.eff * 0.96)  # CRITICAL
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=1000,
-            peak_vram_bytes=peak, n_objects=2,
+            chunk_id=0,
+            chunk_size=1000,
+            peak_vram_bytes=peak,
+            n_objects=2,
             baseline_vram_bytes=baseline,
         )
 
         assert rec.action == "SHRINK"
-        # Baseline-aware: target_growth = eff * 0.80 - eff * 0.10 = eff * 0.70
-        # growth = eff * 0.91 - eff * 0.10 = eff * 0.81
-        # raw = 1000 * (0.70 / 0.81) * 0.95 = 1000 * 0.821 = 821
+        assert rec.pressure == "CRITICAL"
         # Floor: 1000 * 0.50 = 500
-        # min(821, 500) = 500  (floor still wins — it's conservative)
         floor_size = int(1000 * mgr.SHRINK_CRITICAL_FACTOR)
         assert rec.adjusted_chunk_size <= floor_size
 
     def test_floor_prevents_overly_generous_shrink(self):
         """Floor factor ensures a meaningful reduction even with baseline."""
         mgr = self._make_mgr(800)
-        # WARNING pressure (82%) with low baseline
+        # WARNING pressure (87%) with low baseline
+        # (use 0.87, safely above WARNING_THRESHOLD=0.85)
         baseline = int(self.eff * 0.05)
-        peak = int(self.eff * 0.82)
+        peak = int(self.eff * 0.87)
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=800,
-            peak_vram_bytes=peak, n_objects=1,
+            chunk_id=0,
+            chunk_size=800,
+            peak_vram_bytes=peak,
+            n_objects=1,
             baseline_vram_bytes=baseline,
         )
 
         assert rec.action == "SHRINK"
+        assert rec.pressure == "WARNING"
         # Floor is 800 * 0.75 = 600
         assert rec.adjusted_chunk_size <= int(800 * mgr.SHRINK_WARNING_FACTOR)
 
@@ -964,8 +971,10 @@ class TestBaselineAwareShrink:
         peak = int(self.eff * 0.92)
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
-            peak_vram_bytes=peak, n_objects=1,
+            chunk_id=0,
+            chunk_size=500,
+            peak_vram_bytes=peak,
+            n_objects=1,
         )
 
         assert rec.action == "SHRINK"
@@ -977,8 +986,10 @@ class TestBaselineAwareShrink:
         peak = int(self.eff * 0.20)
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
-            peak_vram_bytes=peak, n_objects=1,
+            chunk_id=0,
+            chunk_size=500,
+            peak_vram_bytes=peak,
+            n_objects=1,
         )
 
         assert rec.action == "GROW"
@@ -988,6 +999,7 @@ class TestBaselineAwareShrink:
 # ---------------------------------------------------------------------------
 # Calibration-based GROW
 # ---------------------------------------------------------------------------
+
 
 class TestCalibrationBasedGrow:
     """Tests for aggressive, calibration-based growth in record_chunk."""
@@ -1017,8 +1029,10 @@ class TestCalibrationBasedGrow:
         growth_rate = (peak - baseline) / 520
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=260,
-            peak_vram_bytes=peak, n_objects=2,
+            chunk_id=0,
+            chunk_size=260,
+            peak_vram_bytes=peak,
+            n_objects=2,
             baseline_vram_bytes=baseline,
             growth_rate_per_iter=growth_rate,
         )
@@ -1049,8 +1063,10 @@ class TestCalibrationBasedGrow:
         growth_rate = (peak - baseline) / 400  # 200 frames * 2
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=200,
-            peak_vram_bytes=peak, n_objects=1,
+            chunk_id=0,
+            chunk_size=200,
+            peak_vram_bytes=peak,
+            n_objects=1,
             baseline_vram_bytes=baseline,
             growth_rate_per_iter=growth_rate,
         )
@@ -1066,8 +1082,10 @@ class TestCalibrationBasedGrow:
         peak = int(self.eff * 0.27)
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=260,
-            peak_vram_bytes=peak, n_objects=2,
+            chunk_id=0,
+            chunk_size=260,
+            peak_vram_bytes=peak,
+            n_objects=2,
             # No baseline or growth_rate
         )
 
@@ -1086,8 +1104,10 @@ class TestCalibrationBasedGrow:
         growth_rate = (peak - baseline) / 1000  # tiny growth = wants huge chunk
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=500,
-            peak_vram_bytes=peak, n_objects=1,
+            chunk_id=0,
+            chunk_size=500,
+            peak_vram_bytes=peak,
+            n_objects=1,
             baseline_vram_bytes=baseline,
             growth_rate_per_iter=growth_rate,
         )
@@ -1104,8 +1124,10 @@ class TestCalibrationBasedGrow:
         growth_rate = (peak - baseline) / 600
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=300,
-            peak_vram_bytes=peak, n_objects=20,
+            chunk_id=0,
+            chunk_size=300,
+            peak_vram_bytes=peak,
+            n_objects=20,
             baseline_vram_bytes=baseline,
             growth_rate_per_iter=growth_rate,
         )
@@ -1117,6 +1139,7 @@ class TestCalibrationBasedGrow:
         calibrated = int(target_iters / 2)
         # Floor: dampened growth with 20 objects is minimal
         import math
+
         dampened_floor = int(300 * (1.0 + (mgr.GROW_FACTOR - 1.0) / (1.0 + math.log2(20))))
         expected = max(calibrated, dampened_floor)
         expected = min(expected, int(300 * mgr.max_growth_factor))
@@ -1130,8 +1153,10 @@ class TestCalibrationBasedGrow:
         growth_rate = (peak - baseline) / 520
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=260,
-            peak_vram_bytes=peak, n_objects=2,
+            chunk_id=0,
+            chunk_size=260,
+            peak_vram_bytes=peak,
+            n_objects=2,
             baseline_vram_bytes=baseline,
             growth_rate_per_iter=growth_rate,
             soft_warning_seen=True,
@@ -1146,9 +1171,162 @@ class TestCalibrationBasedGrow:
         peak = int(self.eff * 0.20)
 
         rec = mgr.record_chunk(
-            chunk_id=0, chunk_size=300,
-            peak_vram_bytes=peak, n_objects=1,
+            chunk_id=0,
+            chunk_size=300,
+            peak_vram_bytes=peak,
+            n_objects=1,
         )
 
         assert rec.action == "GROW"
         assert rec.target_utilization_pct == round(mgr.GROW_TARGET_PCT * 100, 1)
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveMultiplier
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptiveMultiplier:
+    """Tests for the AdaptiveMultiplier that learns per-frame cost."""
+
+    def _make(self, w=1920, h=1080):
+        from sam3.memory_optimizer import AdaptiveMultiplier
+
+        return AdaptiveMultiplier(width=w, height=h, device="cpu")
+
+    def test_not_calibrated_initially(self):
+        am = self._make()
+        assert not am.is_calibrated
+        # Falls back to static estimate
+        est = am.estimate_per_frame_bytes()
+        assert est > 0
+
+    def test_update_sets_calibrated(self):
+        am = self._make()
+        am.update(growth_rate_per_iter=50_000_000, baseline_bytes=1_000_000_000, n_objects=1, confidence=0.9)
+        assert am.is_calibrated
+
+    def test_low_confidence_rejected(self):
+        am = self._make()
+        am.update(growth_rate_per_iter=50_000_000, baseline_bytes=1_000_000_000, n_objects=1, confidence=0.2)
+        assert not am.is_calibrated  # confidence < 0.3 → rejected
+
+    def test_negative_growth_rejected(self):
+        am = self._make()
+        am.update(growth_rate_per_iter=-1, baseline_bytes=1_000_000_000, n_objects=1, confidence=0.9)
+        assert not am.is_calibrated
+
+    def test_calibrated_estimate_uses_growth_rate(self):
+        am = self._make()
+        growth = 25_000_000  # 25 MB/iter
+        am.update(growth_rate_per_iter=growth, baseline_bytes=2_000_000_000, n_objects=2, confidence=0.95)
+
+        est = am.estimate_per_frame_bytes()
+        # growth × 2 (for "both" direction) = 50 MB
+        expected = growth * 2
+        assert est == expected
+
+    def test_window_limits_samples(self):
+        am = self._make()
+        for i in range(10):
+            am.update(
+                growth_rate_per_iter=10_000_000 * (i + 1), baseline_bytes=1_000_000_000, n_objects=1, confidence=0.8
+            )
+        assert len(am._samples) == am._WINDOW
+
+    def test_compute_safe_frames(self):
+        am = self._make()
+        growth = 50_000_000  # 50 MB/iter → 100 MB/frame
+        am.update(growth_rate_per_iter=growth, baseline_bytes=2_000_000_000, n_objects=1, confidence=0.9)
+
+        avail = 10_000_000_000  # 10 GB
+        baseline = 2_000_000_000  # 2 GB
+        frames = am.compute_safe_frames(avail, baseline)
+        # (10GB - 2GB) / 100MB = 80 frames
+        assert frames == 80
+
+    def test_compute_safe_frames_minimum(self):
+        am = self._make()
+        growth = 500_000_000  # 500 MB/iter → 1 GB/frame
+        am.update(growth_rate_per_iter=growth, baseline_bytes=9_000_000_000, n_objects=1, confidence=0.9)
+
+        # Barely any available → should return minimum 25
+        frames = am.compute_safe_frames(9_500_000_000, 9_500_000_000)
+        assert frames == 25
+
+    def test_to_dict(self):
+        am = self._make()
+        am.update(growth_rate_per_iter=30_000_000, baseline_bytes=2_000_000_000, n_objects=3, confidence=0.85)
+
+        d = am.to_dict()
+        assert d["calibrated"] is True
+        assert d["n_samples"] == 1
+        assert d["adaptive_per_frame_mb"] is not None
+        assert d["static_per_frame_mb"] > 0
+        assert len(d["samples"]) == 1
+
+    def test_manager_init_and_feed(self):
+        """AdaptiveChunkManager.init_adaptive_multiplier + feed_calibration."""
+        mgr = AdaptiveChunkManager(
+            initial_chunk_size=500,
+            device="cpu",
+            vram_limit_bytes=80 * 1024**3,
+        )
+        mgr.vram_limit = 80 * 1024**3
+        mgr.init_adaptive_multiplier(1920, 1080)
+        assert mgr.adaptive_multiplier is not None
+        assert not mgr.adaptive_multiplier.is_calibrated
+
+        mgr.feed_calibration(
+            growth_rate_per_iter=40_000_000,
+            baseline_bytes=5_000_000_000,
+            n_objects=2,
+            confidence=0.9,
+        )
+        assert mgr.adaptive_multiplier.is_calibrated
+        est = mgr.get_adaptive_per_frame_bytes()
+        assert est is not None
+        assert est == 40_000_000 * 2
+
+    def test_record_chunk_feeds_multiplier(self):
+        """record_chunk should automatically feed calibration data."""
+        mgr = AdaptiveChunkManager(
+            initial_chunk_size=500,
+            device="cpu",
+            vram_limit_bytes=80 * 1024**3,
+        )
+        mgr.vram_limit = 80 * 1024**3
+        mgr.init_adaptive_multiplier(1920, 1080)
+
+        eff = mgr.effective_vram_limit
+        peak = int(eff * 0.40)  # low usage → GROW
+        baseline = int(eff * 0.20)
+        growth_rate = 35_000_000
+
+        mgr.record_chunk(
+            chunk_id=0,
+            chunk_size=500,
+            peak_vram_bytes=peak,
+            n_objects=2,
+            baseline_vram_bytes=baseline,
+            growth_rate_per_iter=growth_rate,
+            calibration_confidence=0.88,
+        )
+
+        assert mgr.adaptive_multiplier.is_calibrated
+        assert mgr.get_adaptive_per_frame_bytes() == growth_rate * 2
+
+    def test_to_dict_includes_multiplier(self):
+        """to_dict should include adaptive_multiplier when initialised."""
+        mgr = AdaptiveChunkManager(
+            initial_chunk_size=500,
+            device="cpu",
+            vram_limit_bytes=80 * 1024**3,
+        )
+        mgr.vram_limit = 80 * 1024**3
+        mgr.init_adaptive_multiplier(1920, 1080)
+        mgr.feed_calibration(20_000_000, 3_000_000_000, 1, 0.85)
+
+        d = mgr.to_dict()
+        assert "adaptive_multiplier" in d
+        assert d["adaptive_multiplier"]["calibrated"] is True
