@@ -41,10 +41,7 @@ def visualize(
     # ---------- Mode A: Full-scene render ----------
     if zoom_in_index is None:
         boxes = np.array(input_json["pred_boxes"])
-        rle_masks = [
-            {"size": (orig_h, orig_w), "counts": rle}
-            for rle in input_json["pred_masks"]
-        ]
+        rle_masks = [{"size": (orig_h, orig_w), "counts": rle} for rle in input_json["pred_masks"]]
         binary_masks = [mask_utils.decode(rle) for rle in rle_masks]
 
         img_bgr = cv2.imread(img_path)
@@ -73,9 +70,7 @@ def visualize(
         idx = int(zoom_in_index)
         num_masks = len(input_json.get("pred_masks", []))
         if idx < 0 or idx >= num_masks:
-            raise ValueError(
-                f"zoom_in_index {idx} is out of range (0..{num_masks - 1})."
-            )
+            raise ValueError(f"zoom_in_index {idx} is out of range (0..{num_masks - 1}).")
 
         # (1) Replicate zoom_in_and_visualize
         object_data = {
@@ -86,9 +81,7 @@ def visualize(
             },
         }
         pil_img = Image.open(img_path)
-        pil_mask_i_zoomed, color_hex = render_zoom_in(
-            object_data, pil_img, mask_alpha=mask_alpha
-        )
+        pil_mask_i_zoomed, color_hex = render_zoom_in(object_data, pil_img, mask_alpha=mask_alpha)
 
         # (2) Single-instance render with the same color
         boxes_i = np.array([input_json["pred_boxes"][idx]])

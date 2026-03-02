@@ -28,8 +28,7 @@ class ColoredFormatter(logging.Formatter):
         }
         fmt_str = "{color}%(levelname)s %(asctime)s %(process)d %(filename)s:%(lineno)4d:{reset} %(message)s"
         self.formatters = {
-            level: logging.Formatter(fmt_str.format(color=color, reset=reset))
-            for level, color in colors.items()
+            level: logging.Formatter(fmt_str.format(color=color, reset=reset)) for level, color in colors.items()
         }
         self.default_formatter = self.formatters[logging.INFO]
 
@@ -42,9 +41,7 @@ def get_logger(name, level=logging.INFO):
     """A command line logger."""
     if "LOG_LEVEL" in os.environ:
         level = os.environ["LOG_LEVEL"].upper()
-        assert level in LOG_LEVELS, (
-            f"Invalid LOG_LEVEL: {level}, must be one of {list(LOG_LEVELS.keys())}"
-        )
+        assert level in LOG_LEVELS, f"Invalid LOG_LEVEL: {level}, must be one of {list(LOG_LEVELS.keys())}"
         level = LOG_LEVELS[level]
     logger = logging.getLogger(name)
     logger.setLevel(level)

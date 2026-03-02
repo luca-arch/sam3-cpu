@@ -1,39 +1,37 @@
-import argparse
-import subprocess
-import json
-import os
-import math
 import re
+import subprocess
+
 import psutil
-from pathlib import Path
 
 # ============================================================
 # Helpers
 # ============================================================
 
+
 def run_cmd(cmd):
     """Run command and return stdout."""
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip())
     return result.stdout.strip()
 
+
 def sanitize_filename(filename: str, replacement: str = "-") -> str:
     """
     Sanitize a string to make it safe for use as a filename or directory name.
-    
+
     This function:
     - Replaces spaces with the specified replacement character (default: "-")
     - Removes or replaces invalid characters for filesystems
     - Ensures the result is a valid filename
-    
+
     Args:
         filename: The string to sanitize (e.g., a prompt with spaces).
         replacement: Character to replace spaces and invalid chars with. Defaults to "-".
-    
+
     Returns:
         Sanitized filename safe for use in file/directory names.
-    
+
     Example:
         >>> sanitize_filename("person walking on street")
         'person-walking-on-street'
@@ -42,33 +40,34 @@ def sanitize_filename(filename: str, replacement: str = "-") -> str:
     """
     # Replace spaces with replacement character
     filename = filename.replace(" ", replacement)
-    
+
     # Remove or replace invalid characters for filesystems
     # Invalid chars: < > : " / \ | ? * and control characters
     filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', replacement, filename)
-    
+
     # Remove leading/trailing dots and spaces (Windows compatibility)
-    filename = filename.strip('. ')
-    
+    filename = filename.strip(". ")
+
     # Replace multiple consecutive replacement characters with single one
-    filename = re.sub(f'{re.escape(replacement)}+', replacement, filename)
-    
+    filename = re.sub(f"{re.escape(replacement)}+", replacement, filename)
+
     # Remove leading/trailing replacement characters
     filename = filename.strip(replacement)
-    
+
     # Ensure filename is not empty
     if not filename:
         filename = "unnamed"
-    
+
     # Limit length to 255 characters (common filesystem limit)
     if len(filename) > 255:
         filename = filename[:255].rstrip(replacement)
-    
+
     return filename
+
 
 def vram_stat():
     """Get VRAM usage statistics.
-    
+
     Uses ``torch.cuda.mem_get_info`` when available (zero-overhead, no
     subprocess).  Falls back to nvidia-smi only if torch is not importable
     or CUDA is not available.
@@ -76,41 +75,36 @@ def vram_stat():
     # Prefer torch.cuda — it reads cached CUDA driver counters (near zero cost)
     try:
         import torch
+
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info(0)
             used = total - free
             return {
-                'total': total,
-                'used': used,
-                'free': free,
-                'percent': round((used / total) * 100, 2) if total else 0,
+                "total": total,
+                "used": used,
+                "free": free,
+                "percent": round((used / total) * 100, 2) if total else 0,
             }
     except Exception:
         pass
 
     # Fallback: nvidia-smi subprocess (slower, but works without torch)
     try:
-        output = run_cmd([
-            "nvidia-smi",
-            "--query-gpu=memory.total,memory.used,memory.free",
-            "--format=csv,noheader,nounits"
-        ])
+        output = run_cmd(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"]
+        )
         total, used, free = map(int, output.split(","))
         return {
-            'total': total * 1024 * 1024,
-            'used': used * 1024 * 1024,
-            'free': free * 1024 * 1024,
-            'percent': (used / total) * 100 if total > 0 else 0
+            "total": total * 1024 * 1024,
+            "used": used * 1024 * 1024,
+            "free": free * 1024 * 1024,
+            "percent": (used / total) * 100 if total > 0 else 0,
         }
     except Exception as e:
-        raise RuntimeError(f"Failed to get VRAM stats: {str(e)}")
+        raise RuntimeError(f"Failed to get VRAM stats: {str(e)}") from e
+
 
 def ram_stat():
     """Get RAM usage statistics."""
     mem = psutil.virtual_memory()
-    return {
-        'total': mem.total,
-        'available': mem.available,
-        'used': mem.used,
-        'percent': mem.percent
-    }
+    return {"total": mem.total, "available": mem.available, "used": mem.used, "percent": mem.percent}

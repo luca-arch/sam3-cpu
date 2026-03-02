@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +51,8 @@ class AsyncIOWorker:
 
     def __init__(self, max_workers: int = 1):
         self._max_workers = max_workers
-        self._executor: Optional[ThreadPoolExecutor] = None
-        self._futures: List[Future] = []
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: list[Future] = []
         self._started = False
         self._files_enqueued: int = 0
         self._errors: int = 0

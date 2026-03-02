@@ -126,17 +126,11 @@ class COCOCustom(COCO):
         # MODIFICATION: faster and cached subset check
         if not hasattr(self, "img_id_set"):
             self.img_id_set = set(self.getImgIds())
-        assert set(annsImgIds).issubset(self.img_id_set), (
-            "Results do not correspond to current coco set"
-        )
+        assert set(annsImgIds).issubset(self.img_id_set), "Results do not correspond to current coco set"
         # END MODIFICATION
         if "caption" in anns[0]:
-            imgIds = set([img["id"] for img in res.dataset["images"]]) & set(
-                [ann["image_id"] for ann in anns]
-            )
-            res.dataset["images"] = [
-                img for img in res.dataset["images"] if img["id"] in imgIds
-            ]
+            imgIds = set([img["id"] for img in res.dataset["images"]]) & set([ann["image_id"] for ann in anns])
+            res.dataset["images"] = [img for img in res.dataset["images"] if img["id"] in imgIds]
             for id, ann in enumerate(anns):
                 ann["id"] = id + 1
         elif "bbox" in anns[0] and not anns[0]["bbox"] == []:
@@ -406,25 +400,14 @@ class CGF1Eval(COCOeval):
         recall = TPs / (TPs + FNs + 1e-4)
         assert np.all(recall <= 1)
         F1 = 2 * precision * recall / (precision + recall + 1e-4)
-        positive_micro_F1 = (
-            2
-            * positive_micro_precision
-            * recall
-            / (positive_micro_precision + recall + 1e-4)
-        )
+        positive_micro_F1 = 2 * positive_micro_precision * recall / (positive_micro_precision + recall + 1e-4)
 
         IL_rec = IL_TPs / (IL_TPs + IL_FNs + 1e-6)
         IL_prec = IL_TPs / (IL_TPs + IL_FPs + 1e-6)
         IL_F1 = 2 * IL_prec * IL_rec / (IL_prec + IL_rec + 1e-6)
         IL_FPR = IL_FPs / (IL_FPs + IL_TNs + 1e-6)
         IL_MCC = float(IL_TPs * IL_TNs - IL_FPs * IL_FNs) / (
-            (
-                float(IL_TPs + IL_FPs)
-                * float(IL_TPs + IL_FNs)
-                * float(IL_TNs + IL_FPs)
-                * float(IL_TNs + IL_FNs)
-            )
-            ** 0.5
+            (float(IL_TPs + IL_FPs) * float(IL_TPs + IL_FNs) * float(IL_TNs + IL_FPs) * float(IL_TNs + IL_FNs)) ** 0.5
             + 1e-6
         )
 
@@ -460,9 +443,7 @@ class CGF1Eval(COCOeval):
             iStr = " {:<18} @[ IoU={:<9}] = {:0.3f}"
             titleStr = "Average " + metric
             iouStr = (
-                "{:0.2f}:{:0.2f}".format(p.iouThrs[0], p.iouThrs[-1])
-                if iouThr is None
-                else "{:0.2f}".format(iouThr)
+                "{:0.2f}:{:0.2f}".format(p.iouThrs[0], p.iouThrs[-1]) if iouThr is None else "{:0.2f}".format(iouThr)
             )
 
             s = self.eval[metric]
@@ -492,9 +473,7 @@ class CGF1Eval(COCOeval):
                 if metric.image_level:
                     stats.append(_summarize_single(metric=metric.name))
                 else:
-                    stats.append(
-                        _summarize(iouThr=metric.iou_threshold, metric=metric.name)
-                    )
+                    stats.append(_summarize(iouThr=metric.iou_threshold, metric=metric.name))
             return np.asarray(stats)
 
         summarize = _summarizeDets
@@ -520,11 +499,7 @@ def _evaluate(self):
         computeIoU = self.computeIoU
     else:
         raise RuntimeError(f"Unsupported iou {p.iouType}")
-    self.ious = {
-        (imgId, catId): computeIoU(imgId, catId)
-        for imgId in p.imgIds
-        for catId in catIds
-    }
+    self.ious = {(imgId, catId): computeIoU(imgId, catId) for imgId in p.imgIds for catId in catIds}
 
     maxDet = p.maxDets[-1]
     evalImgs = [
@@ -577,11 +552,7 @@ class CGF1Evaluator:
         # exclude_img_ids are the ids that are not exhaustively annotated in any of the other gts
         for coco_gt in self.coco_gts[1:]:
             exclude_img_ids = exclude_img_ids.union(
-                {
-                    img["id"]
-                    for img in coco_gt.dataset["images"]
-                    if not img["is_instance_exhaustive"]
-                }
+                {img["id"] for img in coco_gt.dataset["images"] if not img["is_instance_exhaustive"]}
             )
         # we only eval on instance exhaustive queries
         self.eval_img_ids = [
@@ -599,9 +570,7 @@ class CGF1Evaluator:
 
         """
         assert len(self.coco_gts) > 0, "No ground truth provided for evaluation."
-        assert len(self.coco_gts) == len(self.coco_evals), (
-            "Mismatch in number of ground truths and evaluators."
-        )
+        assert len(self.coco_gts) == len(self.coco_evals), "Mismatch in number of ground truths and evaluators."
 
         if self.verbose:
             print(f"Loading predictions from {pred_file}")
@@ -624,9 +593,7 @@ class CGF1Evaluator:
                 # suppress pycocotools prints
                 with open(os.devnull, "w") as devnull:
                     with contextlib.redirect_stdout(devnull):
-                        coco_dt = (
-                            cur_coco_gt.loadRes(results) if results else COCOCustom()
-                        )
+                        coco_dt = cur_coco_gt.loadRes(results) if results else COCOCustom()
 
                 coco_eval.cocoDt = coco_dt
                 coco_eval.params.imgIds = [img_id]
@@ -639,9 +606,7 @@ class CGF1Evaluator:
         # After this point, we have selected the best scoring per image among several ground truths
         # we can now accumulate and summarize, using only the first coco_eval
 
-        self.coco_evals[0].evalImgs = list(
-            np.concatenate(all_eval_imgs, axis=2).flatten()
-        )
+        self.coco_evals[0].evalImgs = list(np.concatenate(all_eval_imgs, axis=2).flatten())
         self.coco_evals[0].params.imgIds = self.eval_img_ids
         self.coco_evals[0]._paramsEval = copy.deepcopy(self.coco_evals[0].params)
 
@@ -671,14 +636,10 @@ class CGF1Evaluator:
         assert scorings[0].ndim == 3, (
             f"Expecting results in [numCats, numAreas, numImgs] format, got {scorings[0].shape}"
         )
-        assert scorings[0].shape[0] == 1, (
-            f"Expecting a single category, got {scorings[0].shape[0]}"
-        )
+        assert scorings[0].shape[0] == 1, f"Expecting a single category, got {scorings[0].shape[0]}"
 
         for scoring in scorings:
-            assert scoring.shape == scorings[0].shape, (
-                f"Shape mismatch: {scoring.shape}, {scorings[0].shape}"
-            )
+            assert scoring.shape == scorings[0].shape, f"Shape mismatch: {scoring.shape}, {scorings[0].shape}"
 
         selected_imgs = []
         for img_id in range(scorings[0].shape[-1]):

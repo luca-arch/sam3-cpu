@@ -125,9 +125,7 @@ def reindex_coco_to_temp(input_json_path: str) -> Optional[str]:
 
     # Validate COCO format
     if not is_coco_json(data):
-        raise ValueError(
-            f"File does not appear to be in COCO format: {input_json_path}"
-        )
+        raise ValueError(f"File does not appear to be in COCO format: {input_json_path}")
 
     # Check if reindexing is needed
     annotations_zero, images_zero, categories_zero = check_zero_indexed(data)
@@ -215,9 +213,7 @@ def test_reindex_function():
         print(f"First category ID: {result_data['categories'][0]['id']}")
         print(f"First annotation ID: {result_data['annotations'][0]['id']}")
         print(f"First annotation image_id: {result_data['annotations'][0]['image_id']}")
-        print(
-            f"First annotation category_id: {result_data['annotations'][0]['category_id']}"
-        )
+        print(f"First annotation category_id: {result_data['annotations'][0]['category_id']}")
 
         # Clean up
         os.unlink(result_path)

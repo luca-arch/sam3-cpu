@@ -76,6 +76,7 @@ exclude = [
     "sam3/train",          # training code
     "sam3/eval/hota_eval_toolkit",
     "sam3/eval/teta_eval_toolkit",
+    "sam3/perflib",        # perf library — vendored
 ]
 
 [tool.ruff.lint]
@@ -90,11 +91,22 @@ select = [
 ]
 ignore = [
     "E501",    # line too long — handled by formatter
-    "S101",    # assert used — fine in tests
+    "E402",    # module-level import not at top — needed for CPU guard
+    "E721",    # type comparison — some are intentional (isinstance not always appropriate)
+    "E741",    # ambiguous variable name — single-letter vars used in math/loop
+    "S101",    # assert used — fine in tests and assertions
+    "S108",    # hardcoded /tmp — we use TEMP_DIR deliberately
+    "S110",    # try-except-pass — used for optional-dependency guards
+    "S311",    # suspicious random — not crypto use
     "S603",    # subprocess without shell=True check — we control inputs
     "S607",    # partial executable path — acceptable
+    "B006",    # mutable default arg — used in argparse add_argument
+    "B007",    # unused loop variable — common in enumeration patterns
     "B008",    # function call in default arg — used by argparse
+    "B905",    # zip without strict — pervasive, not a bug
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S106"]
+"sam3/eval/*" = ["E", "W", "F", "I", "B", "UP", "S"]     # eval scripts — mostly upstream
+"sam3/agent/*" = ["E", "W", "F", "I", "B", "UP", "S"]    # agent code — separate concern

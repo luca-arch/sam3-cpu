@@ -13,9 +13,7 @@ except Exception:
     mask_utils = None
 
 
-def mask_intersection(
-    masks1: torch.Tensor, masks2: torch.Tensor, block_size: int = 16
-) -> torch.Tensor:
+def mask_intersection(masks1: torch.Tensor, masks2: torch.Tensor, block_size: int = 16) -> torch.Tensor:
     assert masks1.shape[1:] == masks2.shape[1:]
     assert masks1.dtype == torch.bool and masks2.dtype == torch.bool
     N, M = masks1.shape[0], masks2.shape[0]
@@ -47,9 +45,7 @@ def _decode_single_mask(mask_repr, h: int, w: int) -> np.ndarray:
         return (arr > 0).astype(np.uint8)
 
     if mask_utils is None:
-        raise ImportError(
-            "pycocotools is required to decode RLE mask strings. pip install pycocotools"
-        )
+        raise ImportError("pycocotools is required to decode RLE mask strings. pip install pycocotools")
 
     if not isinstance(mask_repr, (str, bytes)):
         raise ValueError("Unsupported mask representation type for RLE decode.")

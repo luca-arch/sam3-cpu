@@ -267,9 +267,7 @@ class ColorPalette:
 
         # Calculate the Euclidean distance between the colors and each pixel in the image
         # Broadcasting happens here: img_array shape is (num_pixels, 3), color_values shape is (num_colors, 3)
-        distances = np.sqrt(
-            np.sum((img_array[:, np.newaxis, :] - color_values) ** 2, axis=2)
-        )
+        distances = np.sqrt(np.sum((img_array[:, np.newaxis, :] - color_values) ** 2, axis=2))
 
         # Average the distances for each color
         mean_distances = np.mean(distances, axis=0)
@@ -332,9 +330,7 @@ def draw_text(
     )
 
 
-def draw_mask(
-    ax, rle, color, show_holes=True, alpha=0.15, upsample_factor=1.0, rle_upsampled=None
-):
+def draw_mask(ax, rle, color, show_holes=True, alpha=0.15, upsample_factor=1.0, rle_upsampled=None):
     if isinstance(rle, dict):
         mask = mask_utils.decode(rle)
     elif isinstance(rle, np.ndarray):
@@ -361,9 +357,7 @@ def draw_mask(
         mask_img[:, :, -1] = mask_upsampled * alpha
         ax.imshow(mask_img)
 
-    *_, contours, _ = cv2.findContours(
-        mask.astype(np.uint8).copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-    )
+    *_, contours, _ = cv2.findContours(mask.astype(np.uint8).copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     upsampled_contours = [(cont + 0.5) * upsample_factor - 0.5 for cont in contours]
     facecolor = (0, 0, 0, 0) if show_holes else color
     if alpha > 0.8:
@@ -402,7 +396,5 @@ def _change_color_brightness(color, brightness_factor):
     modified_lightness = polygon_color[1] + (brightness_factor * polygon_color[1])
     modified_lightness = 0.0 if modified_lightness < 0.0 else modified_lightness
     modified_lightness = 1.0 if modified_lightness > 1.0 else modified_lightness
-    modified_color = colorsys.hls_to_rgb(
-        polygon_color[0], modified_lightness, polygon_color[2]
-    )
+    modified_color = colorsys.hls_to_rgb(polygon_color[0], modified_lightness, polygon_color[2])
     return modified_color

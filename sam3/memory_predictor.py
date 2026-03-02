@@ -44,32 +44,34 @@ import statistics
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any
 
 import psutil
-
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_DEFAULT_WINDOW = 30          # sliding window for k estimation
-_DEFAULT_SAFETY = 0.85        # keep 15 % headroom before OOM
-_MIN_SAMPLES_FOR_PRED = 1     # minimum slopes before we can predict (1 slope = 2 samples)
-_SLOPE_VAR_LINEAR = 1e-6      # Var(k) below this → linear growth
-_SLOPE_VAR_STEP = 1e-3        # Var(k) below this → stepwise
-_CACHE_CLEAR_THRESHOLD = 0.90 # auto-clear CUDA cache at 90 % allocation
+_DEFAULT_WINDOW = 30  # sliding window for k estimation
+_DEFAULT_SAFETY = 0.85  # keep 15 % headroom before OOM
+_MIN_SAMPLES_FOR_PRED = 1  # minimum slopes before we can predict (1 slope = 2 samples)
+_SLOPE_VAR_LINEAR = 1e-6  # Var(k) below this → linear growth
+_SLOPE_VAR_STEP = 1e-3  # Var(k) below this → stepwise
+_CACHE_CLEAR_THRESHOLD = 0.90  # auto-clear CUDA cache at 90 % allocation
 
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 
+
 class GrowthPattern(Enum):
     """Detected memory-growth classification."""
+
     UNKNOWN = auto()
     LINEAR = auto()
     STEPWISE = auto()
@@ -79,9 +81,10 @@ class GrowthPattern(Enum):
 
 class StopLevel(Enum):
     """Urgency of an OOM warning."""
+
     NONE = auto()
-    SOFT = auto()      # ~20 % headroom left
-    HARD = auto()      # ~5 % headroom left
+    SOFT = auto()  # ~20 % headroom left
+    HARD = auto()  # ~5 % headroom left
     CRITICAL = auto()  # OOM imminent (< 2 %)
 
 
@@ -89,26 +92,29 @@ class StopLevel(Enum):
 # Data classes
 # ---------------------------------------------------------------------------
 
+
 @dataclass(slots=True)
 class FrameSample:
     """Snapshot of memory state after processing a frame."""
+
     frame: int
-    timestamp: float           # time.monotonic()
-    wall_time: str             # ISO timestamp
-    rss_bytes: int             # process RSS
-    gpu_allocated: Dict[int, int] = field(default_factory=dict)
-    gpu_reserved: Dict[int, int] = field(default_factory=dict)
+    timestamp: float  # time.monotonic()
+    wall_time: str  # ISO timestamp
+    rss_bytes: int  # process RSS
+    gpu_allocated: dict[int, int] = field(default_factory=dict)
+    gpu_reserved: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
 class Prediction:
     """OOM prediction result."""
-    frames_remaining: Optional[int]
-    oom_frame: Optional[int]
-    confidence: float          # 0.0 – 1.0
-    growth_rate_bytes: float   # k (bytes per frame)
-    model_used: str            # "linear" | "exponential"
-    memory_source: str         # "rss" | "gpu:0" etc.
+
+    frames_remaining: int | None
+    oom_frame: int | None
+    confidence: float  # 0.0 – 1.0
+    growth_rate_bytes: float  # k (bytes per frame)
+    model_used: str  # "linear" | "exponential"
+    memory_source: str  # "rss" | "gpu:0" etc.
     current_bytes: int
     limit_bytes: int
     headroom_pct: float
@@ -118,6 +124,7 @@ class Prediction:
 # ---------------------------------------------------------------------------
 # HybridMemoryMonitor
 # ---------------------------------------------------------------------------
+
 
 class HybridMemoryMonitor:
     """Near-zero-cost memory reader for CPU + GPU.
@@ -132,11 +139,12 @@ class HybridMemoryMonitor:
     def __init__(self):
         self._proc = psutil.Process()
         self._gpu_count = 0
-        self._gpu_limits: Dict[int, int] = {}
+        self._gpu_limits: dict[int, int] = {}
         self._torch_available = False
 
         try:
             import torch
+
             if torch.cuda.is_available():
                 self._torch_available = True
                 self._gpu_count = torch.cuda.device_count()
@@ -148,7 +156,8 @@ class HybridMemoryMonitor:
                     except Exception:
                         props = torch.cuda.get_device_properties(i)
                         self._gpu_limits[i] = getattr(
-                            props, "total_memory",
+                            props,
+                            "total_memory",
                             getattr(props, "total_mem", 0),
                         )
         except Exception:
@@ -181,6 +190,7 @@ class HybridMemoryMonitor:
         if not self._torch_available or device >= self._gpu_count:
             return 0
         import torch
+
         return torch.cuda.memory_allocated(device)
 
     def gpu_reserved(self, device: int = 0) -> int:
@@ -188,6 +198,7 @@ class HybridMemoryMonitor:
         if not self._torch_available or device >= self._gpu_count:
             return 0
         import torch
+
         return torch.cuda.memory_reserved(device)
 
     def gpu_total(self, device: int = 0) -> int:
@@ -218,11 +229,12 @@ class HybridMemoryMonitor:
             gpu_reserved=gpu_resv,
         )
 
-    def clear_gpu_cache(self, device: Optional[int] = None):
+    def clear_gpu_cache(self, device: int | None = None):
         """Call ``torch.cuda.empty_cache()`` to release reserved memory."""
         if not self._torch_available:
             return
         import torch
+
         if device is not None:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
@@ -234,6 +246,7 @@ class HybridMemoryMonitor:
 # GrowthEstimator  —  sliding-window O(1) growth-rate estimator
 # ---------------------------------------------------------------------------
 
+
 class GrowthEstimator:
     """Estimates memory growth rate *k* (bytes/frame) using a sliding
     window of recent samples.  Maintains running sums for O(1) update.
@@ -244,9 +257,9 @@ class GrowthEstimator:
 
     def __init__(self, window: int = _DEFAULT_WINDOW):
         self._window = window
-        self._frames: Deque[int] = deque(maxlen=window)
-        self._values: Deque[int] = deque(maxlen=window)
-        self._slopes: Deque[float] = deque(maxlen=window)
+        self._frames: deque[int] = deque(maxlen=window)
+        self._values: deque[int] = deque(maxlen=window)
+        self._slopes: deque[float] = deque(maxlen=window)
 
     # ----- core -----------------------------------------------------------
 
@@ -323,7 +336,7 @@ class GrowthEstimator:
 
     # ----- exponential model fitting --------------------------------------
 
-    def fit_exponential_k(self) -> Optional[float]:
+    def fit_exponential_k(self) -> float | None:
         """Estimate exponential growth rate using log-linear regression.
 
         If M(f) = M₀ · e^(k·f), then ln(M) = ln(M₀) + k·f, which is
@@ -351,7 +364,7 @@ class GrowthEstimator:
 
     # ----- state export ---------------------------------------------------
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "k_median": round(self.k, 2),
             "k_mean": round(self.k_mean, 2),
@@ -365,6 +378,7 @@ class GrowthEstimator:
 # ---------------------------------------------------------------------------
 # OOMPredictor
 # ---------------------------------------------------------------------------
+
 
 class OOMPredictor:
     """Predicts OOM frame using linear (and optionally exponential) model.
@@ -458,6 +472,7 @@ class OOMPredictor:
 # AdaptiveScheduler  —  dynamic chunk-size optimiser
 # ---------------------------------------------------------------------------
 
+
 class AdaptiveScheduler:
     """Recommends an optimal chunk size based on observed memory growth.
 
@@ -480,12 +495,12 @@ class AdaptiveScheduler:
         self._limit = limit_bytes
         self._safety = safety
         self._warmup = warmup
-        self._baseline: Optional[int] = None
-        self._recommended: Optional[int] = None
-        self._checkpoints: List[Dict[str, Any]] = []
+        self._baseline: int | None = None
+        self._recommended: int | None = None
+        self._checkpoints: list[dict[str, Any]] = []
 
     @property
-    def recommended_chunk(self) -> Optional[int]:
+    def recommended_chunk(self) -> int | None:
         """Current best estimate of safe chunk size (frames)."""
         return self._recommended
 
@@ -510,20 +525,22 @@ class AdaptiveScheduler:
         predicted_n = int(headroom / k)
         new_rec = frame + max(predicted_n, 1)
 
-        self._checkpoints.append({
-            "frame": frame,
-            "mem_bytes": mem_bytes,
-            "k": round(k, 2),
-            "predicted_safe_frames": predicted_n,
-            "recommended_chunk": new_rec,
-            "wall_time": datetime.now().isoformat(),
-        })
+        self._checkpoints.append(
+            {
+                "frame": frame,
+                "mem_bytes": mem_bytes,
+                "k": round(k, 2),
+                "predicted_safe_frames": predicted_n,
+                "recommended_chunk": new_rec,
+                "wall_time": datetime.now().isoformat(),
+            }
+        )
 
         # Accept new recommendation if it's more conservative or first
         if self._recommended is None or new_rec < self._recommended:
             self._recommended = new_rec
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "baseline_bytes": self._baseline,
             "recommended_chunk": self._recommended,
@@ -536,6 +553,7 @@ class AdaptiveScheduler:
 # ---------------------------------------------------------------------------
 # MemoryPredictor  —  main async controller
 # ---------------------------------------------------------------------------
+
 
 class MemoryPredictor:
     """Fully async, non-blocking memory predictor.
@@ -574,9 +592,9 @@ class MemoryPredictor:
         window: int = _DEFAULT_WINDOW,
         poll_base: float = 0.5,
         poll_max: float = 5.0,
-        on_soft_stop: Optional[Callable[[], None]] = None,
-        on_hard_stop: Optional[Callable[[], None]] = None,
-        on_resize: Optional[Callable[[int], None]] = None,
+        on_soft_stop: Callable[[], None] | None = None,
+        on_hard_stop: Callable[[], None] | None = None,
+        on_resize: Callable[[int], None] | None = None,
     ):
         self._device_str = device
         self._safety = safety_factor
@@ -593,14 +611,14 @@ class MemoryPredictor:
         self._predictor = OOMPredictor(safety_factor)
 
         # Per-source estimators (one for RSS, one per GPU)
-        self._estimators: Dict[str, GrowthEstimator] = {
+        self._estimators: dict[str, GrowthEstimator] = {
             "rss": GrowthEstimator(window),
         }
         for d in range(self._monitor.gpu_count):
             self._estimators[f"gpu:{d}"] = GrowthEstimator(window)
 
         # Determine limits
-        self._limits: Dict[str, int] = {
+        self._limits: dict[str, int] = {
             "rss": self._monitor.ram_total(),
         }
         for d in range(self._monitor.gpu_count):
@@ -623,15 +641,15 @@ class MemoryPredictor:
         self._scheduler = AdaptiveScheduler(primary_limit, safety_factor)
 
         # Sample history (full trace for metadata export)
-        self._samples: List[FrameSample] = []       # from record_frame()
-        self._bg_samples: List[FrameSample] = []    # from bg thread polls
-        self._predictions: List[Dict[str, Any]] = []
-        self._last_prediction: Optional[Prediction] = None
+        self._samples: list[FrameSample] = []  # from record_frame()
+        self._bg_samples: list[FrameSample] = []  # from bg thread polls
+        self._predictions: list[dict[str, Any]] = []
+        self._last_prediction: Prediction | None = None
 
         # Background thread state
         self._running = False
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._poll_count = 0
 
         # Soft/hard stop already fired (avoid spamming callbacks)
@@ -679,7 +697,7 @@ class MemoryPredictor:
             self._scheduler.update(frame, primary_val, self._primary_estimator)
 
     @property
-    def prediction(self) -> Optional[Prediction]:
+    def prediction(self) -> Prediction | None:
         """Latest OOM prediction (thread-safe read)."""
         with self._lock:
             return self._last_prediction
@@ -693,7 +711,7 @@ class MemoryPredictor:
         return pred.stop_level in (StopLevel.HARD, StopLevel.CRITICAL)
 
     @property
-    def recommended_chunk_size(self) -> Optional[int]:
+    def recommended_chunk_size(self) -> int | None:
         """Current optimal chunk size estimate (frames)."""
         return self._scheduler.recommended_chunk
 
@@ -714,7 +732,7 @@ class MemoryPredictor:
         while self._running:
             # Exponential sampling schedule
             interval = min(
-                self._poll_base * (1.2 ** step),
+                self._poll_base * (1.2**step),
                 self._poll_max,
             )
             time.sleep(interval)
@@ -723,9 +741,7 @@ class MemoryPredictor:
 
             with self._lock:
                 # Take a bg sample for the growth curve (not for estimator)
-                latest_frame = (
-                    self._samples[-1].frame if self._samples else 0
-                )
+                latest_frame = self._samples[-1].frame if self._samples else 0
                 sample = self._monitor.sample(latest_frame)
                 self._bg_samples.append(sample)
 
@@ -733,33 +749,30 @@ class MemoryPredictor:
                 pred = self._make_prediction()
                 if pred is not None:
                     self._last_prediction = pred
-                    self._predictions.append({
-                        "poll": self._poll_count,
-                        "wall_time": datetime.now().isoformat(),
-                        "source": pred.memory_source,
-                        "current_bytes": pred.current_bytes,
-                        "limit_bytes": pred.limit_bytes,
-                        "headroom_pct": pred.headroom_pct,
-                        "frames_remaining": pred.frames_remaining,
-                        "oom_frame": pred.oom_frame,
-                        "growth_rate": pred.growth_rate_bytes,
-                        "model": pred.model_used,
-                        "confidence": pred.confidence,
-                        "stop_level": pred.stop_level.name,
-                    })
+                    self._predictions.append(
+                        {
+                            "poll": self._poll_count,
+                            "wall_time": datetime.now().isoformat(),
+                            "source": pred.memory_source,
+                            "current_bytes": pred.current_bytes,
+                            "limit_bytes": pred.limit_bytes,
+                            "headroom_pct": pred.headroom_pct,
+                            "frames_remaining": pred.frames_remaining,
+                            "oom_frame": pred.oom_frame,
+                            "growth_rate": pred.growth_rate_bytes,
+                            "model": pred.model_used,
+                            "confidence": pred.confidence,
+                            "stop_level": pred.stop_level.name,
+                        }
+                    )
 
                     # Fire callbacks
                     self._check_callbacks(pred)
 
                     # Auto CUDA cache clear if close to limit
-                    if (
-                        self._monitor.has_gpu
-                        and "gpu" in self._primary_source
-                    ):
+                    if self._monitor.has_gpu and "gpu" in self._primary_source:
                         dev = int(self._primary_source.split(":")[1])
-                        usage = self._monitor.gpu_allocated(dev) / max(
-                            self._monitor.gpu_total(dev), 1
-                        )
+                        usage = self._monitor.gpu_allocated(dev) / max(self._monitor.gpu_total(dev), 1)
                         if usage > _CACHE_CLEAR_THRESHOLD:
                             self._monitor.clear_gpu_cache(dev)
 
@@ -777,7 +790,7 @@ class MemoryPredictor:
         dev = int(self._primary_source.split(":")[1])
         return sample.gpu_allocated.get(dev, 0)
 
-    def _make_prediction(self) -> Optional[Prediction]:
+    def _make_prediction(self) -> Prediction | None:
         """Run prediction on the primary memory source.
 
         Uses bg-polled sample for the most recent memory reading when
@@ -798,7 +811,11 @@ class MemoryPredictor:
         frame = self._samples[-1].frame
 
         return self._predictor.predict(
-            frame, current, limit, est, self._primary_source,
+            frame,
+            current,
+            limit,
+            est,
+            self._primary_source,
         )
 
     def _check_callbacks(self, pred: Prediction):
@@ -828,7 +845,7 @@ class MemoryPredictor:
     # Metadata export
     # =====================================================================
 
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
         """Full metadata export for JSON serialisation."""
         with self._lock:
             pred = self._last_prediction
@@ -848,9 +865,7 @@ class MemoryPredictor:
                 "total_samples": len(self._samples),
                 "total_bg_samples": len(self._bg_samples),
                 "total_polls": self._poll_count,
-                "growth_estimators": {
-                    k: est.to_dict() for k, est in self._estimators.items()
-                },
+                "growth_estimators": {k: est.to_dict() for k, est in self._estimators.items()},
                 "scheduler": self._scheduler.to_dict(),
                 "last_prediction": {
                     "frames_remaining": pred.frames_remaining,
@@ -860,12 +875,14 @@ class MemoryPredictor:
                     "model_used": pred.model_used,
                     "headroom_pct": pred.headroom_pct,
                     "stop_level": pred.stop_level.name,
-                } if pred else None,
+                }
+                if pred
+                else None,
                 "prediction_history": self._predictions[-50:],  # last 50
                 "growth_curve": curve,
             }
 
-    def _build_growth_curve(self) -> Dict[str, List]:
+    def _build_growth_curve(self) -> dict[str, list]:
         """Build a downsampled growth curve for plotting / export.
 
         Merges frame-based samples from ``record_frame()`` with
@@ -879,7 +896,7 @@ class MemoryPredictor:
         # Sort by timestamp, deduplicate by rounding ts to 0.01s
         all_samples.sort(key=lambda s: s.timestamp)
         seen_ts: set = set()
-        unique: List[FrameSample] = []
+        unique: list[FrameSample] = []
         for s in all_samples:
             key = round(s.timestamp, 2)
             if key not in seen_ts:
@@ -891,18 +908,18 @@ class MemoryPredictor:
         frames = []
         rss_mb = []
         timestamps = []
-        gpu_mb: Dict[str, List[float]] = {}
+        gpu_mb: dict[str, list[float]] = {}
 
         for i in range(0, len(unique), step):
             s = unique[i]
             frames.append(s.frame)
             timestamps.append(round(s.timestamp, 3))
-            rss_mb.append(round(s.rss_bytes / (1024 ** 2), 1))
+            rss_mb.append(round(s.rss_bytes / (1024**2), 1))
             for d, alloc in s.gpu_allocated.items():
                 key = f"gpu:{d}"
                 if key not in gpu_mb:
                     gpu_mb[key] = []
-                gpu_mb[key].append(round(alloc / (1024 ** 2), 1))
+                gpu_mb[key].append(round(alloc / (1024**2), 1))
 
         return {
             "frames": frames,

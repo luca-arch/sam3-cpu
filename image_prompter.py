@@ -25,11 +25,13 @@ Usage:
 """
 
 # ---- Force-CPU guard (must run before ANY torch/sam3 import) ----
-import os as _os, sys as _sys
-if '--device' in _sys.argv:
-    _i = _sys.argv.index('--device')
-    if _i + 1 < len(_sys.argv) and _sys.argv[_i + 1].lower() == 'cpu':
-        _os.environ['CUDA_VISIBLE_DEVICES'] = ''
+import os as _os
+import sys as _sys
+
+if "--device" in _sys.argv:
+    _i = _sys.argv.index("--device")
+    if _i + 1 < len(_sys.argv) and _sys.argv[_i + 1].lower() == "cpu":
+        _os.environ["CUDA_VISIBLE_DEVICES"] = ""
 # -----------------------------------------------------------------
 
 import argparse
@@ -37,15 +39,15 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 from PIL import Image
 
-
 # ---------------------------------------------------------------------------
 # Memory validation helpers
 # ---------------------------------------------------------------------------
+
 
 def _format_bytes(b: float) -> str:
     """Human-readable byte size."""
@@ -56,7 +58,7 @@ def _format_bytes(b: float) -> str:
     return f"{b:.1f} PB"
 
 
-def _print_table(rows: List[List[str]], col_widths: Optional[List[int]] = None):
+def _print_table(rows: list[list[str]], col_widths: list[int] | None = None):
     """Print a simple ASCII table."""
     if not rows:
         return
@@ -72,14 +74,14 @@ def _print_table(rows: List[List[str]], col_widths: Optional[List[int]] = None):
     print(sep)
 
 
-def _validate_memory(image_path: Path, device: str) -> Dict[str, Any]:
+def _validate_memory(image_path: Path, device: str) -> dict[str, Any]:
     """Check whether there is enough memory to process this image.
 
     Returns a dict with memory stats and a boolean ``can_process``.
     """
+    from sam3.__globals import IMAGE_INFERENCE_MB, RAM_USAGE_PERCENT, VRAM_USAGE_PERCENT
     from sam3.memory_manager import MemoryManager
     from sam3.utils.helpers import ram_stat, vram_stat
-    from sam3.__globals import IMAGE_INFERENCE_MB, RAM_USAGE_PERCENT, VRAM_USAGE_PERCENT
 
     img = Image.open(image_path)
     width, height = img.size
@@ -116,7 +118,7 @@ def _validate_memory(image_path: Path, device: str) -> Dict[str, Any]:
     return info
 
 
-def _show_memory_table(info: Dict[str, Any]):
+def _show_memory_table(info: dict[str, Any]):
     """Print memory validation results as a table."""
     rows = [
         ["Metric", "Value"],
@@ -139,8 +141,10 @@ def _show_memory_table(info: Dict[str, Any]):
 # Overlay helpers
 # ---------------------------------------------------------------------------
 
-def _create_overlay(image: Image.Image, mask: np.ndarray, alpha: float = 0.5,
-                    color: tuple = (30, 144, 255)) -> Image.Image:
+
+def _create_overlay(
+    image: Image.Image, mask: np.ndarray, alpha: float = 0.5, color: tuple = (30, 144, 255)
+) -> Image.Image:
     """Blend a coloured mask overlay onto the original image."""
     img_arr = np.array(image.convert("RGB")).copy()
     binary = mask > 0
@@ -148,9 +152,7 @@ def _create_overlay(image: Image.Image, mask: np.ndarray, alpha: float = 0.5,
         binary = binary[0]
     overlay = np.zeros_like(img_arr)
     overlay[binary] = color
-    img_arr[binary] = (
-        (1 - alpha) * img_arr[binary] + alpha * overlay[binary]
-    ).astype(np.uint8)
+    img_arr[binary] = ((1 - alpha) * img_arr[binary] + alpha * overlay[binary]).astype(np.uint8)
     return Image.fromarray(img_arr)
 
 
@@ -158,14 +160,15 @@ def _create_overlay(image: Image.Image, mask: np.ndarray, alpha: float = 0.5,
 # Processing logic
 # ---------------------------------------------------------------------------
 
+
 def _process_image_with_text_prompts(
     driver,
     image: Image.Image,
-    prompts: List[str],
+    prompts: list[str],
     image_name: str,
     output_dir: Path,
     alpha: float,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Process an image with one or more text prompts.
 
     Returns a list of per-prompt metadata dicts for aggregation.
@@ -174,7 +177,7 @@ def _process_image_with_text_prompts(
 
     total_pixels = image.width * image.height
     processor, inference_state = driver.inference(image)
-    prompt_results: List[Dict[str, Any]] = []
+    prompt_results: list[dict[str, Any]] = []
 
     for prompt in prompts:
         t_prompt_start = time.time()
@@ -197,7 +200,7 @@ def _process_image_with_text_prompts(
             m_np = m.cpu().numpy() if hasattr(m, "cpu") else np.array(m)
             if m_np.ndim == 3 and m_np.shape[0] == 1:
                 m_np = m_np[0]
-            m_u8 = (m_np.astype(np.uint8) * 255)
+            m_u8 = m_np.astype(np.uint8) * 255
 
             # Mask area
             mask_area_px = int(np.count_nonzero(m_np))
@@ -213,15 +216,17 @@ def _process_image_with_text_prompts(
 
             score_val = float(scores[i]) if scores is not None else None
             box_val = boxes[i].tolist() if boxes is not None and len(boxes) > i else None
-            meta_objects.append({
-                "object_id": i,
-                "score": score_val,
-                "box": box_val,
-                "mask_area_pixels": mask_area_px,
-                "mask_area_pct": mask_area_pct,
-                "mask_file": f"object_{i}_mask.png",
-                "overlay_file": f"object_{i}_overlay.png",
-            })
+            meta_objects.append(
+                {
+                    "object_id": i,
+                    "score": score_val,
+                    "box": box_val,
+                    "mask_area_pixels": mask_area_px,
+                    "mask_area_pct": mask_area_pct,
+                    "mask_file": f"object_{i}_mask.png",
+                    "overlay_file": f"object_{i}_overlay.png",
+                }
+            )
 
         prompt_time = round(time.time() - t_prompt_start, 3)
 
@@ -243,12 +248,12 @@ def _process_image_with_text_prompts(
 def _process_image_with_bbox(
     driver,
     image: Image.Image,
-    boxes: List[List[float]],
-    box_labels: List[int],
+    boxes: list[list[float]],
+    box_labels: list[int],
     image_name: str,
     output_dir: Path,
     alpha: float,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Process an image with bounding box prompts.
 
     Returns metadata dict for aggregation.
@@ -280,7 +285,7 @@ def _process_image_with_bbox(
         m_np = m.cpu().numpy() if hasattr(m, "cpu") else np.array(m)
         if m_np.ndim == 3 and m_np.shape[0] == 1:
             m_np = m_np[0]
-        m_u8 = (m_np.astype(np.uint8) * 255)
+        m_u8 = m_np.astype(np.uint8) * 255
 
         mask_area_px = int(np.count_nonzero(m_np))
         mask_area_pct = round(mask_area_px / total_pixels * 100, 2) if total_pixels else 0.0
@@ -291,14 +296,16 @@ def _process_image_with_bbox(
         overlay = _create_overlay(image, m_np, alpha=alpha)
         overlay.save(bbox_dir / f"object_{i}_overlay.png")
 
-        meta_objects.append({
-            "object_id": i,
-            "score": float(scores[i]) if scores is not None else None,
-            "mask_area_pixels": mask_area_px,
-            "mask_area_pct": mask_area_pct,
-            "mask_file": f"object_{i}_mask.png",
-            "overlay_file": f"object_{i}_overlay.png",
-        })
+        meta_objects.append(
+            {
+                "object_id": i,
+                "score": float(scores[i]) if scores is not None else None,
+                "mask_area_pixels": mask_area_px,
+                "mask_area_pct": mask_area_pct,
+                "mask_file": f"object_{i}_mask.png",
+                "overlay_file": f"object_{i}_overlay.png",
+            }
+        )
 
     inference_time = round(time.time() - t_start, 3)
     meta = {
@@ -317,18 +324,16 @@ def _process_image_with_bbox(
 def _process_image_with_points(
     driver,
     image: Image.Image,
-    points: List[List[float]],
-    point_labels: List[int],
+    points: list[list[float]],
+    point_labels: list[int],
     image_name: str,
     output_dir: Path,
     alpha: float,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Process an image with click-point prompts via geometric prompt.
 
     Returns metadata dict for aggregation.
     """
-    import torch
-    from sam3.model.box_ops import box_xywh_to_cxcywh
 
     t_start = time.time()
     total_pixels = image.width * image.height
@@ -343,17 +348,15 @@ def _process_image_with_points(
     width, height = image.size
     # Point-size fraction of the image used to construct a tiny box
     POINT_BOX_FRACTION = 0.02  # 2% of image dimension
-    box_half_w = POINT_BOX_FRACTION / 2.0
-    box_half_h = POINT_BOX_FRACTION / 2.0
+    POINT_BOX_FRACTION / 2.0
+    POINT_BOX_FRACTION / 2.0
 
     for pt, lbl in zip(points, point_labels):
         # Normalise point to [0, 1] and build a small box in CXCYWH normalised form
         cx = pt[0] / width
         cy = pt[1] / height
         small_box = [cx, cy, POINT_BOX_FRACTION, POINT_BOX_FRACTION]
-        inference_state = processor.add_geometric_prompt(
-            state=inference_state, box=small_box, label=bool(lbl)
-        )
+        inference_state = processor.add_geometric_prompt(state=inference_state, box=small_box, label=bool(lbl))
 
     masks = inference_state.get("masks")
     scores = inference_state.get("scores")
@@ -367,7 +370,7 @@ def _process_image_with_points(
         m_np = m.cpu().numpy() if hasattr(m, "cpu") else np.array(m)
         if m_np.ndim == 3 and m_np.shape[0] == 1:
             m_np = m_np[0]
-        m_u8 = (m_np.astype(np.uint8) * 255)
+        m_u8 = m_np.astype(np.uint8) * 255
 
         mask_area_px = int(np.count_nonzero(m_np))
         mask_area_pct = round(mask_area_px / total_pixels * 100, 2) if total_pixels else 0.0
@@ -378,14 +381,16 @@ def _process_image_with_points(
         overlay = _create_overlay(image, m_np, alpha=alpha)
         overlay.save(pts_dir / f"object_{i}_overlay.png")
 
-        meta_objects.append({
-            "object_id": i,
-            "score": float(scores[i]) if scores is not None else None,
-            "mask_area_pixels": mask_area_px,
-            "mask_area_pct": mask_area_pct,
-            "mask_file": f"object_{i}_mask.png",
-            "overlay_file": f"object_{i}_overlay.png",
-        })
+        meta_objects.append(
+            {
+                "object_id": i,
+                "score": float(scores[i]) if scores is not None else None,
+                "mask_area_pixels": mask_area_px,
+                "mask_area_pct": mask_area_pct,
+                "mask_file": f"object_{i}_mask.png",
+                "overlay_file": f"object_{i}_overlay.png",
+            }
+        )
 
     inference_time = round(time.time() - t_start, 3)
     meta = {
@@ -405,7 +410,8 @@ def _process_image_with_points(
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_bbox(raw: List[str]) -> List[List[float]]:
+
+def parse_bbox(raw: list[str]) -> list[list[float]]:
     """Parse --bbox values into a list of 4-coord bounding boxes.
 
     Accepts either 4 values (one box) or multiples of 4.
@@ -417,7 +423,7 @@ def parse_bbox(raw: List[str]) -> List[List[float]]:
     return [vals[i : i + 4] for i in range(0, len(vals), 4)]
 
 
-def parse_points(raw: List[str]) -> List[List[float]]:
+def parse_points(raw: list[str]) -> list[list[float]]:
     """Parse --points values like '320,240' into [[320, 240], ...]."""
     pts = []
     for p in raw:
@@ -443,35 +449,54 @@ Examples:
     )
 
     parser.add_argument(
-        "--images", nargs="+", required=True,
+        "--images",
+        nargs="+",
+        required=True,
         help="One or more image file paths",
     )
     parser.add_argument(
-        "--prompts", nargs="+", default=None,
+        "--prompts",
+        nargs="+",
+        default=None,
         help="Text prompts for segmentation (e.g. person car)",
     )
     parser.add_argument(
-        "--points", nargs="+", default=None,
+        "--points",
+        nargs="+",
+        default=None,
         help="Click points as x,y pairs (e.g. 320,240 500,300)",
     )
     parser.add_argument(
-        "--point-labels", nargs="+", type=int, default=None,
+        "--point-labels",
+        nargs="+",
+        type=int,
+        default=None,
         help="Labels for each point (1=positive, 0=negative). Must match --points count.",
     )
     parser.add_argument(
-        "--bbox", nargs="+", type=float, default=None,
+        "--bbox",
+        nargs="+",
+        type=float,
+        default=None,
         help="Bounding box(es) as x y w h (multiples of 4 for multiple boxes)",
     )
     parser.add_argument(
-        "--output", type=str, default="results",
+        "--output",
+        type=str,
+        default="results",
         help="Output directory (default: results)",
     )
     parser.add_argument(
-        "--alpha", type=float, default=0.5,
+        "--alpha",
+        type=float,
+        default=0.5,
         help="Overlay alpha for mask visualisation (0.0–1.0, default: 0.5)",
     )
     parser.add_argument(
-        "--device", type=str, default=None, choices=["cpu", "cuda"],
+        "--device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda"],
         help="Force device (auto-detected if omitted)",
     )
 
@@ -486,7 +511,9 @@ Examples:
     if args.points and args.point_labels:
         points = parse_points(args.points)
         if len(args.point_labels) != len(points):
-            print(f"\033[91m✗ --point-labels count ({len(args.point_labels)}) must match --points count ({len(points)})\033[0m")
+            print(
+                f"\033[91m✗ --point-labels count ({len(args.point_labels)}) must match --points count ({len(points)})\033[0m"
+            )
             sys.exit(1)
     elif args.points:
         points = parse_points(args.points)
@@ -498,6 +525,7 @@ Examples:
 
     # --- Device ---------------------------------------------------------------
     from sam3.__globals import DEVICE as DEFAULT_DEVICE
+
     device = args.device or DEFAULT_DEVICE.type
 
     # --- Validate image files -------------------------------------------------
@@ -527,7 +555,9 @@ Examples:
 
     # --- Process each image ---------------------------------------------------
     from datetime import datetime
+
     import torch
+
     from sam3.utils.memory_sampler import MemorySampler
 
     pipeline_start = time.time()
@@ -536,9 +566,9 @@ Examples:
     mem_sampler.start()
 
     driver = None
-    model_load_s: Optional[float] = None
-    all_memory_info: List[Dict[str, Any]] = []
-    per_image_results: List[Dict[str, Any]] = []
+    model_load_s: float | None = None
+    all_memory_info: list[dict[str, Any]] = []
+    per_image_results: list[dict[str, Any]] = []
 
     for idx, img_path in enumerate(image_paths):
         image_name = img_path.stem
@@ -565,6 +595,7 @@ Examples:
             print("  Loading model...")
             t_model_start = time.time()
             from sam3.drivers import Sam3ImageDriver
+
             driver = Sam3ImageDriver(device=device)
             model_load_s = round(time.time() - t_model_start, 3)
             print(f"  Model loaded in {model_load_s:.1f}s.\n")
@@ -572,34 +603,49 @@ Examples:
         image = Image.open(img_path)
 
         # Collect per-prompt / per-type results
-        prompt_results: List[Dict[str, Any]] = []
-        bbox_result: Optional[Dict[str, Any]] = None
-        points_result: Optional[Dict[str, Any]] = None
+        prompt_results: list[dict[str, Any]] = []
+        bbox_result: dict[str, Any] | None = None
+        points_result: dict[str, Any] | None = None
 
         # --- Text prompts (loop per prompt, separate folders) -----------------
         if args.prompts:
             prompt_results = _process_image_with_text_prompts(
-                driver, image, args.prompts, image_name, image_output, args.alpha,
+                driver,
+                image,
+                args.prompts,
+                image_name,
+                image_output,
+                args.alpha,
             )
 
         # --- Bounding boxes ---------------------------------------------------
         if boxes:
             bbox_result = _process_image_with_bbox(
-                driver, image, boxes, [1] * len(boxes),
-                image_name, image_output, args.alpha,
+                driver,
+                image,
+                boxes,
+                [1] * len(boxes),
+                image_name,
+                image_output,
+                args.alpha,
             )
 
         # --- Click points -----------------------------------------------------
         if points:
             points_result = _process_image_with_points(
-                driver, image, points, args.point_labels,
-                image_name, image_output, args.alpha,
+                driver,
+                image,
+                points,
+                args.point_labels,
+                image_name,
+                image_output,
+                args.alpha,
             )
 
         image_time = round(time.time() - t_image_start, 3)
 
         # Build enriched objects section — aggregate from prompt results
-        objects_section: Dict[str, Any] = {}
+        objects_section: dict[str, Any] = {}
         if prompt_results:
             objects_section["text_prompts"] = prompt_results
         if bbox_result:
@@ -629,11 +675,13 @@ Examples:
         with open(image_output / "metadata.json", "w") as f:
             json.dump(img_meta, f, indent=2, default=str)
 
-        per_image_results.append({
-            "image_name": image_name,
-            "image_path": str(img_path),
-            "processing_time_s": image_time,
-        })
+        per_image_results.append(
+            {
+                "image_name": image_name,
+                "image_path": str(img_path),
+                "processing_time_s": image_time,
+            }
+        )
 
         # Cleanup between images to free memory
         if driver is not None:

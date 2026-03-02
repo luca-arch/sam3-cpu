@@ -281,25 +281,14 @@ class DemoEval(COCOeval):
         recall = TPs / (TPs + FNs + 1e-4)
         assert np.all(recall <= 1)
         F1 = 2 * precision * recall / (precision + recall + 1e-4)
-        positive_micro_F1 = (
-            2
-            * positive_micro_precision
-            * recall
-            / (positive_micro_precision + recall + 1e-4)
-        )
+        positive_micro_F1 = 2 * positive_micro_precision * recall / (positive_micro_precision + recall + 1e-4)
 
         IL_rec = IL_TPs / (IL_TPs + IL_FNs + 1e-6)
         IL_prec = IL_TPs / (IL_TPs + IL_FPs + 1e-6)
         IL_F1 = 2 * IL_prec * IL_rec / (IL_prec + IL_rec + 1e-6)
         IL_FPR = IL_FPs / (IL_FPs + IL_TNs + 1e-6)
         IL_MCC = float(IL_TPs * IL_TNs - IL_FPs * IL_FNs) / (
-            (
-                float(IL_TPs + IL_FPs)
-                * float(IL_TPs + IL_FNs)
-                * float(IL_TNs + IL_FPs)
-                * float(IL_TNs + IL_FNs)
-            )
-            ** 0.5
+            (float(IL_TPs + IL_FPs) * float(IL_TPs + IL_FNs) * float(IL_TNs + IL_FPs) * float(IL_TNs + IL_FNs)) ** 0.5
             + 1e-6
         )
         IL_perfect_pos = IL_perfects_pos / (total_pos_count + 1e-9)
@@ -334,9 +323,7 @@ class DemoEval(COCOeval):
             "J&F": total_JnF,
         }
         self.eval["CGF1"] = self.eval["positive_macro_F1"] * self.eval["IL_MCC"]
-        self.eval["CGF1_w0dt"] = (
-            self.eval["positive_w0dt_macro_F1"] * self.eval["IL_MCC"]
-        )
+        self.eval["CGF1_w0dt"] = self.eval["positive_w0dt_macro_F1"] * self.eval["IL_MCC"]
         self.eval["CGF1_micro"] = self.eval["positive_micro_F1"] * self.eval["IL_MCC"]
 
     def summarize(self):
@@ -352,9 +339,7 @@ class DemoEval(COCOeval):
             iStr = " {:<18} @[ IoU={:<9}] = {:0.3f}"
             titleStr = "Average " + metric
             iouStr = (
-                "{:0.2f}:{:0.2f}".format(p.iouThrs[0], p.iouThrs[-1])
-                if iouThr is None
-                else "{:0.2f}".format(iouThr)
+                "{:0.2f}:{:0.2f}".format(p.iouThrs[0], p.iouThrs[-1]) if iouThr is None else "{:0.2f}".format(iouThr)
             )
 
             s = self.eval[metric]
@@ -529,14 +514,10 @@ class DemoEvaluator(CocoEvaluator):
         assert scorings[0].ndim == 3, (
             f"Expecting results in [numCats, numAreas, numImgs] format, got {scorings[0].shape}"
         )
-        assert scorings[0].shape[0] == 1, (
-            f"Expecting a single category, got {scorings[0].shape[0]}"
-        )
+        assert scorings[0].shape[0] == 1, f"Expecting a single category, got {scorings[0].shape[0]}"
 
         for scoring in scorings:
-            assert scoring.shape == scorings[0].shape, (
-                f"Shape mismatch: {scoring.shape}, {scorings[0].shape}"
-            )
+            assert scoring.shape == scorings[0].shape, f"Shape mismatch: {scoring.shape}, {scorings[0].shape}"
 
         selected_imgs = []
         for img_id in range(scorings[0].shape[-1]):
@@ -628,9 +609,7 @@ class DemoEvaluator(CocoEvaluator):
 
     def accumulate(self, imgIds=None):
         self._lazy_init()
-        logging.info(
-            f"demo evaluator: Accumulating on {len(imgIds) if imgIds is not None else 'all'} images"
-        )
+        logging.info(f"demo evaluator: Accumulating on {len(imgIds) if imgIds is not None else 'all'} images")
         if not is_main_process():
             return
 

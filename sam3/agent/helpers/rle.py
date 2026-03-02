@@ -39,9 +39,7 @@ def rle_encode(orig_mask, return_areas=False):
     if return_areas:
         mask_areas = flat_mask.sum(-1).tolist()
     # Find the indices where the mask changes
-    differences = torch.ones(
-        mask.shape[0], flat_mask.shape[1] + 1, device=mask.device, dtype=torch.bool
-    )
+    differences = torch.ones(mask.shape[0], flat_mask.shape[1] + 1, device=mask.device, dtype=torch.bool)
     differences[:, 1:-1] = flat_mask[:, :-1] != flat_mask[:, 1:]
     differences[:, 0] = flat_mask[:, 0]
     _, change_indices = torch.where(differences)
@@ -91,12 +89,7 @@ def robust_rle_encode(masks):
         return rle_encode(masks)
     except RuntimeError as _:
         masks = masks.cpu().numpy()
-        rles = [
-            mask_util.encode(
-                np.array(mask[:, :, np.newaxis], dtype=np.uint8, order="F")
-            )[0]
-            for mask in masks
-        ]
+        rles = [mask_util.encode(np.array(mask[:, :, np.newaxis], dtype=np.uint8, order="F"))[0] for mask in masks]
         for rle in rles:
             rle["counts"] = rle["counts"].decode("utf-8")
         return rles

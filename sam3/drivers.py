@@ -1,54 +1,57 @@
 """
 SAM3 CPU + GPU Driver
 
-This module provides a unified interface for running SAM3 on both CPU and GPU. 
-It automatically selects the best available backend for prompt based segmentation operations, 
+This module provides a unified interface for running SAM3 on both CPU and GPU.
+It automatically selects the best available backend for prompt based segmentation operations,
 ensuring optimal performance across different hardware configurations.
 """
+
 import os
-from typing import Dict, List, Optional
+from typing import Literal
+
 import numpy as np
-from typing_extensions import Literal
 import torch
-from sam3.utils.profiler import profile
-from sam3.__globals import DEVICE, BPE_PATH, CPU_CORES_PERCENT
-from sam3.utils.logger import get_logger
+
+from sam3.__globals import BPE_PATH, CPU_CORES_PERCENT, DEVICE
 from sam3.memory_optimizer import clear_memory
+from sam3.utils.logger import get_logger
+from sam3.utils.profiler import profile
 
 logger = get_logger(__name__)
 
+
 class Sam3ImageDriver:
     """High-level driver for SAM3 image segmentation with automatic device selection.
-    
+
     This driver provides a simplified interface for image segmentation tasks using SAM3.
     It automatically detects available hardware (CPU/GPU) and optimizes performance accordingly.
     Supports text-based prompts and geometric prompts (bounding boxes) for versatile segmentation.
-    
+
     Performance Notes:
         - GPU: Automatically enables TF32 and bfloat16 for Ampere GPUs
         - CPU: Uses optimized CPU backend with configurable worker threads
         - Memory: Call cleanup() after processing to release resources
-    
+
     Example:
         >>> driver = Sam3ImageDriver(bpe_path="path/to/tokenizer.model")
         >>> results = driver.prompt_texts("image.jpg", prompts=["person", "car"])
         >>> for prompt, state in results.items():
         ...     print(f"Found {len(state['scores'])} {prompt}(s)")
         >>> driver.cleanup()
-    
+
     Attributes:
         predictor: The underlying SAM3 model predictor instance.
     """
-    
-    def __init__(self, bpe_path: str = BPE_PATH, num_workers: Optional[int] = 1, device: Optional[str] = None):
+
+    def __init__(self, bpe_path: str = BPE_PATH, num_workers: int | None = 1, device: str | None = None):
         """Initialize the SAM3 image driver.
-        
+
         Args:
             bpe_path: Path to the BPE tokenizer model file. Defaults to global BPE_PATH.
             num_workers: Number of worker threads for CPU processing. Only used on CPU.
                         Defaults to 1. Higher values may improve throughput but increase memory.
             device: Force device ('cpu' or 'cuda'). Auto-detected if None.
-        
+
         Raises:
             FileNotFoundError: If bpe_path does not exist.
             RuntimeError: If model loading fails.
@@ -59,33 +62,34 @@ class Sam3ImageDriver:
     @profile()
     def _build_model(self, bpe_path, device):
         """Internal method to build the SAM3 image model.
-        
+
         Args:
             bpe_path: Path to BPE tokenizer model file.
             device: Device type ('cpu' or 'cuda').
-        
+
         Returns:
             Built SAM3 image model ready for inference.
-        
+
         Performance Note:
             Model loading typically takes 5-15 seconds depending on device.
         """
         from sam3 import build_sam3_image_model
+
         logger.info(f"Loading model on device: {device}")
         model = build_sam3_image_model(bpe_path=bpe_path, device=device)
         return model
 
     @profile()
-    def _get_predictor(self, bpe_path: Optional[str], num_workers: Optional[int]):
+    def _get_predictor(self, bpe_path: str | None, num_workers: int | None):
         """Internal method to initialize predictor with device-specific optimizations.
-        
+
         Args:
             bpe_path: Path to BPE tokenizer model.
             num_workers: Number of CPU worker threads (unused on GPU).
-        
+
         Returns:
             Initialized predictor ready for inference.
-        
+
         Performance Optimizations:
             - CPU: Queries CPU capabilities for optimal instruction set usage
             - GPU (Ampere): Enables TF32 for faster matrix operations (~3x speedup)
@@ -100,7 +104,8 @@ class Sam3ImageDriver:
             #  - intra-op: physical cores (parallelism within a single matmul/conv)
             #  - inter-op: 1 (run ops sequentially — avoids lock contention)
             import psutil
-            phys = psutil.cpu_count(logical=False)*CPU_CORES_PERCENT or 1
+
+            phys = psutil.cpu_count(logical=False) * CPU_CORES_PERCENT or 1
             phys = max(1, int(phys))  # Ensure at least 1 thread is used
             torch.set_num_threads(phys)
             try:
@@ -121,50 +126,51 @@ class Sam3ImageDriver:
             torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
 
         return self._build_model(bpe_path=bpe_path, device=device)
-        
+
     @profile()
     def inference(self, image):
         """Initialize image processing and create inference state.
-        
+
         This method prepares the image for segmentation by encoding it into the model's
         internal representation. The resulting processor and state are used for all
         subsequent prompt operations.
-        
+
         Args:
             image: Input image as PIL Image, numpy array, or torch tensor.
-        
+
         Returns:
             Tuple of (processor, inference_state):
                 - processor: Sam3Processor instance for handling prompts
                 - inference_state: Encoded image state with embeddings
-        
+
         Raises:
             ValueError: If model is not loaded.
-        
+
         Performance Note:
             Image encoding is memory-intensive. For batch processing, call cleanup()
             between images to prevent memory buildup.
         """
         from sam3.model.sam3_image_processor import Sam3Processor
+
         if self.predictor is None:
             raise ValueError("Model is not loaded.")
         # confidence_threshold=0.5 filters out low-confidence detections
         processor = Sam3Processor(self.predictor, confidence_threshold=0.5, device=self._device)
         inference_state = processor.set_image(image)
         return processor, inference_state
-    
+
     @profile()
-    def prompt_and_predict(self, processor, inference_state, prompt: str="people"):
+    def prompt_and_predict(self, processor, inference_state, prompt: str = "people"):
         """Apply a text prompt to the image and get segmentation results.
-        
+
         Args:
             processor: Sam3Processor instance from inference().
             inference_state: Current inference state.
             prompt: Natural language description of objects to segment (e.g., "person", "car").
-        
+
         Returns:
             Updated inference_state containing segmentation masks, scores, and bounding boxes.
-        
+
         Note:
             This method resets all previous prompts before applying the new one.
         """
@@ -175,26 +181,26 @@ class Sam3ImageDriver:
         return inference_state
 
     @profile()
-    def prompt_texts(self, image_path: str, prompts: str | List[str]=["people"]):
+    def prompt_texts(self, image_path: str, prompts: str | list[str] = ["people"]):
         """High-level method to segment objects in an image using text prompts.
-        
+
         This is the primary entry point for text-based image segmentation. It handles
         image loading, inference initialization, and prompt processing in a single call.
-        
+
         Args:
             image_path: Path to the image file (supports common formats: jpg, png, etc.).
             prompts: Single prompt string or list of prompts (e.g., ["person", "car", "tree"]).
-        
+
         Returns:
             Dictionary mapping each prompt to its inference_state containing:
                 - "masks": Segmentation masks for detected objects
                 - "scores": Confidence scores for each detection
                 - "boxes": Bounding boxes in normalized coordinates
-        
+
         Raises:
             ValueError: If image file doesn't exist or is empty.
             RuntimeError: If image loading or inference fails.
-        
+
         Example:
             >>> driver = Sam3ImageDriver()
             >>> results = driver.prompt_texts("scene.jpg", prompts=["person", "bicycle"])
@@ -202,7 +208,7 @@ class Sam3ImageDriver:
             ...     print(f"Found {len(state['scores'])} {prompt}(s)")
             ...     for i, score in enumerate(state['scores']):
             ...         print(f"  Object {i}: confidence={score:.2f}")
-        
+
         Performance Note:
             Image is encoded once, then all prompts are processed sequentially.
             For large images (>4K), consider resizing to reduce memory usage.
@@ -210,6 +216,7 @@ class Sam3ImageDriver:
         # Validate image file exists and is readable
         if os.path.isfile(image_path):
             from PIL import Image
+
             image = Image.open(image_path)
             # Sanity check: ensure image has valid dimensions
             if image.size == (0, 0):
@@ -218,10 +225,10 @@ class Sam3ImageDriver:
                 logger.info(f"Loaded image: {image_path} with size {image.size}")
         else:
             raise ValueError(f"Could not load image file: {image_path}")
-        
+
         # Initialize image encoding (expensive operation, done once)
         processor, inference_state = self.inference(image)
-        
+
         # Normalize prompts to list format for consistent processing
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -232,10 +239,18 @@ class Sam3ImageDriver:
             inference_state = self.prompt_and_predict(processor, inference_state, prompt=prompt)
             # Store a copy of relevant results to avoid reference issues
             result[prompt] = {
-                "masks": inference_state["masks"].clone() if hasattr(inference_state["masks"], 'clone') else inference_state["masks"].copy(),
-                "scores": inference_state["scores"].clone() if hasattr(inference_state["scores"], 'clone') else inference_state["scores"].copy(),
-                "boxes": inference_state["boxes"].clone() if hasattr(inference_state["boxes"], 'clone') else inference_state["boxes"].copy(),
-                "masks_logits": inference_state.get("masks_logits").clone() if hasattr(inference_state.get("masks_logits", None), 'clone') else inference_state.get("masks_logits"),
+                "masks": inference_state["masks"].clone()
+                if hasattr(inference_state["masks"], "clone")
+                else inference_state["masks"].copy(),
+                "scores": inference_state["scores"].clone()
+                if hasattr(inference_state["scores"], "clone")
+                else inference_state["scores"].copy(),
+                "boxes": inference_state["boxes"].clone()
+                if hasattr(inference_state["boxes"], "clone")
+                else inference_state["boxes"].copy(),
+                "masks_logits": inference_state.get("masks_logits").clone()
+                if hasattr(inference_state.get("masks_logits", None), "clone")
+                else inference_state.get("masks_logits"),
             }
             nb_objects = len(result[prompt]["scores"])
             logger.info(f"found {nb_objects} {prompt}(s)")
@@ -243,31 +258,27 @@ class Sam3ImageDriver:
 
     @profile()
     def prompt_bounding_box(
-        self, 
-        image: torch.Tensor | np.ndarray | str, 
-        processor,
-        inference_state, 
-        box_xywh: List[float | int]
+        self, image: torch.Tensor | np.ndarray | str, processor, inference_state, box_xywh: list[float | int]
     ):
         """Segment an object using a bounding box prompt.
-        
+
         This method provides precise control over segmentation by specifying the exact
         region of interest. Useful when text prompts are ambiguous or multiple instances
         of the same object need individual targeting.
-        
+
         Args:
             image: Input image (PIL Image, numpy array, or file path).
             processor: Sam3Processor instance from inference().
             inference_state: Current inference state.
             box_xywh: Bounding box in XYWH format [x, y, width, height] in absolute pixels.
-        
+
         Returns:
             Updated inference_state with segmentation for the boxed region.
-        
+
         Note:
             Box coordinates use XYWH format (top-left x, y, width, height) and are
             internally converted to center-based format (CXCYWH) then normalized to [0, 1].
-        
+
         Example:
             >>> # Segment person at coordinates (100, 150) with size 200x300
             >>> box = [100, 150, 200, 300]
@@ -279,56 +290,59 @@ class Sam3ImageDriver:
         # Load image if path provided
         if isinstance(image, str):
             from PIL import Image
+
             image = Image.open(image)
-        
+
         width, height = image.size
 
         # Convert box format: XYWH (top-left + size) -> CXCYWH (center + size)
         # Algorithm: cx = x + w/2, cy = y + h/2
         box_input_xywh = torch.tensor(box_xywh, dtype=torch.float32).view(-1, 4)
         box_input_cxcywh = box_xywh_to_cxcywh(box_input_xywh)
-        
+
         # Normalize coordinates to [0, 1] range for resolution-independent processing
         norm_box_cxcywh = normalize_bbox(box_input_cxcywh, width, height).flatten().tolist()
 
         # Clear previous prompts and apply box prompt
         processor.reset_all_prompts(inference_state)
         inference_state = processor.add_geometric_prompt(
-            state=inference_state, box=norm_box_cxcywh, label=True  # label=True indicates positive prompt
+            state=inference_state,
+            box=norm_box_cxcywh,
+            label=True,  # label=True indicates positive prompt
         )
         return inference_state
-    
+
     @profile()
     def prompt_multi_box_with_labels(
-        self, 
-        image: torch.Tensor | np.ndarray | str, 
+        self,
+        image: torch.Tensor | np.ndarray | str,
         processor,
-        inference_state, 
-        boxes_xywh: List[List[float | int]], 
-        box_labels: List[int]
+        inference_state,
+        boxes_xywh: list[list[float | int]],
+        box_labels: list[int],
     ):
         """Segment multiple objects using bounding boxes with positive/negative labels.
-        
+
         This advanced method allows specifying multiple regions with labels indicating
         whether to include (positive) or exclude (negative) the region from segmentation.
         Useful for complex scenes requiring fine-grained control.
-        
+
         Args:
             image: Input image (PIL Image, numpy array, or file path).
             processor: Sam3Processor instance from inference().
             inference_state: Current inference state.
             boxes_xywh: List of bounding boxes, each in XYWH format [x, y, width, height].
             box_labels: List of labels (1=positive/include, 0=negative/exclude) for each box.
-        
+
         Returns:
             Updated inference_state with segmentation for all labeled regions.
-        
+
         Example:
             >>> # Segment two people, exclude background object
             >>> boxes = [[100, 150, 200, 300], [400, 200, 180, 320], [500, 100, 50, 80]]
             >>> labels = [1, 1, 0]  # Include first two boxes, exclude third
             >>> state = driver.prompt_multi_box_with_labels(image, processor, state, boxes, labels)
-        
+
         Note:
             Labels must match the length of boxes. Positive labels (1) add objects to
             the segmentation, while negative labels (0) exclude regions.
@@ -339,14 +353,15 @@ class Sam3ImageDriver:
         # Load image if path provided
         if isinstance(image, str):
             from PIL import Image
+
             image = Image.open(image)
-        
+
         width, height = image.size
 
         # Batch convert all boxes: XYWH -> CXCYWH format
-        boxes_input_xywh = torch.tensor(boxes_xywh, dtype=torch.float32).view(-1,4)
+        boxes_input_xywh = torch.tensor(boxes_xywh, dtype=torch.float32).view(-1, 4)
         boxes_input_cxcywh = box_xywh_to_cxcywh(boxes_input_xywh)
-        
+
         # Normalize all boxes to [0, 1] range
         norm_boxes_cxcywh = normalize_bbox(boxes_input_cxcywh, width, height).tolist()
 
@@ -355,27 +370,25 @@ class Sam3ImageDriver:
 
         # Add each box prompt with its label (positive or negative)
         for box, label in zip(norm_boxes_cxcywh, box_labels):
-            inference_state = processor.add_geometric_prompt(
-                state=inference_state, box=box, label=label
-            )
+            inference_state = processor.add_geometric_prompt(state=inference_state, box=box, label=label)
         return inference_state
-    
+
     @profile()
     def cleanup(self):
         """Release memory and clean up resources.
-        
+
         This method aggressively frees memory by calling device-specific cleanup routines.
         Essential for preventing memory leaks in long-running applications or batch processing.
-        
+
         Performance Note:
             - GPU: Clears CUDA cache, reclaiming ~100% of allocated GPU memory
             - CPU (Linux only): Calls malloc_trim to return memory to OS, plus Python GC
             - CPU (non-Linux): Only runs Python garbage collection
-        
+
         Platform Compatibility:
             The CPU malloc_trim optimization requires glibc (Linux). On Windows/macOS,
             only Python garbage collection is performed.
-        
+
         Example:
             >>> driver = Sam3ImageDriver()
             >>> for image_path in image_list:
@@ -384,7 +397,7 @@ class Sam3ImageDriver:
             ...     driver.cleanup()  # Free memory before next image
         """
         # Device-specific memory cleanup
-        device = getattr(self, '_device', DEVICE.type)
+        device = getattr(self, "_device", DEVICE.type)
         if device == "cuda":
             # Clear PyTorch's GPU memory cache
             torch.cuda.empty_cache()
@@ -405,66 +418,65 @@ class Sam3ImageDriver:
             gc.collect()
 
 
-
-class Sam3VideoDriver():
+class Sam3VideoDriver:
     """High-level driver for SAM3 video segmentation with session-based tracking.
-    
+
     This driver provides a comprehensive interface for video object segmentation and tracking
     across multiple frames. It uses a session-based architecture where each video is processed
     in an isolated session, supporting multiple concurrent sessions.
-    
+
     Key Features:
         - Text-based and point-based prompting for object annotation
         - Temporal propagation (forward/backward/bidirectional) for tracking
         - Multi-object tracking with unique object IDs
         - Session management for resource isolation
         - Automatic device detection and optimization (CPU/GPU)
-    
+
     Architecture:
         1. Start session with video → Get session_id
         2. Add prompts (text or points) → Define objects to track
         3. Propagate → Track objects across frames
         4. Refine (optional) → Improve tracking with additional prompts
         5. Close session → Release resources
-    
+
     Performance Notes:
         - GPU: Supports multi-GPU parallelism for faster processing
         - CPU: Uses multi-threaded workers (configurable via num_workers)
         - Memory: Each session holds encoded frames. Close sessions when done.
         - Propagation: Processing time scales linearly with video length
-    
+
     Example:
         >>> driver = Sam3VideoDriver(bpe_path="path/to/tokenizer.model")
-        >>> 
+        >>>
         >>> # Start video segmentation session
         >>> session_id = driver.start_session("video.mp4")
-        >>> 
+        >>>
         >>> # Add object using text prompt
         >>> response = driver.add_prompt(session_id, prompt="person")
-        >>> 
+        >>>
         >>> # Track across all frames
         >>> results = driver.propagate_in_video(session_id, propogation_direction="forward")
         >>> for frame_idx, masks in results.items():
         ...     print(f"Frame {frame_idx}: {len(masks)} objects")
-        >>> 
+        >>>
         >>> # Clean up
         >>> driver.close_session(session_id)
         >>> driver.cleanup()
-    
+
     Attributes:
         predictor: The underlying SAM3 video predictor instance (CPU or GPU variant).
     """
-    
-    def __init__(self, bpe_path: Optional[str] = BPE_PATH, num_workers: Optional[int] = 1, device: Optional[str] = None):
+
+    def __init__(self, bpe_path: str | None = BPE_PATH, num_workers: int | None = 1, device: str | None = None):
         """Initialize the SAM3 video driver.
-        
+
         Args:
             bpe_path: Path to the BPE tokenizer model file. Defaults to global BPE_PATH.
             num_workers: Number of worker threads for CPU processing, or number of GPUs to use.
                         - CPU: Controls parallel frame processing (recommend: CPU cores / 2)
                         - GPU: Number of GPUs to use (default: all available)
             device: Force device ('cpu' or 'cuda'). Auto-detected if None.
-        
+
         Raises:
             FileNotFoundError: If bpe_path does not exist.
             RuntimeError: If model loading fails or no compatible device found.
@@ -473,24 +485,25 @@ class Sam3VideoDriver():
         self._get_predictor(bpe_path=bpe_path, num_workers=num_workers, device=self._device)
 
     @profile()
-    def _get_predictor(self, bpe_path: Optional[str], num_workers: Optional[int] = None, device: str = DEVICE.type):
+    def _get_predictor(self, bpe_path: str | None, num_workers: int | None = None, device: str = DEVICE.type):
         """Internal method to initialize video predictor with device-specific optimizations.
-        
+
         Args:
             bpe_path: Path to BPE tokenizer model.
             num_workers: Worker count (threads on CPU, GPU count on GPU).
-        
+
         Performance Optimizations:
             - CPU: Multi-threaded frame processing for parallel decoding
             - GPU (Ampere): TF32 enabled for ~3x matmul speedup
             - GPU: bfloat16 precision for 2x memory reduction
             - GPU: Multi-GPU support for distributed processing
-        
+
         Note:
             Sets self.predictor as side effect. Returns None.
         """
         if device == "cpu":
             from sam3.model_builder import build_sam3_video_predictor_cpu
+
             logger.warning("Running on CPU. For better performance, please run on a GPU.")
             # Query CPU capabilities to optimize for available instruction sets (AVX2, AVX512, etc.)
             torch.backends.cpu.get_cpu_capability()
@@ -498,7 +511,8 @@ class Sam3VideoDriver():
             #  - intra-op: physical cores (parallelism within a single matmul/conv)
             #  - inter-op: 1 (run ops sequentially — avoids lock contention)
             import psutil
-            phys = psutil.cpu_count(logical=False)*CPU_CORES_PERCENT or 1
+
+            phys = psutil.cpu_count(logical=False) * CPU_CORES_PERCENT or 1
             phys = max(1, int(phys))  # Ensure at least 1 thread is used
             torch.set_num_threads(phys)
             try:
@@ -509,6 +523,7 @@ class Sam3VideoDriver():
             self.predictor = build_sam3_video_predictor_cpu(bpe_path=bpe_path, num_workers=num_workers)
         else:
             from sam3.model_builder import build_sam3_video_predictor
+
             logger.info("Running on GPU. Enabling TF32 and bfloat16 for better performance.")
             # Enable TensorFloat-32 for Ampere+ GPUs (RTX 30xx/40xx, A100, H100)
             # TF32: 10-bit mantissa vs FP32's 23-bit = ~3x speedup with <0.1% accuracy loss
@@ -526,10 +541,10 @@ class Sam3VideoDriver():
 
     def _abs_to_rel_coords(self, coords, img_width, img_height, coord_type="point"):
         """Convert absolute pixel coordinates to normalized relative coordinates.
-        
+
         This internal method normalizes coordinates to [0, 1] range for resolution-independent
         processing. SAM3 requires normalized coordinates to handle videos of varying resolutions.
-        
+
         Args:
             coords: List of coordinates in absolute pixels.
             img_width: Image width in pixels.
@@ -537,22 +552,22 @@ class Sam3VideoDriver():
             coord_type: Type of coordinates to convert:
                        - "point": [[x, y], ...] format (e.g., click points)
                        - "box": [[x, y, w, h], ...] format (bounding boxes in XYWH)
-        
+
         Returns:
             List of normalized coordinates in [0, 1] range, maintaining input structure.
-        
+
         Raises:
             ValueError: If coord_type is not "point" or "box".
-        
+
         Example:
             >>> # Convert click point at pixel (640, 480) in 1920x1080 image
             >>> rel_points = driver._abs_to_rel_coords([[640, 480]], 1920, 1080, "point")
             >>> # Result: [[0.333, 0.444]]
-            >>> 
+            >>>
             >>> # Convert bounding box [100, 200, 300, 400] in 1920x1080 image
             >>> rel_box = driver._abs_to_rel_coords([[100, 200, 300, 400]], 1920, 1080, "box")
             >>> # Result: [[0.052, 0.185, 0.156, 0.370]]
-        
+
         Algorithm:
             - Point: (x, y) → (x/width, y/height)
             - Box: (x, y, w, h) → (x/width, y/height, w/width, h/height)
@@ -562,39 +577,36 @@ class Sam3VideoDriver():
             return [[x / img_width, y / img_height] for x, y in coords]
         elif coord_type == "box":
             # Normalize box coordinates: divide all dimensions by respective image dimensions
-            return [
-                [x / img_width, y / img_height, w / img_width, h / img_height]
-                for x, y, w, h in coords
-            ]
+            return [[x / img_width, y / img_height, w / img_width, h / img_height] for x, y, w, h in coords]
         else:
             raise ValueError(f"Unknown coord_type: {coord_type}")
 
-# -------------- Prompting APIs (add prompt, propagate, remove object) --------------
+    # -------------- Prompting APIs (add prompt, propagate, remove object) --------------
     @profile()
     def add_prompt(self, session_id: str, prompt: str, frame_index: int = 0):
         """Add a text-based prompt to identify objects in the video.
-        
+
         This method uses natural language to describe objects to segment. The model will
         detect all instances matching the description across the video frames.
-        
+
         Args:
             session_id: Active session identifier from start_session().
             prompt: Natural language description of objects to segment (e.g., "person", "red car").
             frame_index: Frame index to add the prompt on (default: 0).
-        
+
         Returns:
             Response dictionary containing:
-                - "outputs": Segmentation results with masks, scores, and object IDs  
-        
+                - "outputs": Segmentation results with masks, scores, and object IDs
+
         Raises:
             ValueError: If model is not loaded or session_id is invalid.
-        
+
         Example:
             >>> session_id = driver.start_session("video.mp4")
             >>> response = driver.add_prompt(session_id, "person", frame_index=0)
             >>> out = response["outputs"]
             >>> print(f"Detected {len(out['out_obj_ids'])} objects")
-        
+
         Note:
             Text prompts provide automatic detection but less control than point prompts.
             For precise object selection, use add_object_with_points_prompt().
@@ -614,21 +626,21 @@ class Sam3VideoDriver():
 
     @profile()
     def add_object_with_points_prompt(
-        self, 
+        self,
         session_id: str,
         frame_idx: int,
         object_id: int,
         frame_width: int,
         frame_height: int,
-        points: List[List[float | int]],    # positive clicks have label 1, while negative clicks have label 0
-        point_labels: List[int]
+        points: list[list[float | int]],  # positive clicks have label 1, while negative clicks have label 0
+        point_labels: list[int],
     ):
         """Add or refine an object using interactive point prompts (clicks).
-        
+
         This method provides precise control through positive clicks (include region) and
         negative clicks (exclude region). It's the primary way to manually define objects
         when text prompts are insufficient or for correcting automatic detections.
-        
+
         Args:
             session_id: Active session identifier from start_session().
             frame_idx: Zero-based frame index where points are annotated.
@@ -637,15 +649,15 @@ class Sam3VideoDriver():
             frame_height: Video frame height in pixels (for coordinate normalization).
             points: List of [x, y] coordinates in absolute pixels. Example: [[640, 480], [800, 500]].
             point_labels: List of labels matching points (1=positive/include, 0=negative/exclude).
-        
+
         Returns:
             Response dictionary containing:
                 - "outputs": Updated segmentation results for this object
                 - "frame_index": Frame where the prompt was applied
-        
+
         Raises:
             ValueError: If model not loaded, session invalid, or points/labels length mismatch.
-        
+
         Example:
             >>> session_id = driver.start_session("video.mp4")
             >>> # Add object with 2 positive clicks and 1 negative click
@@ -656,20 +668,20 @@ class Sam3VideoDriver():
             ...     frame_width=1920, frame_height=1080,
             ...     points=points, point_labels=labels
             ... )
-        
+
         Point Labeling Strategy:
             - Positive (1): Click inside the target object
             - Negative (0): Click on background or unwanted regions
             - More points = more accurate segmentation
             - Use negative points to exclude ambiguous regions
-        
+
         Performance Note:
             Point prompts are processed immediately. For real-time annotation,
             consider batching multiple objects before calling propagate_in_video().
         """
         if self.predictor is None:
             raise ValueError("Model is not loaded.")
-        
+
         labels = np.array(point_labels)
         points_abs = np.array(points)
 
@@ -692,22 +704,24 @@ class Sam3VideoDriver():
             )
         )
 
-        return response["outputs"]  # response["outputs"] contains the updated segmentation results after adding the object
+        return response[
+            "outputs"
+        ]  # response["outputs"] contains the updated segmentation results after adding the object
 
     @profile()
     def propagate_in_video(
-        self, 
-        session_id: str, 
-        start_frame_idx: int = None, 
-        frames_to_track: int = None, 
-        propagation_direction: Literal["both", "forward", "backward"] = "both"
-    ) -> Dict[int, Dict[str, List]]:
+        self,
+        session_id: str,
+        start_frame_idx: int = None,
+        frames_to_track: int = None,
+        propagation_direction: Literal["both", "forward", "backward"] = "both",
+    ) -> dict[int, dict[str, list]]:
         """Propagate object segmentation across video frames temporally.
-        
+
         This is the core tracking method that extends object segmentation from prompted
         frames to all other frames. Uses temporal consistency and motion cues to maintain
         accurate tracking across the video sequence.
-        
+
         Args:
             session_id: Active session identifier from start_session().
             start_frame_idx: Starting frame index for propagation. If None, uses the last
@@ -718,36 +732,36 @@ class Sam3VideoDriver():
                 - "forward": Track from start_frame_idx towards end of video
                 - "backward": Track from start_frame_idx towards beginning
                 - "both": Track in both directions simultaneously (default)
-        
+
         Returns:
             Dictionary mapping frame_index (int) to segmentation outputs:
                 {frame_idx: {"masks": [...], "scores": [...], "object_ids": [...]}}
-        
+
         Raises:
             ValueError: If model not loaded, session invalid, or direction invalid.
-        
+
         Example:
             >>> session_id = driver.start_session("video.mp4")
             >>> # Add object annotation on frame 10
             >>> driver.add_object_with_points_prompt(session_id, frame_idx=10, ...)
-            >>> 
+            >>>
             >>> # Track forward from frame 10 to end
             >>> results = driver.propagate_in_video(
             ...     session_id, start_frame_idx=10, propagation_direction="forward"
             ... )
             >>> print(f"Tracked across {len(results)} frames")
-            >>> 
+            >>>
             >>> # Track both directions for 50 frames total
             >>> results = driver.propagate_in_video(
             ...     session_id, frames_to_track=50, propagation_direction="both"
             ... )
-        
+
         Performance Notes:
             - Streaming Results: Returns dictionary populated frame-by-frame as processing completes
             - Processing Time: ~0.1-0.5 seconds per frame on GPU, 1-3 seconds on CPU
             - Memory: Peak memory scales with number of tracked objects (not video length)
             - Bidirectional: "both" processes forward and backward in parallel for speed
-        
+
         Tracking Quality:
             - Best within 20-30 frames of prompted frame (motion coherence)
             - Degradation on occlusions, fast motion, or scene changes
@@ -755,10 +769,12 @@ class Sam3VideoDriver():
         """
         if self.predictor is None:
             raise ValueError("Model is not loaded.")
-        
+
         if propagation_direction not in ("both", "forward", "backward"):
-            raise ValueError("propagation_direction must be 'both', 'forward' or 'backward'. Options: 'both', 'forward', 'backward'")
-        
+            raise ValueError(
+                "propagation_direction must be 'both', 'forward' or 'backward'. Options: 'both', 'forward', 'backward'"
+            )
+
         # Collect all streaming results into a single return value
         result = {}
         object_ids = set()
@@ -775,7 +791,7 @@ class Sam3VideoDriver():
             object_ids.update(frame_obj_ids)
 
         return result, object_ids, frame_objects
-    
+
     def propagate_in_video_streaming(
         self,
         session_id: str,
@@ -804,9 +820,7 @@ class Sam3VideoDriver():
             raise ValueError("Model is not loaded.")
 
         if propagation_direction not in ("both", "forward", "backward"):
-            raise ValueError(
-                "propagation_direction must be 'both', 'forward' or 'backward'"
-            )
+            raise ValueError("propagation_direction must be 'both', 'forward' or 'backward'")
 
         for response in self.predictor.handle_stream_request(
             request=dict(
@@ -823,27 +837,25 @@ class Sam3VideoDriver():
                     obj_ids = obj_ids.tolist()
                 yield response["frame_index"], response["outputs"], obj_ids
             else:
-                logger.warning(
-                    f"Response missing required keys. Got keys: {list(response.keys())}"
-                )
+                logger.warning(f"Response missing required keys. Got keys: {list(response.keys())}")
 
     @profile()
     def refine_existing_object_with_points_prompt(
-        self, 
+        self,
         session_id: str,
         frame_idx: int,
         object_id: int,
         frame_width: int,
         frame_height: int,
-        points: List[List[float | int]],    # positive clicks have label 1, while negative clicks have label 0
-        point_labels: List[int]
+        points: list[list[float | int]],  # positive clicks have label 1, while negative clicks have label 0
+        point_labels: list[int],
     ):
         """Refine tracking of an existing object using additional point prompts.
-        
+
         This method is an alias for add_object_with_points_prompt() used specifically
         for clarifying intent when correcting existing tracked objects. Adding points
         with the same object_id updates that object's segmentation.
-        
+
         Args:
             session_id: Active session identifier from start_session().
             frame_idx: Frame index where refinement prompts are annotated.
@@ -852,15 +864,15 @@ class Sam3VideoDriver():
             frame_height: Video frame height in pixels.
             points: List of [x, y] click coordinates in absolute pixels.
             point_labels: List of labels (1=positive/include, 0=negative/exclude).
-        
+
         Returns:
             Response dictionary with updated segmentation for the refined object.
-        
+
         Example:
             >>> # Initially track person (object_id=1) on frame 0
             >>> driver.add_object_with_points_prompt(session_id, 0, object_id=1, ...)
             >>> driver.propagate_in_video(session_id, propogation_direction="forward")
-            >>> 
+            >>>
             >>> # Track drifts on frame 50, refine with negative clicks
             >>> refine_points = [[800, 600]]  # Click on wrongly included background
             >>> refine_labels = [0]  # Negative click to exclude
@@ -871,13 +883,13 @@ class Sam3VideoDriver():
             ... )
             >>> # Re-propagate to apply refinement
             >>> driver.propagate_in_video(session_id, start_frame_idx=50, propogation_direction="forward")
-        
+
         Refinement Workflow:
             1. Identify frame where tracking degrades
             2. Add corrective prompts (usually negative clicks on false positives)
             3. Re-propagate from that frame forward/backward
             4. Repeat for other problematic frames if needed
-        
+
         Note:
             After refining, you must call propagate_in_video() again to apply corrections
             to subsequent frames. Previous propagation results remain unchanged.
@@ -889,7 +901,7 @@ class Sam3VideoDriver():
             frame_width=frame_width,
             frame_height=frame_height,
             points=points,
-            point_labels=point_labels
+            point_labels=point_labels,
         )
 
     @profile()
@@ -926,17 +938,17 @@ class Sam3VideoDriver():
             >>> # Previous chunk produced masks for objects 0, 1, 2
             >>> prev_masks = {0: mask_array_0, 1: mask_array_1, 2: mask_array_2}
             >>> obj_ids = [0, 1, 2]
-            >>> 
+            >>>
             >>> # Start new session on next chunk
             >>> session_id = driver.start_session("chunk_1.mp4")
-            >>> 
+            >>>
             >>> # Inject previous chunk's last-frame masks on frame 0
             >>> result = driver.inject_masks(session_id, frame_idx=0,
             ...     masks=prev_masks, object_ids=obj_ids)
-            >>> 
+            >>>
             >>> # Optionally add text prompt for NEW object detection
             >>> driver.add_prompt(session_id, "person")
-            >>> 
+            >>>
             >>> # Propagate (tracks both injected + newly detected objects)
             >>> driver.propagate_in_video(session_id)
         """
@@ -957,27 +969,27 @@ class Sam3VideoDriver():
     @profile()
     def remove_object(self, session_id: str, object_id: int):
         """Remove an object from the video segmentation session.
-        
+
         Permanently deletes all tracking information for the specified object across
         all frames in the session. Useful for removing incorrectly detected objects
         or objects no longer of interest.
-        
+
         Args:
             session_id: Active session identifier from start_session().
             object_id: Unique integer ID of the object to remove.
-        
+
         Raises:
             ValueError: If model not loaded, session invalid, or object_id doesn't exist.
-        
+
         Example:
             >>> # Add multiple objects
             >>> driver.add_object_with_points_prompt(session_id, 0, object_id=1, ...)
             >>> driver.add_object_with_points_prompt(session_id, 0, object_id=2, ...)
             >>> driver.propagate_in_video(session_id)
-            >>> 
+            >>>
             >>> # Remove object 2 from all frames
             >>> driver.remove_object(session_id, object_id=2)
-        
+
         Note:
             - Removal is permanent for this session
             - Other objects remain unaffected
@@ -994,24 +1006,24 @@ class Sam3VideoDriver():
             )
         )
 
-# -------------- Session Management APIs (start, reset, close) --------------
+    # -------------- Session Management APIs (start, reset, close) --------------
     @profile()
     def cleanup(self):
         """Release all resources and perform comprehensive memory cleanup.
-        
+
         This method performs a full shutdown of the predictor and aggressively frees
         memory. Essential for long-running applications or when switching between videos.
-        
+
         Cleanup Operations:
             1. Shutdown predictor (closes all sessions)
             2. Release device memory (GPU cache or CPU malloc)
             3. Run garbage collection
-        
+
         Performance Notes:
             - GPU: Clears CUDA cache (~100% GPU memory recovery)
             - CPU (Linux): Calls malloc_trim + GC (aggressive OS-level cleanup)
             - CPU (other): Python GC only (standard cleanup)
-        
+
         Example:
             >>> driver = Sam3VideoDriver()
             >>> # Process multiple videos
@@ -1020,7 +1032,7 @@ class Sam3VideoDriver():
             ...     # ... track objects ...
             ...     driver.close_session(session_id)
             >>> driver.cleanup()  # Final cleanup before exit
-        
+
         Warning:
             After cleanup(), the driver is non-functional. Create a new instance
             to process additional videos.
@@ -1029,7 +1041,7 @@ class Sam3VideoDriver():
         self.shutdown()
 
         # Device-specific aggressive memory recovery
-        device = getattr(self, '_device', DEVICE.type)
+        device = getattr(self, "_device", DEVICE.type)
         if device == "cuda":
             # Clear PyTorch's CUDA memory cache
             torch.cuda.empty_cache()
@@ -1047,36 +1059,36 @@ class Sam3VideoDriver():
 
             # Run Python garbage collector to free unreferenced objects
             gc.collect()
-    
+
     @profile()
     def close_session(self, session_id: str):
         """Close and release resources for a specific video segmentation session.
-        
+
         This method deallocates memory and resources associated with a session while
         keeping the driver active for processing other videos. Always close sessions
         when done to prevent memory leaks.
-        
+
         Args:
             session_id: Session identifier to close (from start_session()).
-        
+
         Raises:
             ValueError: If model not loaded or session_id is invalid.
-        
+
         Example:
             >>> driver = Sam3VideoDriver()
             >>> session1 = driver.start_session("video1.mp4")
             >>> # ... process video1 ...
             >>> driver.close_session(session1)  # Free memory
-            >>> 
+            >>>
             >>> session2 = driver.start_session("video2.mp4")  # Driver still active
             >>> # ... process video2 ...
             >>> driver.close_session(session2)
-        
+
         Memory Impact:
             - Releases encoded frame embeddings (~1-2 GB per video on GPU)
             - Clears all tracked object states
             - Driver remains loaded and ready for new sessions
-        
+
         Best Practice:
             Use try-finally to ensure sessions are closed even on errors:
             >>> session_id = driver.start_session(video_path)
@@ -1088,7 +1100,7 @@ class Sam3VideoDriver():
         """
         if self.predictor is None:
             raise ValueError("Model is not loaded.")
-        
+
         self.predictor.handle_request(
             request=dict(
                 type="close_session",
@@ -1097,44 +1109,44 @@ class Sam3VideoDriver():
         )
 
         # Release CUDA cache so freed memory becomes available for next session
-        device = getattr(self, '_device', DEVICE.type)
+        device = getattr(self, "_device", DEVICE.type)
         clear_memory(device, full_gc=True)
 
     @profile()
     def reset_session(self, session_id: str):
         """Reset a session to its initial state, removing all prompts and tracked objects.
-        
+
         This method clears all annotation data (prompts, objects, tracking results) while
         keeping the video loaded and encoded. Useful for trying different annotation
         strategies without reloading the video.
-        
+
         Args:
             session_id: Session identifier to reset (from start_session()).
-        
+
         Raises:
             ValueError: If model not loaded or session_id is invalid.
-        
+
         Example:
             >>> session_id = driver.start_session("video.mp4")
             >>> # First attempt: track people
             >>> driver.add_prompt(session_id, "person")
             >>> results1 = driver.propagate_in_video(session_id)
-            >>> 
+            >>>
             >>> # Not satisfied, try different approach
             >>> driver.reset_session(session_id)
             >>> # Second attempt: manual point annotation
             >>> driver.add_object_with_points_prompt(session_id, 0, object_id=1, ...)
             >>> results2 = driver.propagate_in_video(session_id)
-        
+
         Performance Note:
             Reset is much faster than close + start because the video remains loaded
             and encoded in memory. Video encoding is the most expensive operation.
-        
+
         What Gets Reset:
             - All prompts (text and point annotations)
             - All tracked objects and their IDs
             - All propagation results
-        
+
         What Stays:
             - Encoded video frames (expensive to recompute)
             - Session ID (remains valid)
@@ -1152,28 +1164,28 @@ class Sam3VideoDriver():
         # Release cached GPU memory from the previous prompt's propagation.
         # This is critical: reset_session clears model tracking state but
         # CUDA still holds reserved (but freed) memory in its allocator pool.
-        device = getattr(self, '_device', DEVICE.type)
+        device = getattr(self, "_device", DEVICE.type)
         clear_memory(device, full_gc=True)
 
     @profile()
     def start_session(self, video_path: str) -> str:
         """Start a new video segmentation session and load the video.
-        
+
         This method initializes a new session, loads the video, and encodes all frames
         into the model's internal representation. Returns a unique session ID used for
         all subsequent operations on this video.
-        
+
         Args:
             video_path: Path to video file. Supports common formats (mp4, avi, mov, mkv, etc.).
-        
+
         Returns:
             Unique session identifier (string) used for all session operations.
-        
+
         Raises:
             ValueError: If model not loaded.
             FileNotFoundError: If video_path doesn't exist.
             RuntimeError: If video loading or encoding fails.
-        
+
         Example:
             >>> driver = Sam3VideoDriver()
             >>> session_id = driver.start_session("/path/to/video.mp4")
@@ -1182,19 +1194,19 @@ class Sam3VideoDriver():
             >>> driver.add_prompt(session_id, "person")
             >>> # ... do work ...
             >>> driver.close_session(session_id)  # Always close when done
-        
+
         Performance Notes:
             - Video Encoding: Most expensive operation, takes 30s-5min depending on length
             - Memory Usage: ~1-2 GB per video on GPU, ~2-4 GB on CPU
             - Frame Rate: Processes ~10-30 frames/sec during encoding (device-dependent)
             - Long Videos: Consider splitting videos >5 minutes into chunks
-        
+
         Session Management:
             - Multiple concurrent sessions supported (memory permitting)
             - Each session is isolated (prompts/objects don't affect other sessions)
             - Always close sessions with close_session() to free memory
             - Use context manager pattern for automatic cleanup
-        
+
         Supported Video Formats:
             Common: mp4, avi, mov, mkv, webm, flv, wmv
             Codec: H.264, H.265, VP8, VP9, etc. (anything OpenCV supports)
@@ -1212,32 +1224,32 @@ class Sam3VideoDriver():
     @profile()
     def shutdown(self):
         """Shutdown the video predictor and close all active sessions.
-        
+
         This method gracefully shuts down the predictor, closing all active sessions
         and releasing associated resources. After shutdown, the driver becomes
         non-functional and cannot process videos.
-        
+
         Raises:
             No exceptions raised. Issues are logged as warnings.
-        
+
         Example:
             >>> driver = Sam3VideoDriver()
             >>> session_id = driver.start_session("video.mp4")
             >>> # ... process video ...
             >>> driver.shutdown()  # Close all sessions and shutdown
             >>> # Driver is now unusable, create new instance if needed
-        
+
         Shutdown vs Close vs Cleanup:
             - shutdown(): Closes predictor, all sessions become invalid
             - close_session(): Closes one session, predictor stays active
             - cleanup(): Calls shutdown() + aggressive memory cleanup
-        
+
         Note:
             - Safe to call multiple times (idempotent)
             - Automatically called by cleanup()
             - Use cleanup() instead for memory-sensitive applications
             - No need to close individual sessions before shutdown (automatic)
-        
+
         Warning States:
             - "Predictor is already shut down": shutdown() called twice (harmless)
             - "Predictor was never initialized": shutdown() called on failed init

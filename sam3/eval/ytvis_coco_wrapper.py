@@ -43,10 +43,7 @@ class YTVIS(COCO):
                     # note that in some datasets we load under this YTVIS class,
                     # some "bboxes" could be None for when the GT object is invisible,
                     # so we replace them with [0, 0, 0, 0]
-                    ann["bboxes"] = [
-                        bbox if bbox is not None else [0, 0, 0, 0]
-                        for bbox in ann["bboxes"]
-                    ]
+                    ann["bboxes"] = [bbox if bbox is not None else [0, 0, 0, 0] for bbox in ann["bboxes"]]
                 if "areas" in ann:
                     # similar to "bboxes", some areas could be None for when the GT
                     # object is invisible, so we replace them with 0
@@ -59,9 +56,7 @@ class YTVIS(COCO):
             self.dataset["images"] = self.dataset.pop("videos")
 
         if self.ignore_gt_cats:
-            self.dataset["categories"] = [
-                {"supercategory": "object", "id": -1, "name": "object"}
-            ]
+            self.dataset["categories"] = [{"supercategory": "object", "id": -1, "name": "object"}]
         else:
             for cat in self.dataset["categories"]:
                 cat["id"] = int(cat["id"])
@@ -104,9 +99,7 @@ class YTVIS(COCO):
                 bbs = [(bb if bb is not None else [0, 0, 0, 0]) for bb in ann["bboxes"]]
                 xxyy = [[bb[0], bb[0] + bb[2], bb[1], bb[1] + bb[3]] for bb in bbs]
                 if not "segmentations" in ann:
-                    ann["segmentations"] = [
-                        [[x1, y1, x1, y2, x2, y2, x2, y1]] for (x1, x2, y1, y2) in xxyy
-                    ]
+                    ann["segmentations"] = [[[x1, y1, x1, y2, x2, y2, x2, y1]] for (x1, x2, y1, y2) in xxyy]
                 ann["areas"] = [bb[2] * bb[3] for bb in bbs]
                 # NOTE: We also compute average area of a tracklet across video, allowing us to compute area based mAP.
                 ann["area"] = np.mean(ann["areas"])
@@ -115,13 +108,9 @@ class YTVIS(COCO):
         elif "segmentations" in anns[0]:
             res.dataset["categories"] = copy.deepcopy(self.dataset["categories"])
             for id, ann in enumerate(anns):
-                ann["bboxes"] = [
-                    mask_util.toBbox(segm) for segm in ann["segmentations"]
-                ]
+                ann["bboxes"] = [mask_util.toBbox(segm) for segm in ann["segmentations"]]
                 if "areas" not in ann:
-                    ann["areas"] = [
-                        mask_util.area(segm) for segm in ann["segmentations"]
-                    ]
+                    ann["areas"] = [mask_util.area(segm) for segm in ann["segmentations"]]
                 # NOTE: We also compute average area of a tracklet across video, allowing us to compute area based mAP.
                 ann["area"] = np.mean(ann["areas"])
                 ann["id"] = id + 1

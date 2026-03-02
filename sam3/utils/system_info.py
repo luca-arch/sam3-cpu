@@ -1,31 +1,37 @@
-import psutil
 import platform
+
+import psutil
+
 
 def available_ram(size_unit="Bytes"):
     vm = psutil.virtual_memory()
     if size_unit == "GB":
-        return vm.available / (1024 ** 3)
+        return vm.available / (1024**3)
     elif size_unit == "MB":
-        return vm.available / (1024 ** 2)
+        return vm.available / (1024**2)
     elif size_unit == "KB":
         return vm.available / 1024
     return vm.available
 
+
 def total_ram(size_unit="Bytes"):
     vm = psutil.virtual_memory()
     if size_unit == "GB":
-        return vm.total / (1024 ** 3)
+        return vm.total / (1024**3)
     elif size_unit == "MB":
-        return vm.total / (1024 ** 2)
+        return vm.total / (1024**2)
     elif size_unit == "KB":
         return vm.total / 1024
     return vm.total
 
+
 def cpu_usage():
     return psutil.cpu_percent(interval=1)
 
+
 def cpu_cores():
     return psutil.cpu_count(logical=False), psutil.cpu_count(logical=True)
+
 
 def get_system_info():
     print("=" * 50)
@@ -37,9 +43,9 @@ def get_system_info():
     # ---------------------------
     vm = psutil.virtual_memory()
 
-    total_ram_gb = vm.total / (1024 ** 3)
-    available_ram_gb = vm.available / (1024 ** 3)
-    used_ram_gb = vm.used / (1024 ** 3)
+    total_ram_gb = vm.total / (1024**3)
+    available_ram_gb = vm.available / (1024**3)
+    used_ram_gb = vm.used / (1024**3)
 
     print("\nRAM Information:")
     print(f"Total RAM:      {total_ram_gb:.2f} GB")
@@ -70,7 +76,9 @@ def get_system_info():
 
     print("\nPer-Core Frequencies:")
     for i, core in enumerate(per_core_freq):
-        print(f"Core {str(i).zfill(len(str(logical_cores)))}: Current - {core.current:.2f} MHz | Min - {core.min:.2f} MHz | Max - {core.max:.2f} MHz")
+        print(
+            f"Core {str(i).zfill(len(str(logical_cores)))}: Current - {core.current:.2f} MHz | Min - {core.min:.2f} MHz | Max - {core.max:.2f} MHz"
+        )
 
     # ---------------------------
     # Extra Info

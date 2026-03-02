@@ -39,9 +39,7 @@ def _get_metric_index(metric_name: str, iou_threshold: Optional[float] = None) -
     for idx, metric in enumerate(CGF1_METRICS):
         if metric.name == metric_name and metric.iou_threshold == iou_threshold:
             return idx
-    raise ValueError(
-        f"Metric '{metric_name}' with IoU threshold {iou_threshold} not found in CGF1_METRICS"
-    )
+    raise ValueError(f"Metric '{metric_name}' with IoU threshold {iou_threshold} not found in CGF1_METRICS")
 
 
 class BasePredFileEvaluator:
@@ -74,9 +72,7 @@ class YTVISPredFileEvaluator(BasePredFileEvaluator):
         # rather than compressed RLEs ("counts" is a string), so we first convert them here.
         if "segm" in self.iou_types:
             for ann in ytvisGT.dataset["annotations"]:
-                ann["segmentations"] = [
-                    _compress_rle(rle) for rle in ann["segmentations"]
-                ]
+                ann["segmentations"] = [_compress_rle(rle) for rle in ann["segmentations"]]
 
         with open(pred_file) as f:
             dt = json.load(f)
@@ -139,9 +135,7 @@ class VideoPhraseApEvaluator(BasePredFileEvaluator):
         gt, dt = remap_video_category_pairs_to_unique_video_ids(gt, dt)
         if "segm" in self.iou_types:
             for ann in gt["annotations"]:
-                ann["segmentations"] = [
-                    _compress_rle(rle) for rle in ann["segmentations"]
-                ]
+                ann["segmentations"] = [_compress_rle(rle) for rle in ann["segmentations"]]
         for d in dt:
             d["image_id"] = d["video_id"]
 
@@ -212,14 +206,10 @@ class VideoCGF1Evaluator(BasePredFileEvaluator):
             )
         # For phrase AP and demo F1 evaluation, we need to remap each pair of (video_id, category_id) to
         # a new unique video_id, so that we don't mix detections from different categories under `useCat=False`
-        gt, dt = remap_video_category_pairs_to_unique_video_ids(
-            gt, dt, add_negative_np_pairs=compute_ilmcc_and_cgf1
-        )
+        gt, dt = remap_video_category_pairs_to_unique_video_ids(gt, dt, add_negative_np_pairs=compute_ilmcc_and_cgf1)
         if "segm" in self.iou_types:
             for ann in gt["annotations"]:
-                ann["segmentations"] = [
-                    _compress_rle(rle) for rle in ann["segmentations"]
-                ]
+                ann["segmentations"] = [_compress_rle(rle) for rle in ann["segmentations"]]
         for d in dt:
             d["image_id"] = d["video_id"]
 
@@ -254,33 +244,25 @@ class VideoCGF1Evaluator(BasePredFileEvaluator):
                 ilmcc_avg_idx = _get_metric_index("IL_MCC", None)
                 results[result_prefix + "_cgf1_micro_50_95"] = stats[cgf1_micro_avg_idx]
                 results[result_prefix + "_ilmcc_50_95"] = stats[ilmcc_avg_idx]
-                results[result_prefix + "_positive_micro_f1_50_95"] = stats[
-                    positive_micro_f1_avg_idx
-                ]
+                results[result_prefix + "_positive_micro_f1_50_95"] = stats[positive_micro_f1_avg_idx]
 
                 # IoU = 0.5
                 cgf1_micro_50_idx = _get_metric_index("cgF1", 0.5)
                 positive_micro_f1_50_idx = _get_metric_index("positive_micro_F1", 0.5)
                 results[result_prefix + "_cgf1_micro_50"] = stats[cgf1_micro_50_idx]
                 results[result_prefix + "_ilmcc_50"] = float(
-                    np.array(stats[cgf1_micro_50_idx])
-                    / np.array(stats[positive_micro_f1_50_idx])
+                    np.array(stats[cgf1_micro_50_idx]) / np.array(stats[positive_micro_f1_50_idx])
                 )
-                results[result_prefix + "_positive_micro_f1_50"] = stats[
-                    positive_micro_f1_50_idx
-                ]
+                results[result_prefix + "_positive_micro_f1_50"] = stats[positive_micro_f1_50_idx]
 
                 # IoU = 0.75
                 cgf1_micro_75_idx = _get_metric_index("cgF1", 0.75)
                 positive_micro_f1_75_idx = _get_metric_index("positive_micro_F1", 0.75)
                 results[result_prefix + "_cgf1_micro_75"] = stats[cgf1_micro_75_idx]
                 results[result_prefix + "_ilmcc_75"] = float(
-                    np.array(stats[cgf1_micro_75_idx])
-                    / np.array(stats[positive_micro_f1_75_idx])
+                    np.array(stats[cgf1_micro_75_idx]) / np.array(stats[positive_micro_f1_75_idx])
                 )
-                results[result_prefix + "_positive_micro_f1_75"] = stats[
-                    positive_micro_f1_75_idx
-                ]
+                results[result_prefix + "_positive_micro_f1_75"] = stats[positive_micro_f1_75_idx]
 
             self.extract_video_np_level_results(demoF1Eval, video_np_level_results)
 
@@ -357,9 +339,7 @@ class VideoTetaEvaluator(BasePredFileEvaluator):
         valid_strategies = ["track", "frame", "none"]
         print("current nms_strategy:", self.nms_strategy)
         if self.nms_strategy not in valid_strategies:
-            raise ValueError(
-                f"Invalid NMS strategy: {self.nms_strategy}. Must be one of {valid_strategies}"
-            )
+            raise ValueError(f"Invalid NMS strategy: {self.nms_strategy}. Must be one of {valid_strategies}")
 
         print(f"Initialized VideoTetaEvaluator with NMS strategy: {self.nms_strategy}")
         print(f"Probability threshold set to: {self.prob_thresh}")
@@ -377,9 +357,7 @@ class VideoTetaEvaluator(BasePredFileEvaluator):
         # Filter by score threshold
         if self.prob_thresh > 0:
             raw_preds = [d for d in raw_preds if d["score"] >= self.prob_thresh]
-            print(
-                f"Filtered to {len(raw_preds)} predictions with score >= {self.prob_thresh}"
-            )
+            print(f"Filtered to {len(raw_preds)} predictions with score >= {self.prob_thresh}")
         # Group predictions by video_id
         video_groups = defaultdict(list)
         for pred in raw_preds:
@@ -393,9 +371,7 @@ class VideoTetaEvaluator(BasePredFileEvaluator):
             print("Skipping NMS processing as strategy is set to 'none'")
             # No processing needed for "none" strategy
         # Save processed predictions
-        processed_preds = [
-            track for tracks in video_groups.values() for track in tracks
-        ]
+        processed_preds = [track for tracks in video_groups.values() for track in tracks]
         processed_path = os.path.join(tmp_dir, "processed_preds.json")
         with open(processed_path, "w") as f:
             json.dump(processed_preds, f)
@@ -449,9 +425,7 @@ class VideoTetaEvaluator(BasePredFileEvaluator):
                 dataset_parsing_key = "TAO"
 
             # Run evaluation
-            eval_results, _ = evaluator.evaluate(
-                dataset_list, [metrics.TETA(exhaustive=self.is_exhaustive)]
-            )
+            eval_results, _ = evaluator.evaluate(dataset_list, [metrics.TETA(exhaustive=self.is_exhaustive)])
 
             # Extract and format results
             results = {
@@ -623,9 +597,7 @@ class VideoPhraseHotaEvaluator(BasePredFileEvaluator):
 
             _summarize_results(output_res, iou_type, "COMBINED_SEQ", "all")
             if "COMBINED_SEQ_CHALLENGING" in output_res[self.dataset_name]["tracker"]:
-                _summarize_results(
-                    output_res, iou_type, "COMBINED_SEQ_CHALLENGING", "challenging"
-                )
+                _summarize_results(output_res, iou_type, "COMBINED_SEQ_CHALLENGING", "challenging")
 
         # video-NP level results not supported for `VideoPhraseHotaEvaluator` yet
         return out_dict, video_np_level_results
@@ -652,15 +624,10 @@ class VideoPhraseHotaEvaluator(BasePredFileEvaluator):
         # unique filenames to each remapped video, so we add remapped video_id as prefix.
         for video in gt["videos"]:
             new_video_id = video["id"]
-            video["file_names"] = [
-                f"remapped_vid_{new_video_id:012d}/{name}"
-                for name in video["file_names"]
-            ]
+            video["file_names"] = [f"remapped_vid_{new_video_id:012d}/{name}" for name in video["file_names"]]
         return gt, dt
 
-    def extract_video_np_level_results(
-        self, iou_type, remapped_gt, raw_results, video_np_level_results
-    ):
+    def extract_video_np_level_results(self, iou_type, remapped_gt, raw_results, video_np_level_results):
         """Aggregate statistics for video-level metrics."""
         result_prefix = "mask" if iou_type == "segm" else "bbox"
         for video in remapped_gt["videos"]:
@@ -706,9 +673,7 @@ def _compress_rle(rle):
     return rle
 
 
-def remap_video_category_pairs_to_unique_video_ids(
-    gt_json, dt_json, add_negative_np_pairs=False
-):
+def remap_video_category_pairs_to_unique_video_ids(gt_json, dt_json, add_negative_np_pairs=False):
     """
     Remap each pair of (video_id, category_id) to a new unique video_id. This is useful
     for phrase AP and demo F1 evaluation on videos, where we have `useCat=False` and
@@ -729,28 +694,20 @@ def remap_video_category_pairs_to_unique_video_ids(
 
     # assign the video_id-category_id pairs to unique video ids
     video_id_category_id_pairs = sorted(video_id_category_id_pairs)
-    video_id_category_id_to_new_video_id = {
-        pair: (i + 1) for i, pair in enumerate(video_id_category_id_pairs)
-    }
+    video_id_category_id_to_new_video_id = {pair: (i + 1) for i, pair in enumerate(video_id_category_id_pairs)}
     # also map the negative NP pairs -- this is needed for IL_MCC and CG-F1 evaluation
     if add_negative_np_pairs:
         for vnp in gt_json["video_np_pairs"]:
             pair = (vnp["video_id"], vnp["category_id"])
             if pair not in video_id_category_id_to_new_video_id:
-                video_id_category_id_to_new_video_id[pair] = (
-                    len(video_id_category_id_to_new_video_id) + 1
-                )
+                video_id_category_id_to_new_video_id[pair] = len(video_id_category_id_to_new_video_id) + 1
 
     # map the "video_id" in predictions
     for pred in dt_json:
-        pred["video_id"] = video_id_category_id_to_new_video_id[
-            (pred["video_id"], pred["category_id"])
-        ]
+        pred["video_id"] = video_id_category_id_to_new_video_id[(pred["video_id"], pred["category_id"])]
     # map the "video_id" in gt_json["annotations"]
     for ann in gt_json["annotations"]:
-        ann["video_id"] = video_id_category_id_to_new_video_id[
-            (ann["video_id"], ann["category_id"])
-        ]
+        ann["video_id"] = video_id_category_id_to_new_video_id[(ann["video_id"], ann["category_id"])]
     # map and duplicate gt_json["videos"]
     new_videos = []
     for (
@@ -810,15 +767,9 @@ def remap_gt_dt_class_agnostic(gt, dt):
     for video in gt["videos"]:
         video["orig_video_id"] = video["id"]
         # Use the first annotation's original category_id if available, else None
-        orig_cat = (
-            anns_by_video[video["id"]][0]["category_id"]
-            if anns_by_video[video["id"]]
-            else None
-        )
+        orig_cat = anns_by_video[video["id"]][0]["category_id"] if anns_by_video[video["id"]] else None
         video["orig_category_id"] = orig_cat
-        video["file_names"] = [
-            f"remapped_vid_{video['id']:012d}/{name}" for name in video["file_names"]
-        ]
+        video["file_names"] = [f"remapped_vid_{video['id']:012d}/{name}" for name in video["file_names"]]
 
     # Set all DT category_id to 1
     for d in dt:

@@ -65,9 +65,7 @@ def run_main_all(dataset_name, args):
     pred_file = os.path.join(args.pred_dir, dataset_name + "_preds.json")
     eval_res_file = os.path.join(args.eval_res_dir, dataset_name + "_eval_res.json")
     print(f"=== Running evaluation for Pred {pred_file} vs GT {gt_annot_file} ===")
-    veval_evaluator = VEvalEvaluator(
-        gt_annot_file=gt_annot_file, eval_res_file=eval_res_file
-    )
+    veval_evaluator = VEvalEvaluator(gt_annot_file=gt_annot_file, eval_res_file=eval_res_file)
     _ = veval_evaluator.run_eval(pred_file=pred_file)
 
     print(f"=== Results saved to {eval_res_file} ===")
@@ -96,9 +94,7 @@ def main_one(args):
     eval_res_file = args.eval_res_file
 
     print(f"=== Running evaluation for Pred {pred_file} vs GT {gt_annot_file} ===")
-    veval_evaluator = VEvalEvaluator(
-        gt_annot_file=gt_annot_file, eval_res_file=eval_res_file
-    )
+    veval_evaluator = VEvalEvaluator(gt_annot_file=gt_annot_file, eval_res_file=eval_res_file)
     _ = veval_evaluator.run_eval(pred_file=pred_file)
 
     print(f"=== Results saved to {eval_res_file} ===")

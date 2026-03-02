@@ -65,9 +65,7 @@ class COCOevalCustom(COCOeval):
     This is a slightly modified version of the original COCO API with added support for positive split evaluation.
     """
 
-    def __init__(
-        self, cocoGt=None, cocoDt=None, iouType="segm", dt_only_positive=False
-    ):
+    def __init__(self, cocoGt=None, cocoDt=None, iouType="segm", dt_only_positive=False):
         super().__init__(cocoGt, cocoDt, iouType)
         self.dt_only_positive = dt_only_positive
 
@@ -85,12 +83,8 @@ class COCOevalCustom(COCOeval):
 
         p = self.params
         if p.useCats:
-            gts = self.cocoGt.loadAnns(
-                self.cocoGt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds)
-            )
-            dts = self.cocoDt.loadAnns(
-                self.cocoDt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds)
-            )
+            gts = self.cocoGt.loadAnns(self.cocoGt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds))
+            dts = self.cocoDt.loadAnns(self.cocoDt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds))
         else:
             gts = self.cocoGt.loadAnns(self.cocoGt.getAnnIds(imgIds=p.imgIds))
             dts = self.cocoDt.loadAnns(self.cocoDt.getAnnIds(imgIds=p.imgIds))
@@ -115,10 +109,7 @@ class COCOevalCustom(COCOeval):
 
         #### BEGIN MODIFICATION ####
         for dt in dts:
-            if (
-                self.dt_only_positive
-                and dt["category_id"] not in _gts_cat_ids[dt["image_id"]]
-            ):
+            if self.dt_only_positive and dt["category_id"] not in _gts_cat_ids[dt["image_id"]]:
                 continue
             self._dts[dt["image_id"], dt["category_id"]].append(dt)
         #### END MODIFICATION ####
@@ -152,9 +143,7 @@ class CocoEvaluatorOfflineWithPredFileEvaluators:
 
         # Run the evaluation
         logging.info("Coco evaluator: Running evaluation")
-        coco_eval = COCOevalCustom(
-            self.gt, cocoDt, iouType=self.iou_type, dt_only_positive=self.positive_split
-        )
+        coco_eval = COCOevalCustom(self.gt, cocoDt, iouType=self.iou_type, dt_only_positive=self.positive_split)
         coco_eval.evaluate()
         coco_eval.accumulate()
         coco_eval.summarize()
@@ -170,9 +159,7 @@ class CocoEvaluatorOfflineWithPredFileEvaluators:
 
             # Run TIDE
             logging.info("Coco evaluator: Running TIDE")
-            self.tide.evaluate(
-                self.tide_gt, datasets.COCOResult(str(dumped_file)), name="coco_eval"
-            )
+            self.tide.evaluate(self.tide_gt, datasets.COCOResult(str(dumped_file)), name="coco_eval")
             self.tide.summarize()
             for k, v in self.tide.get_main_errors()["coco_eval"].items():
                 outs[f"coco_eval_{self.iou_type}_TIDE_{k}"] = v

@@ -118,9 +118,7 @@ def convert_ytbvis_to_cocovid_gt(ann_json, save_path=None):
     return VIS
 
 
-def convert_ytbvis_to_cocovid_pred(
-    youtubevis_pred_path: str, converted_dataset_path: str, output_path: str
-) -> None:
+def convert_ytbvis_to_cocovid_pred(youtubevis_pred_path: str, converted_dataset_path: str, output_path: str) -> None:
     """
     Convert YouTubeVIS predictions to COCO format with video_id preservation
 
@@ -139,10 +137,7 @@ def convert_ytbvis_to_cocovid_pred(
         coco_dataset = json.load(f)
 
     # Create (video_id, frame_idx) -> image_id mapping
-    image_id_map = {
-        (img["video_id"], img["frame_index"]): img["id"]
-        for img in coco_dataset["images"]
-    }
+    image_id_map = {(img["video_id"], img["frame_index"]): img["id"] for img in coco_dataset["images"]}
 
     coco_annotations = []
     track_id_counter = 1  # Unique track ID generator
@@ -165,9 +160,7 @@ def convert_ytbvis_to_cocovid_pred(
         if len(areas) == 0:
             areas = [None] * len(bboxes)
 
-        for frame_idx, (bbox, segmentation, area_from_pred) in enumerate(
-            zip(bboxes, segmentations, areas)
-        ):
+        for frame_idx, (bbox, segmentation, area_from_pred) in enumerate(zip(bboxes, segmentations, areas)):
             # Skip frames with missing objects (None or zero bbox)
             if bbox is None or all(x == 0 for x in bbox):
                 continue

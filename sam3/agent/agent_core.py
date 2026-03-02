@@ -45,10 +45,7 @@ def count_images(messages):
             # Iterate through each content item
             for content_item in message["content"]:
                 # Check if content item is a dict with type "image"
-                if (
-                    isinstance(content_item, dict)
-                    and content_item.get("type") == "image"
-                ):
+                if isinstance(content_item, dict) and content_item.get("type") == "image":
                     total += 1
     return total
 
@@ -148,27 +145,21 @@ def agent_inference(
     os.makedirs(error_save_dir, exist_ok=True)
     os.makedirs(debug_save_dir, exist_ok=True)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    MLLM_SYSTEM_PROMPT_PATH = os.path.join(
-        current_dir, "system_prompts/system_prompt.txt"
-    )
+    MLLM_SYSTEM_PROMPT_PATH = os.path.join(current_dir, "system_prompts/system_prompt.txt")
     ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH = os.path.join(
         current_dir, "system_prompts/system_prompt_iterative_checking.txt"
     )
     # init variables
     PATH_TO_LATEST_OUTPUT_JSON = ""
     LATEST_SAM3_TEXT_PROMPT = ""
-    USED_TEXT_PROMPTS = (
-        set()
-    )  # Track all previously used text prompts for segment_phrase
+    USED_TEXT_PROMPTS = set()  # Track all previously used text prompts for segment_phrase
     generation_count = 0  # Counter for number of send_generate_request calls
 
     # debug setup
     debug_folder_path = None
     debug_jsonl_path = None
     if debug:
-        debug_folder_path = os.path.join(
-            debug_save_dir, f"{img_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}"
-        )
+        debug_folder_path = os.path.join(debug_save_dir, f"{img_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}")
         debug_jsonl_path = os.path.join(debug_folder_path, "debug_history.json")
         os.makedirs(debug_folder_path, exist_ok=True)
 
@@ -220,10 +211,7 @@ def agent_inference(
 
         if PATH_TO_LATEST_OUTPUT_JSON == "":
             # The first tool call must be segment_phrase or report_no_mask
-            assert (
-                tool_call["name"] == "segment_phrase"
-                or tool_call["name"] == "report_no_mask"
-            )
+            assert tool_call["name"] == "segment_phrase" or tool_call["name"] == "report_no_mask"
 
         if tool_call["name"] == "segment_phrase":
             print("🔍 Calling segment_phrase tool...")
@@ -232,9 +220,7 @@ def agent_inference(
             # Check if this text_prompt has been used before
             current_text_prompt = tool_call["parameters"]["text_prompt"]
             if current_text_prompt in USED_TEXT_PROMPTS:
-                print(
-                    f"❌ Text prompt '{current_text_prompt}' has been used before. Requesting a different prompt."
-                )
+                print(f"❌ Text prompt '{current_text_prompt}' has been used before. Requesting a different prompt.")
                 duplicate_prompt_message = f"You have previously used '{current_text_prompt}' as your text_prompt to call the segment_phrase tool. You may not use it again. Please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase prompt, while adhering to all the rules stated in the system prompt. You must also never use any of the following text_prompt(s): {str(list(USED_TEXT_PROMPTS))}."
                 messages.append(
                     {
@@ -273,9 +259,7 @@ def agent_inference(
                     messages.append(
                         {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": sam3_output_text_message}
-                            ],
+                            "content": [{"type": "text", "text": sam3_output_text_message}],
                         }
                     )
                 else:
@@ -296,9 +280,7 @@ def agent_inference(
             assert LATEST_SAM3_TEXT_PROMPT != ""
 
             # Make sure that the last message is a image
-            assert messages[-1]["content"][1]["type"] == "image", (
-                "Second content element should be an image"
-            )
+            assert messages[-1]["content"][1]["type"] == "image", "Second content element should be an image"
             messages.pop()  # Remove the last user message
             # Add simplified replacement message
             simplified_message = {
@@ -354,9 +336,7 @@ def agent_inference(
                         ],
                     },
                 ]
-                checking_generated_text = send_generate_request(
-                    iterative_checking_messages
-                )
+                checking_generated_text = send_generate_request(iterative_checking_messages)
 
                 # Process the generated text to determine if the mask should be kept or rejected
                 if checking_generated_text is None:
@@ -364,11 +344,7 @@ def agent_inference(
                         "Generated text is None, which is unexpected. Please check the Qwen server and the input parameters."
                     )
                 print(f"Generated text for mask {i + 1}: {checking_generated_text}")
-                verdict = (
-                    checking_generated_text.split("<verdict>")[-1]
-                    .split("</verdict>")[0]
-                    .strip()
-                )
+                verdict = checking_generated_text.split("<verdict>")[-1].split("</verdict>")[0].strip()
                 if "Accept" in verdict:
                     assert not "Reject" in verdict
                     print(f"Mask {i + 1} accepted, keeping it in the outputs.")
@@ -386,20 +362,14 @@ def agent_inference(
                 "orig_img_h": current_outputs["orig_img_h"],
                 "orig_img_w": current_outputs["orig_img_w"],
                 "pred_boxes": [current_outputs["pred_boxes"][i] for i in masks_to_keep],
-                "pred_scores": [
-                    current_outputs["pred_scores"][i] for i in masks_to_keep
-                ],
+                "pred_scores": [current_outputs["pred_scores"][i] for i in masks_to_keep],
                 "pred_masks": [current_outputs["pred_masks"][i] for i in masks_to_keep],
             }
 
             image_w_check_masks = visualize(updated_outputs)
-            image_w_check_masks_path = os.path.join(
-                sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png"
-            ).replace(
+            image_w_check_masks_path = os.path.join(sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png").replace(
                 ".png",
-                f"_selected_masks_{'-'.join(map(str, [i + 1 for i in masks_to_keep]))}.png".replace(
-                    "/", "_"
-                ),
+                f"_selected_masks_{'-'.join(map(str, [i + 1 for i in masks_to_keep]))}.png".replace("/", "_"),
             )
             image_w_check_masks.save(image_w_check_masks_path)
             # save the updated json outputs and append to message history
@@ -442,9 +412,7 @@ def agent_inference(
                 base_path = base_path.split("masks_")[0] + ".json"
             # Create new filename with current masks; use a clearer suffix when empty
             if len(masks_to_keep) == 0:
-                PATH_TO_LATEST_OUTPUT_JSON = base_path.replace(
-                    ".json", "masks_none.json"
-                )
+                PATH_TO_LATEST_OUTPUT_JSON = base_path.replace(".json", "masks_none.json")
             else:
                 PATH_TO_LATEST_OUTPUT_JSON = base_path.replace(
                     ".json", f"masks_{'_'.join(map(str, masks_to_keep))}.json"
@@ -467,15 +435,9 @@ def agent_inference(
                 "original_image_path": current_outputs["original_image_path"],
                 "orig_img_h": current_outputs["orig_img_h"],
                 "orig_img_w": current_outputs["orig_img_w"],
-                "pred_boxes": [
-                    current_outputs["pred_boxes"][i - 1] for i in masks_to_keep
-                ],
-                "pred_scores": [
-                    current_outputs["pred_scores"][i - 1] for i in masks_to_keep
-                ],
-                "pred_masks": [
-                    current_outputs["pred_masks"][i - 1] for i in masks_to_keep
-                ],
+                "pred_boxes": [current_outputs["pred_boxes"][i - 1] for i in masks_to_keep],
+                "pred_scores": [current_outputs["pred_scores"][i - 1] for i in masks_to_keep],
+                "pred_masks": [current_outputs["pred_masks"][i - 1] for i in masks_to_keep],
             }
 
             rendered_final_output = visualize(final_outputs)
@@ -518,14 +480,8 @@ def agent_inference(
         for message in messages:
             if message["role"] == "assistant" and "content" in message:
                 for content in message["content"]:
-                    if (
-                        isinstance(content, dict)
-                        and content.get("type") == "text"
-                        and "text" in content
-                    ):
-                        content["text"] = (
-                            content["text"].split("</tool>", 1)[0] + "</tool>\n\n"
-                        )
+                    if isinstance(content, dict) and content.get("type") == "text" and "text" in content:
+                        content["text"] = content["text"].split("</tool>", 1)[0] + "</tool>\n\n"
         # Prune the messages history before the next MLLM generation round according to the 3-part rules.
         # This keeps history compact and ensures the model sees only the allowed parts.
         messages = _prune_messages_for_next_round(
@@ -539,17 +495,13 @@ def agent_inference(
         assert count_images(messages) <= 2
         generation_count += 1
         if generation_count > max_generations:
-            raise ValueError(
-                f"Exceeded maximum number of allowed generation requests ({max_generations})"
-            )
+            raise ValueError(f"Exceeded maximum number of allowed generation requests ({max_generations})")
 
         print("\n\n")
         print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
         print("\n\n")
         generated_text = send_generate_request(messages)
-        print(
-            f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
-        )
+        print(f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n")
 
     print("\n\n>>> SAM 3 Agent execution ended.\n\n")
 

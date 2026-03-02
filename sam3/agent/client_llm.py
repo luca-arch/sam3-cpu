@@ -64,19 +64,13 @@ def send_generate_request(
                     image_path = c["image"]
 
                     print("image_path", image_path)
-                    new_image_path = image_path.replace(
-                        "?", "%3F"
-                    )  # Escape ? in the path
+                    new_image_path = image_path.replace("?", "%3F")  # Escape ? in the path
 
                     # Read the image file and convert to base64
                     try:
-                        base64_image, mime_type = get_image_base64_and_mime(
-                            new_image_path
-                        )
+                        base64_image, mime_type = get_image_base64_and_mime(new_image_path)
                         if base64_image is None:
-                            print(
-                                f"Warning: Could not convert image to base64: {new_image_path}"
-                            )
+                            print(f"Warning: Could not convert image to base64: {new_image_path}")
                             continue
 
                         # Create the proper image_url structure with base64 data
@@ -157,28 +151,20 @@ def send_direct_request(
                         new_image_path = image_path.replace("?", "%3F")
 
                         try:
-                            base64_image, mime_type = get_image_base64_and_mime(
-                                new_image_path
-                            )
+                            base64_image, mime_type = get_image_base64_and_mime(new_image_path)
                             if base64_image is None:
-                                print(
-                                    f"Warning: Could not convert image: {new_image_path}"
-                                )
+                                print(f"Warning: Could not convert image: {new_image_path}")
                                 continue
 
                             # vLLM expects image_url format
                             processed_content.append(
                                 {
                                     "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{mime_type};base64,{base64_image}"
-                                    },
+                                    "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
                                 }
                             )
                         except Exception as e:
-                            print(
-                                f"Warning: Error processing image {new_image_path}: {e}"
-                            )
+                            print(f"Warning: Error processing image {new_image_path}: {e}")
                             continue
                     else:
                         processed_content.append(c)

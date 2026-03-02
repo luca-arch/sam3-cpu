@@ -1,15 +1,21 @@
-import time
-import tracemalloc
 import functools
 import json
 import os
-import psutil
+import time
+import tracemalloc
 from datetime import datetime
-from sam3.__globals import PROFILE_OUTPUT_JSON, PROFILE_OUTPUT_TXT
+
+import psutil
+
+# Default output paths – kept in sync with sam3.__globals but defined locally
+# to avoid a circular import (__globals → utils.logger → utils.__init__ → profiler → __globals).
+_PROFILE_OUTPUT_JSON = "profile_results.json"
+_PROFILE_OUTPUT_TXT = "profile_results.txt"
 
 PROFILE_RESULTS = []
 
-def profile(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
+
+def profile(output_json=_PROFILE_OUTPUT_JSON, output_txt=_PROFILE_OUTPUT_TXT):
     """Profile decorator with global enable/disable control via sam3.__globals.ENABLE_PROFILING"""
 
     def decorator(func):
@@ -21,7 +27,7 @@ def profile(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
                 from sam3.__globals import ENABLE_PROFILING
             except ImportError:
                 ENABLE_PROFILING = False
-            
+
             if not ENABLE_PROFILING:
                 # Profiling disabled - just call the function
                 return func(*args, **kwargs)
@@ -45,7 +51,7 @@ def profile(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
                 "timestamp": datetime.now().isoformat(),
                 "execution_time_seconds": round(execution_time, 6),
                 "memory_used_MB": round(memory_used, 6),
-                "total_process_memory_MB": round(end_mem / 10**6, 6)
+                "total_process_memory_MB": round(end_mem / 10**6, 6),
             }
 
             PROFILE_RESULTS.append(profile_data)
@@ -60,14 +66,12 @@ def profile(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
                     for entry in PROFILE_RESULTS:
                         f.write(
                             f"{entry['function_name']} | "
-                        f"Time: {entry['execution_time_seconds']} s | "
-                        f"Memory Used: {entry['memory_used_MB']} MB | "
-                        f"Total Memory: {entry['total_process_memory_MB']} MB\n"
-                    )
+                            f"Time: {entry['execution_time_seconds']} s | "
+                            f"Memory Used: {entry['memory_used_MB']} MB | "
+                            f"Total Memory: {entry['total_process_memory_MB']} MB\n"
+                        )
 
-            print(f"[PROFILED] {func.__name__} | "
-                  f"Time: {execution_time:.6f}s | "
-                  f"Memory Used: {memory_used:.6f} MB")
+            print(f"[PROFILED] {func.__name__} | Time: {execution_time:.6f}s | Memory Used: {memory_used:.6f} MB")
 
             return result
 
@@ -75,7 +79,8 @@ def profile(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
 
     return decorator
 
-def profile_v1(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
+
+def profile_v1(output_json=_PROFILE_OUTPUT_JSON, output_txt=_PROFILE_OUTPUT_TXT):
     """
     Decorator to measure execution time and memory usage.
     Saves results to JSON and TXT.
@@ -92,7 +97,7 @@ def profile_v1(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
                 from sam3.__globals import ENABLE_PROFILING
             except ImportError:
                 ENABLE_PROFILING = False
-            
+
             if not ENABLE_PROFILING:
                 # Profiling disabled - just call the function
                 return func(*args, **kwargs)
@@ -117,7 +122,7 @@ def profile_v1(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
                 "timestamp": datetime.now().isoformat(),
                 "execution_time_seconds": round(execution_time, 6),
                 "memory_current_MB": round(current / 10**6, 6),
-                "memory_peak_MB": round(peak / 10**6, 6)
+                "memory_peak_MB": round(peak / 10**6, 6),
             }
 
             PROFILE_RESULTS.append(profile_data)
@@ -137,12 +142,10 @@ def profile_v1(output_json=PROFILE_OUTPUT_JSON, output_txt=PROFILE_OUTPUT_TXT):
                             f"Execution Time (s): {entry['execution_time_seconds']}\n"
                             f"Current Memory (MB): {entry['memory_current_MB']}\n"
                             f"Peak Memory (MB): {entry['memory_peak_MB']}\n"
-                            f"{'-'*40}\n"
+                            f"{'-' * 40}\n"
                         )
 
-            print(f"[PROFILED] {func.__name__} | "
-                  f"Time: {execution_time:.6f}s | "
-                  f"Peak Memory: {peak / 10**6:.6f} MB")
+            print(f"[PROFILED] {func.__name__} | Time: {execution_time:.6f}s | Peak Memory: {peak / 10**6:.6f} MB")
 
             return result
 

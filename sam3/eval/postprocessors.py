@@ -111,16 +111,12 @@ class PostProcessImage(nn.Module):
             target_sizes_boxes, forced_labels, out_bbox, out_probs
         )
         assert boxes is None or len(boxes) == batch_size
-        out_masks = self._process_masks(
-            target_sizes_masks, pred_masks, consistent=consistent, keep=keep
-        )
+        out_masks = self._process_masks(target_sizes_masks, pred_masks, consistent=consistent, keep=keep)
         del pred_masks
 
         if boxes is None:
             assert out_masks is not None
-            assert not ret_tensordict, (
-                "We don't support returning TensorDict if the output does not contain boxes"
-            )
+            assert not ret_tensordict, "We don't support returning TensorDict if the output does not contain boxes"
             B = len(out_masks)
             boxes = [None] * B
             scores = [None] * B
@@ -143,10 +139,7 @@ class PostProcessImage(nn.Module):
                 results = results.cpu()
         else:
             # Convert a dictonary of lists/tensors to list of dictionaries
-            results = [
-                dict(zip(results.keys(), res_tuple))
-                for res_tuple in zip(*results.values())
-            ]
+            results = [dict(zip(results.keys(), res_tuple)) for res_tuple in zip(*results.values())]
 
         return results
 
@@ -218,9 +211,7 @@ class PostProcessImage(nn.Module):
 
         return out_masks
 
-    def _process_boxes_and_labels(
-        self, target_sizes, forced_labels, out_bbox, out_probs
-    ):
+    def _process_boxes_and_labels(self, target_sizes, forced_labels, out_bbox, out_probs):
         if out_bbox is None:
             return None, None, None, None
         assert len(out_probs) == len(target_sizes)
@@ -254,35 +245,25 @@ class PostProcessImage(nn.Module):
 
         return boxes, scores, labels, keep
 
-    def process_results(
-        self, find_stages, find_metadatas: List[BatchedInferenceMetadata], **kwargs
-    ):
+    def process_results(self, find_stages, find_metadatas: List[BatchedInferenceMetadata], **kwargs):
         if find_stages.loss_stages is not None:
             find_metadatas = [find_metadatas[i] for i in find_stages.loss_stages]
         assert len(find_stages) == len(find_metadatas)
         results = {}
         for outputs, meta in zip(find_stages, find_metadatas):
             img_size_for_boxes = (
-                meta.original_size
-                if self.use_original_sizes_box
-                else torch.ones_like(meta.original_size)
+                meta.original_size if self.use_original_sizes_box else torch.ones_like(meta.original_size)
             )
             img_size_for_masks = (
-                meta.original_size
-                if self.use_original_sizes_mask
-                else torch.ones_like(meta.original_size)
+                meta.original_size if self.use_original_sizes_mask else torch.ones_like(meta.original_size)
             )
             detection_results = self(
                 outputs,
                 img_size_for_boxes,
                 img_size_for_masks,
-                forced_labels=(
-                    meta.original_category_id if self.use_original_ids else None
-                ),
+                forced_labels=(meta.original_category_id if self.use_original_ids else None),
             )
-            ids = (
-                meta.original_image_id if self.use_original_ids else meta.coco_image_id
-            )
+            ids = meta.original_image_id if self.use_original_ids else meta.coco_image_id
             assert len(detection_results) == len(ids)
             for img_id, result in zip(ids, detection_results):
                 if img_id.item() not in results:
@@ -291,35 +272,22 @@ class PostProcessImage(nn.Module):
                     assert set(results[img_id.item()].keys()) == set(result.keys())
                     for k in result.keys():
                         if isinstance(result[k], torch.Tensor):
-                            results[img_id.item()][k] = torch.cat(
-                                [results[img_id.item()][k], result[k]], dim=0
-                            )
+                            results[img_id.item()][k] = torch.cat([results[img_id.item()][k], result[k]], dim=0)
                         elif isinstance(result[k], list):
                             results[img_id.item()][k] += result[k]
                         else:
-                            raise NotImplementedError(
-                                f"Unexpected type {type(result[k])} in result."
-                            )
+                            raise NotImplementedError(f"Unexpected type {type(result[k])} in result.")
         # Prune the results to the max number of detections per image.
         for img_id, result in results.items():
-            if (
-                self.max_dets_per_img > 0
-                and len(result["scores"]) > self.max_dets_per_img
-            ):
-                _, topk_indexes = torch.topk(
-                    result["scores"], self.max_dets_per_img, dim=0
-                )
+            if self.max_dets_per_img > 0 and len(result["scores"]) > self.max_dets_per_img:
+                _, topk_indexes = torch.topk(result["scores"], self.max_dets_per_img, dim=0)
                 if self.to_cpu:
                     topk_indexes = topk_indexes.cpu()
                 for k in result.keys():
                     if isinstance(results[img_id][k], list):
-                        results[img_id][k] = [
-                            results[img_id][k][i] for i in topk_indexes.tolist()
-                        ]
+                        results[img_id][k] = [results[img_id][k][i] for i in topk_indexes.tolist()]
                     else:
-                        results[img_id][k] = results[img_id][k].to(topk_indexes.device)[
-                            topk_indexes
-                        ]
+                        results[img_id][k] = results[img_id][k].to(topk_indexes.device)[topk_indexes]
 
         return results
 
@@ -361,9 +329,7 @@ class PostProcessAPIVideo(PostProcessImage):
         self.to_cpu_for_video = to_cpu
         self.prob_thresh = prob_thresh
 
-    def process_results(
-        self, find_stages, find_metadatas: List[BatchedInferenceMetadata], **kwargs
-    ):
+    def process_results(self, find_stages, find_metadatas: List[BatchedInferenceMetadata], **kwargs):
         """
         Tracking Postprocessor for SAM 3 video model.
         This function takes in the output of the SAM 3 video model and processes it to extract all the tracklet predictions.
@@ -379,9 +345,7 @@ class PostProcessAPIVideo(PostProcessImage):
         try:
             from tensordict import TensorDict
         except ImportError as e:
-            logging.error(
-                "tensordict is not installed, please install by running `pip install tensordict --no-deps`"
-            )
+            logging.error("tensordict is not installed, please install by running `pip install tensordict --no-deps`")
             raise e
         # Notes and assumptions:
         # 1- This postprocessor assumes results only for a single video.
@@ -405,24 +369,18 @@ class PostProcessAPIVideo(PostProcessImage):
         vid_masklets_rle_packed: List[Optional[Dict]] = []
         video_id = -1  # We assume single video postprocessing, this ID should be unique in the datapoint.
 
-        for frame_idx, (frame_outs, meta) in enumerate(
-            zip(find_stages, find_metadatas)
-        ):
+        for frame_idx, (frame_outs, meta) in enumerate(zip(find_stages, find_metadatas)):
             # only store keys we need to extract the results
             frame_outs_td = TensorDict(
                 {k: frame_outs[k] for k in self.EXPECTED_KEYS}
             ).auto_batch_size_()  # Shape is [P,Q,...]
-            meta_td = TensorDict(
-                dataclasses.asdict(meta)
-            ).auto_batch_size_()  # Shape is [P,...]
+            meta_td = TensorDict(dataclasses.asdict(meta)).auto_batch_size_()  # Shape is [P,...]
             unique_vid_id = meta.original_image_id.unique()
             assert unique_vid_id.size(0) == 1
             if video_id == -1:
                 video_id = unique_vid_id.item()
             else:
-                assert video_id == unique_vid_id.item(), (
-                    "We can only postprocess one video per datapoint"
-                )
+                assert video_id == unique_vid_id.item(), "We can only postprocess one video per datapoint"
             # keeping track of which objects appear in the current frame
             obj_ids_per_frame = frame_outs["pred_object_ids"]
             assert obj_ids_per_frame.size(-1) == frame_outs["pred_logits"].size(-2)
@@ -431,9 +389,7 @@ class PostProcessAPIVideo(PostProcessImage):
                 # (remove those predictions during the keep-alive period of a tracking query,
                 # where its "pred_object_ids" is still the tracked object ID rather than -1)
                 pred_probs = frame_outs["pred_logits"].sigmoid().squeeze(-1)
-                obj_ids_per_frame = torch.where(
-                    pred_probs >= self.prob_thresh, obj_ids_per_frame, NO_OBJ_ID
-                )
+                obj_ids_per_frame = torch.where(pred_probs >= self.prob_thresh, obj_ids_per_frame, NO_OBJ_ID)
             tracked_obj_ids_idx = torch.where(obj_ids_per_frame != NO_OBJ_ID)
             # Object id is a tuple of (prompt_idx, obj_id). This is because the model can assign same obj_id for two different prompts.
             tracked_obj_ids = [
@@ -453,9 +409,7 @@ class PostProcessAPIVideo(PostProcessImage):
 
             # Since we have P*Q masks per frame, mask interpolation is the GPU memory bottleneck or time bottleneck in case of cpu processing.
             # Instead, we first extract results only for tracked objects, reducing the number of masks to K = sum_i(tracked_objs_per_ith_prompt), hopefully <<< P*Q
-            tracked_objs_outs_td = frame_outs_td[
-                tracked_obj_ids_idx
-            ]  # [P,Q,...] --> [K,...]
+            tracked_objs_outs_td = frame_outs_td[tracked_obj_ids_idx]  # [P,Q,...] --> [K,...]
             meta_td = meta_td[tracked_obj_ids_idx[PROMPT_AXIS].cpu()]
             if self.always_interpolate_masks_on_gpu:
                 gpu_device = meta_td["original_size"].device
@@ -463,14 +417,8 @@ class PostProcessAPIVideo(PostProcessImage):
                 tracked_objs_outs_td = tracked_objs_outs_td.to(device=gpu_device)
             frame_results_td = self(
                 tracked_objs_outs_td.unsqueeze(1),
-                (
-                    meta_td["original_size"]
-                    if self.use_original_sizes
-                    else torch.ones_like(meta_td["original_size"])
-                ),
-                forced_labels=(
-                    meta_td["original_category_id"] if self.use_original_ids else None
-                ),
+                (meta_td["original_size"] if self.use_original_sizes else torch.ones_like(meta_td["original_size"])),
+                forced_labels=(meta_td["original_category_id"] if self.use_original_ids else None),
                 consistent=True,
                 ret_tensordict=True,
             ).squeeze(1)
@@ -499,9 +447,7 @@ class PostProcessAPIVideo(PostProcessImage):
         # NOTE: here, we also have padded tensors for "scores" and "labels", but we overwrite them later.
         padded_frames_results = TensorDict(
             {
-                k: torch.zeros(
-                    num_preds, num_frames, *v.shape[1:], device=v.device, dtype=v.dtype
-                )
+                k: torch.zeros(num_preds, num_frames, *v.shape[1:], device=v.device, dtype=v.dtype)
                 for k, v in vid_preds_packed.items()
             },
             batch_size=[
@@ -525,9 +471,7 @@ class PostProcessAPIVideo(PostProcessImage):
             padded_frames_results[o_idx][oid2padded_idx] = obj_packed_results
             if self.convert_mask_to_rle_for_video:
                 for packed_idx, padded_idx in zip(oid2packed_idx, oid2padded_idx):
-                    vid_masklets_rle_padded[o_idx][padded_idx] = (
-                        vid_masklets_rle_packed[packed_idx]
-                    )
+                    vid_masklets_rle_padded[o_idx][padded_idx] = vid_masklets_rle_packed[packed_idx]
             # NOTE: We need a single confidence score per tracklet for the mAP metric.
             # We use the average confidence score across time. (How does this impact AP?)
             tracklet_scores.append(obj_packed_results["scores"].mean())
@@ -559,9 +503,7 @@ class PostProcessTracking(PostProcessImage):
         super().__init__(max_dets_per_img=max_dets_per_img, iou_type=iou_type, **kwargs)
         self.force_single_mask = force_single_mask
 
-    def process_results(
-        self, find_stages, find_metadatas: BatchedInferenceMetadata, **kwargs
-    ):
+    def process_results(self, find_stages, find_metadatas: BatchedInferenceMetadata, **kwargs):
         assert len(find_stages) == len(find_metadatas)
         results = {}
         for outputs, meta in zip(find_stages, find_metadatas):
@@ -632,9 +574,7 @@ class PostProcessCounting(nn.Module):
         return results
 
     @torch.no_grad()
-    def process_results(
-        self, find_stages, find_metadatas: List[BatchedInferenceMetadata], **kwargs
-    ):
+    def process_results(self, find_stages, find_metadatas: List[BatchedInferenceMetadata], **kwargs):
         assert len(find_stages) == len(find_metadatas)
         results = {}
         for outputs, meta in zip(find_stages, find_metadatas):
@@ -642,9 +582,7 @@ class PostProcessCounting(nn.Module):
                 outputs,
                 meta.original_size,
             )
-            ids = (
-                meta.original_image_id if self.use_original_ids else meta.coco_image_id
-            )
+            ids = meta.original_image_id if self.use_original_ids else meta.coco_image_id
             assert len(detection_results) == len(ids)
             for img_id, result in zip(ids, detection_results):
                 results[img_id.item()] = result

@@ -2,14 +2,13 @@
 
 # pyre-unsafe
 
-import os
-from typing import Optional
 
 # import pkg_resources
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from iopath.common.file_io import g_pathmgr
+
 from sam3.model.decoder import (
     TransformerDecoder,
     TransformerDecoderLayer,
@@ -26,10 +25,12 @@ from sam3.model.memory import (
     SimpleMaskEncoder,
 )
 from sam3.model.model_misc import (
-    DotProductScoring,
     MLP,
-    MultiheadAttentionWrapper as MultiheadAttention,
+    DotProductScoring,
     TransformerWrapper,
+)
+from sam3.model.model_misc import (
+    MultiheadAttentionWrapper as MultiheadAttention,
 )
 from sam3.model.necks import Sam3DualViTDetNeck
 from sam3.model.position_encoding import PositionEmbeddingSine
@@ -50,6 +51,7 @@ from sam3.sam.transformer import RoPEAttention
 def _get_device():
     """Get the appropriate device (cuda if available, otherwise cpu)."""
     return "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def _setup_tf32() -> None:
     """Enable TensorFloat-32 for Ampere GPUs if available."""
@@ -247,7 +249,7 @@ def _create_geometry_encoder():
     # Create position encoding for geometry encoder
     geo_pos_enc = _create_position_encoding()
     # Create CX block for fuser
-    cx_block = CXBlock(
+    CXBlock(
         dim=256,
         kernel_size=7,
         padding=3,
@@ -352,9 +354,7 @@ def _create_tracker_maskmem_backbone():
     )
 
     # Mask processing components
-    mask_downsampler = SimpleMaskDownSampler(
-        kernel_size=3, stride=2, padding=1, interpol_size=[1152, 1152]
-    )
+    mask_downsampler = SimpleMaskDownSampler(kernel_size=3, stride=2, padding=1, interpol_size=[1152, 1152])
 
     cx_block_layer = CXBlock(
         dim=256,
@@ -508,9 +508,7 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
     )
 
 
-def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True, device=None
-) -> Sam3DualViTDetNeck:
+def _create_vision_backbone(compile_mode=None, enable_inst_interactivity=True, device=None) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     if device is None:
         device = _get_device()
@@ -541,23 +539,14 @@ def _load_checkpoint(model, checkpoint_path):
         ckpt = torch.load(f, map_location="cpu", weights_only=True)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
-    sam3_image_ckpt = {
-        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
-    }
+    sam3_image_ckpt = {k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k}
     if model.inst_interactive_predictor is not None:
         sam3_image_ckpt.update(
-            {
-                k.replace("tracker.", "inst_interactive_predictor.model."): v
-                for k, v in ckpt.items()
-                if "tracker" in k
-            }
+            {k.replace("tracker.", "inst_interactive_predictor.model."): v for k, v in ckpt.items() if "tracker" in k}
         )
     missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
     if len(missing_keys) > 0:
-        print(
-            f"loaded {checkpoint_path} and found "
-            f"missing and/or unexpected keys:\n{missing_keys=}"
-        )
+        print(f"loaded {checkpoint_path} and found missing and/or unexpected keys:\n{missing_keys=}")
 
 
 def _setup_device_and_mode(model, device, eval_mode):
@@ -624,11 +613,7 @@ def build_sam3_image_model(
     dot_prod_scoring = _create_dot_product_scoring()
 
     # Create segmentation head if enabled
-    segmentation_head = (
-        _create_segmentation_head(compile_mode=compile_mode)
-        if enable_segmentation
-        else None
-    )
+    segmentation_head = _create_segmentation_head(compile_mode=compile_mode) if enable_segmentation else None
 
     # Create geometry encoder
     input_geometry_encoder = _create_geometry_encoder()
@@ -669,9 +654,9 @@ def download_ckpt_from_hf():
 
 
 def build_sam3_video_model(
-    checkpoint_path: Optional[str] = None,
+    checkpoint_path: str | None = None,
     load_from_HF=True,
-    bpe_path: Optional[str] = None,
+    bpe_path: str | None = None,
     has_presence_token: bool = True,
     geo_encoder_use_img_cross_attn: bool = True,
     strict_state_dict_loading: bool = True,
@@ -692,7 +677,7 @@ def build_sam3_video_model(
     """
     if device is None:
         device = _get_device()
-    
+
     # if bpe_path is None:
     #     bpe_path = pkg_resources.resource_filename(
     #         "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
@@ -719,9 +704,7 @@ def build_sam3_video_model(
         residual=True,
         out_norm=nn.LayerNorm(256),
     )
-    main_dot_prod_scoring = DotProductScoring(
-        d_model=256, d_proj=256, prompt_mlp=main_dot_prod_mlp
-    )
+    main_dot_prod_scoring = DotProductScoring(d_model=256, d_proj=256, prompt_mlp=main_dot_prod_mlp)
 
     # Build Detector module
     detector = Sam3ImageOnVideoMultiGPU(
@@ -801,9 +784,7 @@ def build_sam3_video_model(
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
 
-        missing_keys, unexpected_keys = model.load_state_dict(
-            ckpt, strict=strict_state_dict_loading
-        )
+        missing_keys, unexpected_keys = model.load_state_dict(ckpt, strict=strict_state_dict_loading)
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
         if unexpected_keys:
@@ -817,11 +798,8 @@ def build_sam3_video_model(
 
 
 def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
-    return Sam3VideoPredictorMultiGPU(
-        *model_args, gpus_to_use=gpus_to_use, **model_kwargs
-    )
+    return Sam3VideoPredictorMultiGPU(*model_args, gpus_to_use=gpus_to_use, **model_kwargs)
 
-def build_sam3_video_predictor_cpu(*model_args, num_workers=None, **model_kwargs): 
-    return Sam3VideoPredictorMultiCPU( 
-        *model_args, num_workers=num_workers, **model_kwargs 
-    )
+
+def build_sam3_video_predictor_cpu(*model_args, num_workers=None, **model_kwargs):
+    return Sam3VideoPredictorMultiCPU(*model_args, num_workers=num_workers, **model_kwargs)

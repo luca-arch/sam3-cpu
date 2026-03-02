@@ -167,13 +167,9 @@ def normalize_bbox(bbox_xywh, img_w, img_h):
         normalized_bbox[2] /= img_w
         normalized_bbox[3] /= img_h
     else:
-        assert isinstance(bbox_xywh, torch.Tensor), (
-            "Only torch tensors are supported for batching."
-        )
+        assert isinstance(bbox_xywh, torch.Tensor), "Only torch tensors are supported for batching."
         normalized_bbox = bbox_xywh.clone()
-        assert normalized_bbox.size(-1) == 4, (
-            "bbox_xywh tensor must have last dimension of size 4."
-        )
+        assert normalized_bbox.size(-1) == 4, "bbox_xywh tensor must have last dimension of size 4."
         normalized_bbox[..., 0] /= img_w
         normalized_bbox[..., 1] /= img_h
         normalized_bbox[..., 2] /= img_w
@@ -235,9 +231,7 @@ def visualize_formatted_frame_output(
     if isinstance(outputs_list, dict) and frame_idx in outputs_list:
         # This is a single outputs dict with frame indices as keys
         outputs_list = [outputs_list]
-    elif isinstance(outputs_list, dict) and not any(
-        isinstance(k, int) for k in outputs_list.keys()
-    ):
+    elif isinstance(outputs_list, dict) and not any(isinstance(k, int) for k in outputs_list.keys()):
         # This is a single frame's outputs {obj_id: mask}
         single_frame_outputs = {frame_idx: outputs_list}
         outputs_list = [single_frame_outputs]
@@ -245,9 +239,7 @@ def visualize_formatted_frame_output(
     num_outputs = len(outputs_list)
     if titles is None:
         titles = [f"Set {i + 1}" for i in range(num_outputs)]
-    assert len(titles) == num_outputs, (
-        "length of `titles` should match that of `outputs_list` if not None."
-    )
+    assert len(titles) == num_outputs, "length of `titles` should match that of `outputs_list` if not None."
 
     _, axes = plt.subplots(1, num_outputs, figsize=figsize)
     if num_outputs == 1:
@@ -322,11 +314,7 @@ def visualize_formatted_frame_output(
 
         objects_drawn = 0
         for obj_id, binary_mask in _outputs.items():
-            mask_sum = (
-                binary_mask.sum()
-                if hasattr(binary_mask, "sum")
-                else np.sum(binary_mask)
-            )
+            mask_sum = binary_mask.sum() if hasattr(binary_mask, "sum") else np.sum(binary_mask)
 
             if mask_sum > 0:  # Only draw if mask has content
                 # Convert to torch tensor if it's not already
@@ -354,11 +342,7 @@ def visualize_formatted_frame_output(
                 )
 
                 # Convert back to numpy for plotting
-                mask_np = (
-                    binary_mask.numpy()
-                    if isinstance(binary_mask, torch.Tensor)
-                    else binary_mask
-                )
+                mask_np = binary_mask.numpy() if isinstance(binary_mask, torch.Tensor) else binary_mask
                 plot_mask(mask_np, color=color, ax=ax)
                 objects_drawn += 1
 
@@ -377,9 +361,7 @@ def visualize_formatted_frame_output(
 
         # Draw additional points if provided
         if points_list is not None and points_list[idx] is not None:
-            show_points(
-                points_list[idx], points_labels_list[idx], ax=ax, marker_size=200
-            )
+            show_points(points_list[idx], points_labels_list[idx], ax=ax, marker_size=200)
 
         ax.axis("off")
 
@@ -417,9 +399,9 @@ def render_masklet_frame(img, outputs, frame_idx=None, alpha=0.5):
             )
         mask_bool = mask > 0.5
         for c in range(3):
-            overlay[..., c][mask_bool] = (
-                alpha * color255[c] + (1 - alpha) * overlay[..., c][mask_bool]
-            ).astype(np.uint8)
+            overlay[..., c][mask_bool] = (alpha * color255[c] + (1 - alpha) * overlay[..., c][mask_bool]).astype(
+                np.uint8
+            )
 
     # Draw bounding boxes and text
     for i in range(len(outputs["out_probs"])):
@@ -478,16 +460,11 @@ def save_masklet_video(video_frames, outputs, out_path, alpha=0.5, fps=10):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter("temp.mp4", fourcc, fps, (width, height))
 
-    outputs_list = [
-        (video_frames[frame_idx], frame_idx, outputs[frame_idx])
-        for frame_idx in sorted(outputs.keys())
-    ]
+    outputs_list = [(video_frames[frame_idx], frame_idx, outputs[frame_idx]) for frame_idx in sorted(outputs.keys())]
 
     for frame, frame_idx, frame_outputs in tqdm(outputs_list):
         img = load_frame(frame)
-        overlay = render_masklet_frame(
-            img, frame_outputs, frame_idx=frame_idx, alpha=alpha
-        )
+        overlay = render_masklet_frame(img, frame_outputs, frame_idx=frame_idx, alpha=alpha)
         writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
     writer.release()
@@ -520,9 +497,7 @@ def prepare_masks_for_visualization(frame_to_output):
     return frame_to_output
 
 
-def convert_coco_to_masklet_format(
-    annotations, img_info, is_prediction=False, score_threshold=0.5
-):
+def convert_coco_to_masklet_format(annotations, img_info, is_prediction=False, score_threshold=0.5):
     """
     Convert COCO format annotations to format expected by render_masklet_frame
     """
@@ -621,9 +596,7 @@ def pascal_color_map():
     return colormap.astype(np.uint8)
 
 
-def draw_masks_to_frame(
-    frame: np.ndarray, masks: np.ndarray, colors: np.ndarray
-) -> np.ndarray:
+def draw_masks_to_frame(frame: np.ndarray, masks: np.ndarray, colors: np.ndarray) -> np.ndarray:
     masked_frame = frame
     for mask, color in zip(masks, colors):
         curr_masked_frame = np.where(mask[..., None], color, masked_frame)
@@ -642,20 +615,14 @@ def draw_masks_to_frame(
                 cv2.CHAIN_APPROX_NONE,
             )
 
-        cv2.drawContours(
-            masked_frame, contours, -1, (255, 255, 255), 7
-        )  # White outer contour
-        cv2.drawContours(
-            masked_frame, contours, -1, (0, 0, 0), 5
-        )  # Black middle contour
-        cv2.drawContours(
-            masked_frame, contours, -1, color.tolist(), 3
-        )  # Original color inner contour
+        cv2.drawContours(masked_frame, contours, -1, (255, 255, 255), 7)  # White outer contour
+        cv2.drawContours(masked_frame, contours, -1, (0, 0, 0), 5)  # Black middle contour
+        cv2.drawContours(masked_frame, contours, -1, color.tolist(), 3)  # Original color inner contour
     return masked_frame
 
 
 def get_annot_df(file_path: str):
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         data = json.load(f)
 
     dfs = {}
@@ -692,9 +659,7 @@ def get_media_dir(media_dir: str, dataset: str):
         raise ValueError(f"Dataset {dataset} not found")
 
 
-def get_all_annotations_for_frame(
-    dataset_df: pd.DataFrame, video_id: int, frame_idx: int, data_dir: str, dataset: str
-):
+def get_all_annotations_for_frame(dataset_df: pd.DataFrame, video_id: int, frame_idx: int, data_dir: str, dataset: str):
     media_dir = os.path.join(data_dir, "media")
 
     # Load the annotation and video data
@@ -703,14 +668,10 @@ def get_all_annotations_for_frame(
 
     # Get the frame
     video_df_current = video_df[video_df.id == video_id]
-    assert len(video_df_current) == 1, (
-        f"Expected 1 video row, got {len(video_df_current)}"
-    )
+    assert len(video_df_current) == 1, f"Expected 1 video row, got {len(video_df_current)}"
     video_row = video_df_current.iloc[0]
     file_name = video_row.file_names[frame_idx]
-    file_path = os.path.join(
-        get_media_dir(media_dir=media_dir, dataset=dataset), file_name
-    )
+    file_path = os.path.join(get_media_dir(media_dir=media_dir, dataset=dataset), file_name)
     frame = cv2.imread(file_path)
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -723,11 +684,7 @@ def get_all_annotations_for_frame(
         empty_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         mask_np_pairs = annot_df_current_video.apply(
             lambda row: (
-                (
-                    mask_utils.decode(row.segmentations[frame_idx])
-                    if row.segmentations[frame_idx]
-                    else empty_mask
-                ),
+                (mask_utils.decode(row.segmentations[frame_idx]) if row.segmentations[frame_idx] else empty_mask),
                 row.noun_phrase,
             ),
             axis=1,
@@ -903,9 +860,7 @@ def show_mask(mask, ax, obj_id=None, random_color=False):
 def show_box(box, ax):
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(
-        plt.Rectangle((x0, y0), w, h, edgecolor="green", facecolor=(0, 0, 0, 0), lw=2)
-    )
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor="green", facecolor=(0, 0, 0, 0), lw=2))
 
 
 def show_points(coords, labels, ax, marker_size=375):

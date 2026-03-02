@@ -83,9 +83,7 @@ class PredictionDumper:
         self.merge_predictions = merge_predictions
         self.pred_file_evaluators = pred_file_evaluators
         if self.pred_file_evaluators is not None:
-            assert merge_predictions, (
-                "merge_predictions must be True if pred_file_evaluators are provided"
-            )
+            assert merge_predictions, "merge_predictions must be True if pred_file_evaluators are provided"
         assert self.dump_dir is not None, "dump_dir must be provided"
 
         if is_main_process():
@@ -131,22 +129,15 @@ class PredictionDumper:
         logging.info("Prediction Dumper: Synchronizing between processes")
 
         if not self.merge_predictions:
-            dumped_file = (
-                Path(self.dump_dir)
-                / f"coco_predictions_{self.iou_type}_{get_rank()}.json"
-            )
-            logging.info(
-                f"Prediction Dumper: Dumping local predictions to {dumped_file}"
-            )
+            dumped_file = Path(self.dump_dir) / f"coco_predictions_{self.iou_type}_{get_rank()}.json"
+            logging.info(f"Prediction Dumper: Dumping local predictions to {dumped_file}")
             with g_pathmgr.open(str(dumped_file), "w") as f:
                 json.dump(self.dump, f)
         else:
             self.dump = self.gather_and_merge_predictions()
             dumped_file = Path(self.dump_dir) / f"coco_predictions_{self.iou_type}.json"
             if is_main_process():
-                logging.info(
-                    f"Prediction Dumper: Dumping merged predictions to {dumped_file}"
-                )
+                logging.info(f"Prediction Dumper: Dumping merged predictions to {dumped_file}")
                 with g_pathmgr.open(str(dumped_file), "w") as f:
                     json.dump(self.dump, f)
 
@@ -196,9 +187,7 @@ class PredictionDumper:
             seen_img_cat.update(cur_seen_img_cat)
 
         # Flatten the heap elements back to a list
-        merged_dump = sum(
-            [[h.val for h in cur_preds] for cur_preds in preds_by_image.values()], []
-        )
+        merged_dump = sum([[h.val for h in cur_preds] for cur_preds in preds_by_image.values()], [])
 
         return merged_dump
 

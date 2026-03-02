@@ -41,12 +41,8 @@ class YTVISevalMixin:
         """
         p = self.params
         if p.useCats:
-            gts = self.cocoGt.loadAnns(
-                self.cocoGt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds)
-            )
-            dts = self.cocoDt.loadAnns(
-                self.cocoDt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds)
-            )
+            gts = self.cocoGt.loadAnns(self.cocoGt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds))
+            dts = self.cocoDt.loadAnns(self.cocoDt.getAnnIds(imgIds=p.imgIds, catIds=p.catIds))
         else:
             gts = self.cocoGt.loadAnns(self.cocoGt.getAnnIds(imgIds=p.imgIds))
             dts = self.cocoDt.loadAnns(self.cocoDt.getAnnIds(imgIds=p.imgIds))
@@ -109,9 +105,7 @@ class YTVISevalMixin:
             )  # Num preds x Num GTS x Num frames
             inter = inter.sum(-1)
             union = union.sum(-1)
-            assert (union > 0).all(), (
-                "There exists a tracklet with zero GTs across time. This is suspicious"
-            )
+            assert (union > 0).all(), "There exists a tracklet with zero GTs across time. This is suspicious"
             return inter / union
 
         def iou_masklets(preds, gts):
@@ -120,12 +114,8 @@ class YTVISevalMixin:
             for p_i, gt_i in zip(preds, gts):
                 if p_i and gt_i:
                     # Compute areas of intersection and union
-                    inter += mask_util.area(
-                        mask_util.merge([p_i, gt_i], intersect=True)
-                    )
-                    union += mask_util.area(
-                        mask_util.merge([p_i, gt_i], intersect=False)
-                    )
+                    inter += mask_util.area(mask_util.merge([p_i, gt_i], intersect=True))
+                    union += mask_util.area(mask_util.merge([p_i, gt_i], intersect=False))
                 elif gt_i:
                     union += mask_util.area(gt_i)
                 elif p_i:
@@ -134,9 +124,7 @@ class YTVISevalMixin:
                 iou = inter / union
                 assert iou >= 0 and iou <= 1, "Encountered an error in IoU computation"
             else:
-                assert np.isclose(inter, 0) and np.isclose(union, 0), (
-                    "Encountered an error in IoU computation"
-                )
+                assert np.isclose(inter, 0) and np.isclose(union, 0), "Encountered an error in IoU computation"
                 iou = 1
             return iou
 
@@ -221,9 +209,7 @@ class YTVISResultsWriter:
             labels = prediction["labels"].tolist()
             if "masks" in prediction:
                 masks = prediction["masks"].squeeze(2)
-                assert masks.ndim == 4, (
-                    "Expected masks to be of shape(N_preds,T_frames,H,W)"
-                )
+                assert masks.ndim == 4, "Expected masks to be of shape(N_preds,T_frames,H,W)"
 
                 areas = [mask.flatten(1).sum(1).tolist() for mask in masks]
                 rles = [rle_encode(masklet) for masklet in masks]
@@ -233,14 +219,9 @@ class YTVISResultsWriter:
                 del prediction["masks"]
             elif "masks_rle" in prediction:
                 rles = prediction.pop("masks_rle")
-                areas = [
-                    [0 if rle is None else rle.pop("area") for rle in rles_per_obj]
-                    for rles_per_obj in rles
-                ]
+                areas = [[0 if rle is None else rle.pop("area") for rle in rles_per_obj] for rles_per_obj in rles]
             else:
-                raise ValueError(
-                    "Expected either `masks` or `masks_rle` key in the predictions."
-                )
+                raise ValueError("Expected either `masks` or `masks_rle` key in the predictions.")
 
             new_results = [
                 {
@@ -396,9 +377,7 @@ class YTVISResultsWriter:
             }
             with g_pathmgr.open(self.eval_metrics_file, "w") as f:
                 json.dump(eval_metrics, f)
-            logging.info(
-                f"YTVIS evaluator: Dumped evaluation metrics to {self.eval_metrics_file}"
-            )
+            logging.info(f"YTVIS evaluator: Dumped evaluation metrics to {self.eval_metrics_file}")
 
         if len(meters) == 0:
             meters = {"": 0.0}
