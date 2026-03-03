@@ -499,6 +499,13 @@ Examples:
         choices=["cpu", "cuda"],
         help="Force device (auto-detected if omitted)",
     )
+    parser.add_argument(
+        "--cpu-utilisation",
+        type=int,
+        default=100,
+        metavar="PCT",
+        help="Percentage of logical CPU cores to use (50-100, default: 100)",
+    )
 
     args = parser.parse_args()
 
@@ -548,6 +555,8 @@ Examples:
     if boxes:
         print(f"  Boxes   : {boxes}")
     print(f"  Device  : {device}")
+    if device == "cpu":
+        print(f"  CPU util: {args.cpu_utilisation}%")
     print(f"  Output  : {args.output}")
     print(f"  Alpha   : {args.alpha}")
     print("=" * 70)
@@ -596,7 +605,7 @@ Examples:
             t_model_start = time.time()
             from sam3.drivers import Sam3ImageDriver
 
-            driver = Sam3ImageDriver(device=device)
+            driver = Sam3ImageDriver(device=device, cpu_utilisation=args.cpu_utilisation)
             model_load_s = round(time.time() - t_model_start, 3)
             print(f"  Model loaded in {model_load_s:.1f}s.\n")
 

@@ -18,6 +18,7 @@ from PIL import Image
 
 from sam3.__globals import CHUNK_MASK_MATCHING_IOU_THRESHOLD, DEFAULT_MIN_CHUNK_OVERLAP
 from sam3.utils.logger import get_logger
+from sam3.utils.profiler import profile
 
 logger = get_logger(__name__)
 
@@ -112,6 +113,7 @@ class VideoPostProcessor:
         logger.debug(f"    Inferred overlap from chunk boundaries: {overlap} frames")
         return overlap
 
+    @profile()
     def process(self, prompts: list[str]):
         """
         Main post-processing workflow.
@@ -193,6 +195,7 @@ class VideoPostProcessor:
 
         logger.debug(f"      Saved combined mapping metadata to {metadata_path}")
 
+    @profile()
     def _build_id_mappings(self, prompt: str) -> tuple[dict, dict]:
         """
         Build ID mappings across all chunks for a prompt.
@@ -680,6 +683,7 @@ class VideoPostProcessor:
 
         return overlap_masks
 
+    @profile()
     def _stitch_masks_for_prompt(self, prompt: str, prompt_mappings: dict):
         """
         Stitch masks for a single prompt by following mapping chains.

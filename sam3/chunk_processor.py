@@ -18,6 +18,7 @@ from PIL import Image
 from sam3.__globals import DEFAULT_PROPAGATION_DIRECTION
 from sam3.utils.helpers import sanitize_filename
 from sam3.utils.logger import get_logger
+from sam3.utils.profiler import profile
 
 logger = get_logger(__name__)
 
@@ -86,6 +87,7 @@ class ChunkProcessor:
 
         logger.debug(f"ChunkProcessor initialized for chunk {chunk_id} with shared driver")
 
+    @profile()
     def process_with_prompts(
         self,
         prompts: list[str],
@@ -273,6 +275,7 @@ class ChunkProcessor:
             remapped[frame_idx] = remapped_output
         return remapped
 
+    @profile()
     def _process_single_prompt(
         self, session_id: int, prompt: str, propagation_direction: str, prev_chunk_data: dict[str, Any] | None = None
     ) -> dict[str, Any]:

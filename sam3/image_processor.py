@@ -17,6 +17,7 @@ from sam3.__globals import BPE_PATH, DEFAULT_NUM_WORKERS
 from sam3.drivers import Sam3ImageDriver
 from sam3.utils.helpers import sanitize_filename
 from sam3.utils.logger import get_logger
+from sam3.utils.profiler import profile
 
 logger = get_logger(__name__)
 
@@ -65,6 +66,7 @@ class ImageProcessor:
             logger.debug("Sam3ImageDriver initialized")
         return self._driver
 
+    @profile()
     def process_with_prompts(self, image_paths: list[Path], prompts: list[str]) -> dict[str, Any]:
         """
         Process images with text prompts.
@@ -115,6 +117,7 @@ class ImageProcessor:
 
         return results
 
+    @profile()
     def _process_single_image_with_prompts(self, image_path: Path, prompts: list[str]) -> dict[str, Any]:
         """
         Process a single image with all prompts sequentially.
@@ -203,6 +206,7 @@ class ImageProcessor:
             "output_dir": str(image_output_dir),
         }
 
+    @profile()
     def _process_single_prompt(
         self,
         processor,
@@ -332,6 +336,7 @@ class ImageProcessor:
 
             logger.debug(f"      Saved mask for object {obj_id} to {mask_path}")
 
+    @profile()
     def process_with_boxes(self, image_path: Path, boxes: list[list[float]], box_labels: list[int]) -> dict[str, Any]:
         """
         Process an image with bounding box prompts.

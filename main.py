@@ -68,6 +68,15 @@ Examples:
         help='Keep temporary chunk files for debugging (default: False)'
     )
     
+    # CPU utilisation
+    parser.add_argument(
+        '--cpu-utilisation',
+        type=int,
+        default=100,
+        metavar='PCT',
+        help='Percentage of logical CPU cores to use (50-100, default: 100)'
+    )
+    
     # Parse arguments
     args = parser.parse_args()
     

@@ -18,6 +18,7 @@ from sam3.memory_optimizer import (
 )
 from sam3.utils.ffmpeglib import ffmpeg_lib
 from sam3.utils.helpers import ram_stat, vram_stat
+from sam3.utils.profiler import profile
 
 
 class MemoryError(Exception):
@@ -38,6 +39,7 @@ class MemoryManager:
     def __init__(self):
         pass
 
+    @profile()
     def compute_memory_safe_frames(
         self,
         width: int,
@@ -150,6 +152,7 @@ class MemoryManager:
 
         return chunks
 
+    @profile()
     def chunk_plan_video(
         self,
         video_file: str,

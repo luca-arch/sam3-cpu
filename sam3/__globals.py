@@ -52,7 +52,8 @@ RAM_USAGE_PERCENT = 0.975  # Use 97.5% of available RAM for CPU video chunking (
 VRAM_USAGE_PERCENT = 0.975  # Use 97.5% of available VRAM for initial GPU chunk planning
 # (the IntraChunkMonitor enforces tighter per-frame
 # limits during actual propagation — see below)
-CPU_CORES_PERCENT = 0.90  # Use 90% of CPU cores for parallel processing (leave some for OS and other tasks)
+CPU_CORES_PERCENT = 0.90  # Legacy — kept for reference; the --cpu-utilisation CLI flag now controls thread count
+DEFAULT_CPU_UTILISATION = 100  # Default CPU utilisation percentage (50-100%). 100% = use all logical cores.
 
 MEMORY_SAFETY_MULTIPLIER = 1.5  # Require 1.5x estimated memory for safety (reduced from 3x)
 CPU_MEMORY_RESERVE_PERCENT = 0.3  # Reserve 30% for OS

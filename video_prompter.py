@@ -1022,6 +1022,7 @@ def _process_video(
     time_range: tuple[str, str] | None = None,
     max_vram_gb: float | None = None,
     max_ram_gb: float | None = None,
+    cpu_utilisation: int = 100,
 ):
     """Full video processing pipeline with adaptive dynamic chunking."""
     from datetime import datetime
@@ -1160,7 +1161,7 @@ def _process_video(
     t_model_start = time.time()
     from sam3.drivers import Sam3VideoDriver
 
-    driver = Sam3VideoDriver(device=device)
+    driver = Sam3VideoDriver(device=device, cpu_utilisation=cpu_utilisation)
     model_load_s = round(time.time() - t_model_start, 3)
     print(f"Model loaded in {model_load_s:.1f}s.\n")
     mem_predictor.record_frame(0)  # baseline after model load
@@ -2363,6 +2364,13 @@ Examples:
         default=None,
         help="Simulate a smaller system by capping RAM (GB). For testing adaptive chunking.",
     )
+    parser.add_argument(
+        "--cpu-utilisation",
+        type=int,
+        default=100,
+        metavar="PCT",
+        help="Percentage of logical CPU cores to use (50-100, default: 100)",
+    )
 
     args = parser.parse_args()
 
@@ -2429,6 +2437,8 @@ Examples:
     if args.time_range:
         print(f"  Time    : {args.time_range[0]} → {args.time_range[1]}")
     print(f"  Device  : {device}")
+    if device == "cpu":
+        print(f"  CPU util: {args.cpu_utilisation}%")
     print(f"  Output  : {args.output}")
     print(f"  Alpha   : {args.alpha}")
     print(f"  Chunking: {args.chunk_spread}")
@@ -2454,6 +2464,7 @@ Examples:
         time_range=tuple(args.time_range) if args.time_range else None,
         max_vram_gb=args.max_vram_gb,
         max_ram_gb=args.max_ram_gb,
+        cpu_utilisation=args.cpu_utilisation,
     )
 
 

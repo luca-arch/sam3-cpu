@@ -9,6 +9,8 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from iopath.common.file_io import g_pathmgr
 
+from sam3.utils.profiler import profile
+
 from sam3.model.decoder import (
     TransformerDecoder,
     TransformerDecoderLayer,
@@ -653,6 +655,7 @@ def download_ckpt_from_hf():
     return checkpoint_path
 
 
+@profile()
 def build_sam3_video_model(
     checkpoint_path: str | None = None,
     load_from_HF=True,

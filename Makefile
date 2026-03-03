@@ -53,6 +53,7 @@ help: ## Show this help message
 	@echo ""
 	@echo "$(GREEN)Variables:$(NC)"
 	@echo "  VIDEO_RES=$(VIDEO_RES)  (set resolution: 480p, 720p, 1080p)"
+	@echo "  CPU_UTIL=100           (CPU utilisation 50-100%%, default 100)"
 	@echo ""
 	@echo "$(GREEN)Examples:$(NC)"
 	@echo "  make run-all VIDEO_RES=720p      # Run all examples with 720p video"
@@ -62,6 +63,7 @@ help: ## Show this help message
 	@echo "  make test ARGS='-v'              # Run tests with verbose output"
 	@echo "  make image-prompter IMAGES='img.jpg' PROMPTS='person car'"
 	@echo "  make video-prompter VIDEO='clip.mp4' PROMPTS='player'"
+	@echo "  make video-prompter VIDEO='clip.mp4' PROMPTS='player' CPU_UTIL=75""
 
 setup: ## Run setup script to install uv and dependencies
 	@if [ ! -f setup.sh ]; then \
@@ -268,11 +270,12 @@ image-prompter: check-uv ## Run image_prompter.py (IMAGES, PROMPTS, POINTS, BBOX
 	if [ -n "$(BBOX)" ]; then CMD="$$CMD --bbox $(BBOX)"; fi; \
 	if [ -n "$(ALPHA)" ]; then CMD="$$CMD --alpha $(ALPHA)"; fi; \
 	if [ -n "$(DEVICE)" ]; then CMD="$$CMD --device $(DEVICE)"; fi; \
+	if [ -n "$(CPU_UTIL)" ]; then CMD="$$CMD --cpu-utilisation $(CPU_UTIL)"; fi; \
 	if [ -n "$(OUTPUT)" ]; then CMD="$$CMD --output $(OUTPUT)"; else CMD="$$CMD --output $(OUTPUT_DIR)"; fi; \
 	echo "$(BLUE)Running image_prompter...$(NC)"; \
 	$$CMD $(ARGS)
 
-video-prompter: check-uv ## Run video_prompter.py (VIDEO, PROMPTS, POINTS, MASKS, ALPHA, DEVICE, OUTPUT, ...)
+video-prompter: check-uv ## Run video_prompter.py (VIDEO, PROMPTS, POINTS, MASKS, ALPHA, DEVICE, CPU_UTIL, OUTPUT, ...)
 	@if [ -z "$(VIDEO)" ]; then \
 		echo "$(RED)Error: VIDEO not specified$(NC)"; \
 		echo "$(YELLOW)Usage: make video-prompter VIDEO='clip.mp4' PROMPTS='person ball'$(NC)"; \
@@ -294,6 +297,7 @@ video-prompter: check-uv ## Run video_prompter.py (VIDEO, PROMPTS, POINTS, MASKS
 	if [ -n "$(KEEP_TEMP)" ]; then CMD="$$CMD --keep-temp"; fi; \
 	if [ -n "$(MAX_VRAM_GB)" ]; then CMD="$$CMD --max-vram-gb $(MAX_VRAM_GB)"; fi; \
 	if [ -n "$(MAX_RAM_GB)" ]; then CMD="$$CMD --max-ram-gb $(MAX_RAM_GB)"; fi; \
+	if [ -n "$(CPU_UTIL)" ]; then CMD="$$CMD --cpu-utilisation $(CPU_UTIL)"; fi; \
 	if [ -n "$(OUTPUT)" ]; then CMD="$$CMD --output $(OUTPUT)"; else CMD="$$CMD --output $(OUTPUT_DIR)"; fi; \
 	echo "$(BLUE)Running video_prompter...$(NC)"; \
 	$$CMD $(ARGS)

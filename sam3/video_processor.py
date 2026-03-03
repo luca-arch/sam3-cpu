@@ -16,6 +16,7 @@ from sam3.memory_manager import memory_manager
 from sam3.postprocessor import VideoPostProcessor
 from sam3.utils.ffmpeglib import ffmpeg_lib
 from sam3.utils.logger import get_logger
+from sam3.utils.profiler import profile
 
 logger = get_logger(__name__)
 
@@ -114,6 +115,7 @@ class VideoProcessor:
 
         logger.debug("Created all necessary directories")
 
+    @profile()
     def process_with_prompts(
         self,
         prompts: list[str],
@@ -258,6 +260,7 @@ class VideoProcessor:
             "memory": mem_summary,
         }
 
+    @profile()
     def _create_chunk_plan(self, chunk_spread: str) -> tuple:
         """
         Analyze video and create memory-safe chunk plan.
@@ -300,6 +303,7 @@ class VideoProcessor:
         logger.debug(f"Saved video metadata to {meta_path}")
         return meta_path
 
+    @profile()
     def _process_single_chunk_video(
         self, prompts: list[str], video_metadata: dict, propagation_direction: str
     ) -> list[dict[str, Any]]:
@@ -348,6 +352,7 @@ class VideoProcessor:
 
         return [chunk_result]
 
+    @profile()
     def _process_multiple_chunks(
         self, prompts: list[str], video_metadata: dict, video_chunks: list[dict], propagation_direction: str
     ) -> list[dict[str, Any]]:
@@ -425,6 +430,7 @@ class VideoProcessor:
 
         return chunk_results
 
+    @profile()
     def _postprocess_results(self, chunk_results: list[dict[str, Any]], prompts: list[str]):
         """
         Post-process results from all chunks.

@@ -43,7 +43,7 @@ class Sam3ImageDriver:
         predictor: The underlying SAM3 model predictor instance.
     """
 
-    def __init__(self, bpe_path: str = BPE_PATH, num_workers: int | None = 1, device: str | None = None):
+    def __init__(self, bpe_path: str = BPE_PATH, num_workers: int | None = 1, device: str | None = None, cpu_utilisation: int = 100):
         """Initialize the SAM3 image driver.
 
         Args:
@@ -51,12 +51,14 @@ class Sam3ImageDriver:
             num_workers: Number of worker threads for CPU processing. Only used on CPU.
                         Defaults to 1. Higher values may improve throughput but increase memory.
             device: Force device ('cpu' or 'cuda'). Auto-detected if None.
+            cpu_utilisation: Percentage of logical CPU cores to use (50-100). Default 100.
 
         Raises:
             FileNotFoundError: If bpe_path does not exist.
             RuntimeError: If model loading fails.
         """
         self._device = device or DEVICE.type
+        self._cpu_utilisation = max(50, min(100, cpu_utilisation))
         self.predictor = self._get_predictor(bpe_path=bpe_path, num_workers=num_workers)
 
     @profile()
@@ -91,8 +93,8 @@ class Sam3ImageDriver:
             Initialized predictor ready for inference.
 
         Performance Optimizations:
-            - CPU: Uses all physical cores for intra-op threading (avoids HT overhead)
-            - CPU (AVX512/AMX): Enables bfloat16 autocast for 2-5x speedup on modern Xeon
+            - CPU: Uses all logical cores for intra-op threading (HT helps hide memory latency)
+            - CPU (AVX2+/AVX512/AMX): Enables bfloat16 autocast for 2-5x speedup
             - GPU (Ampere): Enables TF32 for faster matrix operations (~3x speedup)
             - GPU: Uses bfloat16 precision for reduced memory and faster compute
         """
@@ -101,27 +103,35 @@ class Sam3ImageDriver:
             logger.warning("Running on CPU. For better performance, please run on a GPU.")
             # Query CPU capabilities to enable optimal SIMD instructions
             cpu_cap = torch.backends.cpu.get_cpu_capability()
-            # Tune threading: use exact physical core count for intra-op parallelism.
-            # Using fewer threads (e.g. 7 on 8-core) creates load imbalance;
-            # using more (logical/HT cores) hurts compute-bound workloads.
+            # Tune threading: scale logical cores by cpu_utilisation percentage.
+            # Hyper-threading helps SAM3 workloads because the mix of compute-bound
+            # (matmul/conv) and memory-bound (attention, elementwise) ops lets HT
+            # siblings hide memory latency from each other.
             import psutil
 
-            phys = psutil.cpu_count(logical=True) or 1
-            torch.set_num_threads(phys)
+            logical_cores = psutil.cpu_count(logical=True) or 1
+            n_threads = max(1, int(logical_cores * self._cpu_utilisation / 100))
+            torch.set_num_threads(n_threads)
             try:
                 torch.set_num_interop_threads(1)
             except RuntimeError:
                 pass  # can only be set once per process
-            logger.info(f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()}")
+            logger.info(f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()} (utilisation={self._cpu_utilisation}%, logical_cores={logical_cores})")
 
-            # Enable bfloat16 autocast on CPU for modern Xeon processors.
-            # CPUs with AMX-BF16 (Sapphire Rapids+) or AVX512-BF16 see 2-5x speedup
-            # on matmul/conv/linear ops.  Older CPUs get a modest memory reduction.
-            if cpu_cap in ("AVX512",):
+            # Enable bfloat16 autocast on CPU for modern processors (last ~3 years).
+            # Coverage:
+            #   AVX512: Intel Xeon Sapphire Rapids+ (AMX-BF16, 2-5x), Ice Lake+,
+            #           AMD EPYC Genoa / Ryzen 7000+ (Zen 4/5)
+            #   AVX2:   Intel 12th-15th Gen (Alder Lake+), AMD Ryzen 5000+ (Zen 3),
+            #           Apple M-series (Rosetta 2).  PyTorch oneDNN kernels handle
+            #           bf16 math via VNNI or software fallback — still faster than
+            #           fp32 due to halved memory bandwidth.
+            # Only skip for very old CPUs (SSE-only / pre-Haswell "DEFAULT" tier).
+            if cpu_cap in ("AVX512", "AVX2"):
                 torch.autocast("cpu", dtype=torch.bfloat16).__enter__()
                 logger.info(f"CPU bfloat16 autocast ENABLED (capability: {cpu_cap})")
             else:
-                logger.info(f"CPU bfloat16 autocast SKIPPED (capability: {cpu_cap})")
+                logger.info(f"CPU bfloat16 autocast SKIPPED — old CPU (capability: {cpu_cap})")
         else:
             logger.info("Running on GPU. Enabling TF32 and bfloat16 for better performance.")
             # Enable TensorFloat-32 for Ampere GPUs (RTX 30xx, A100, etc.)
@@ -476,7 +486,7 @@ class Sam3VideoDriver:
         predictor: The underlying SAM3 video predictor instance (CPU or GPU variant).
     """
 
-    def __init__(self, bpe_path: str | None = BPE_PATH, num_workers: int | None = 1, device: str | None = None):
+    def __init__(self, bpe_path: str | None = BPE_PATH, num_workers: int | None = 1, device: str | None = None, cpu_utilisation: int = 100):
         """Initialize the SAM3 video driver.
 
         Args:
@@ -485,12 +495,14 @@ class Sam3VideoDriver:
                         - CPU: Controls parallel frame processing (recommend: CPU cores / 2)
                         - GPU: Number of GPUs to use (default: all available)
             device: Force device ('cpu' or 'cuda'). Auto-detected if None.
+            cpu_utilisation: Percentage of logical CPU cores to use (50-100). Default 100.
 
         Raises:
             FileNotFoundError: If bpe_path does not exist.
             RuntimeError: If model loading fails or no compatible device found.
         """
         self._device = device or DEVICE.type
+        self._cpu_utilisation = max(50, min(100, cpu_utilisation))
         self._get_predictor(bpe_path=bpe_path, num_workers=num_workers, device=self._device)
 
     @profile()
@@ -502,8 +514,8 @@ class Sam3VideoDriver:
             num_workers: Worker count (threads on CPU, GPU count on GPU).
 
         Performance Optimizations:
-            - CPU: Uses all physical cores for intra-op threading (avoids HT overhead)
-            - CPU (AVX512/AMX): Enables bfloat16 autocast for 2-5x speedup on modern Xeon
+            - CPU: Uses all logical cores for intra-op threading (HT helps hide memory latency)
+            - CPU (AVX2+/AVX512/AMX): Enables bfloat16 autocast for 2-5x speedup
             - GPU (Ampere): TF32 enabled for ~3x matmul speedup
             - GPU: bfloat16 precision for 2x memory reduction
             - GPU: Multi-GPU support for distributed processing
@@ -517,27 +529,35 @@ class Sam3VideoDriver:
             logger.warning("Running on CPU. For better performance, please run on a GPU.")
             # Query CPU capabilities to optimize for available instruction sets (AVX2, AVX512, etc.)
             cpu_cap = torch.backends.cpu.get_cpu_capability()
-            # Tune threading: use exact physical core count for intra-op parallelism.
-            # Using fewer threads (e.g. 7 on 8-core) creates load imbalance;
-            # using more (logical/HT cores) hurts compute-bound workloads.
+            # Tune threading: scale logical cores by cpu_utilisation percentage.
+            # Hyper-threading helps SAM3 workloads because the mix of compute-bound
+            # (matmul/conv) and memory-bound (attention, elementwise) ops lets HT
+            # siblings hide memory latency from each other.
             import psutil
 
-            phys = psutil.cpu_count(logical=True) or 1
-            torch.set_num_threads(phys)
+            logical_cores = psutil.cpu_count(logical=True) or 1
+            n_threads = max(1, int(logical_cores * self._cpu_utilisation / 100))
+            torch.set_num_threads(n_threads)
             try:
                 torch.set_num_interop_threads(1)
             except RuntimeError:
                 pass  # can only be set once per process
-            logger.info(f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()}")
+            logger.info(f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()} (utilisation={self._cpu_utilisation}%, logical_cores={logical_cores})")
 
-            # Enable bfloat16 autocast on CPU for modern Xeon processors.
-            # CPUs with AMX-BF16 (Sapphire Rapids+) or AVX512-BF16 see 2-5x speedup
-            # on matmul/conv/linear ops.  Older CPUs get a modest memory reduction.
-            if cpu_cap in ("AVX512",):
+            # Enable bfloat16 autocast on CPU for modern processors (last ~3 years).
+            # Coverage:
+            #   AVX512: Intel Xeon Sapphire Rapids+ (AMX-BF16, 2-5x), Ice Lake+,
+            #           AMD EPYC Genoa / Ryzen 7000+ (Zen 4/5)
+            #   AVX2:   Intel 12th-15th Gen (Alder Lake+), AMD Ryzen 5000+ (Zen 3),
+            #           Apple M-series (Rosetta 2).  PyTorch oneDNN kernels handle
+            #           bf16 math via VNNI or software fallback — still faster than
+            #           fp32 due to halved memory bandwidth.
+            # Only skip for very old CPUs (SSE-only / pre-Haswell "DEFAULT" tier).
+            if cpu_cap in ("AVX512", "AVX2"):
                 torch.autocast("cpu", dtype=torch.bfloat16).__enter__()
                 logger.info(f"CPU bfloat16 autocast ENABLED (capability: {cpu_cap})")
             else:
-                logger.info(f"CPU bfloat16 autocast SKIPPED (capability: {cpu_cap})")
+                logger.info(f"CPU bfloat16 autocast SKIPPED — old CPU (capability: {cpu_cap})")
 
             self.predictor = build_sam3_video_predictor_cpu(bpe_path=bpe_path, num_workers=num_workers)
         else:

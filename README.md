@@ -10,18 +10,18 @@
 
 - **CPU + GPU** — runs on CPU out of the box; uses CUDA when available
 - **Zero GPU footprint** — `--device cpu` hides GPUs completely (0 MiB VRAM used)
+- **Configurable CPU utilisation** — `--cpu-utilisation 50..100` controls how many logical cores the model uses (default 100%)
+- **Automatic bfloat16 on CPU** — detects AVX2/AVX512 and enables `torch.autocast` for 2–5× speedup on Intel 10th gen+ and AMD Zen 3+ processors
 - **Memory-aware chunking** — automatically splits long videos into chunks sized to available RAM / VRAM
 - **Cross-chunk continuity** — IoU-based mask remapping keeps object IDs consistent across chunks
-- **Streaming MP4 mask pipeline** — per-object mask videos written in real-time via queue-based GPU→CPU bridge (replaces legacy per-frame PNGs — ~100× fewer I/O operations)
-- **Simultaneous overlay compositing** — colour overlay is composited incrementally during propagation, not as a separate post-processing pass
-- **Adaptive memory multiplier** — learns actual per-frame VRAM cost from chunk execution instead of relying on a hardcoded estimate, improving chunk sizing accuracy after the first chunk
+- **Streaming MP4 mask pipeline** — per-object mask videos written in real-time via queue-based GPU→CPU bridge (~100× fewer I/O operations vs legacy per-frame PNGs)
+- **Simultaneous overlay compositing** — colour overlay composited incrementally during propagation
+- **Adaptive memory multiplier** — learns actual per-frame VRAM cost from chunk execution instead of relying on a hardcoded estimate
 - **Text, point, box & mask prompts** — unified API for all prompt types
 - **Video segment processing** — process a specific frame range or time range instead of the full video
 - **Interval-based object tracking** — appearance / disappearance intervals with timestamps and timecodes for every detected object
-- **Full cross-chunk IoU matrix** — complete pairwise IoU data for every chunk boundary, enabling offline evaluation
-- **Enriched metadata (v2.2.0)** — schema-versioned JSON with timing breakdown, peak / min memory tracking, per-chunk details, mask area statistics, async I/O stats, adaptive multiplier data, and thread configuration
-- **Background memory sampling** — tracks peak and minimum RSS (and GPU peak) throughout the pipeline
-- **Pre-allocated empty mask pool** — reusable read-only black frames avoid repeated allocation when new objects appear mid-chunk
+- **Full cross-chunk IoU matrix** — complete pairwise IoU data for every chunk boundary
+- **Built-in profiler** — `@profile()` decorators across the pipeline, enabled via `--profile` (zero overhead when off)
 - **CLI tools** — `image_prompter.py` and `video_prompter.py` for quick experiments
 
 ---
@@ -36,6 +36,11 @@
   - [image\_prompter.py](#image_prompterpy)
   - [video\_prompter.py](#video_prompterpy)
 - [Python API](#python-api)
+- [CPU Performance Optimisations](#cpu-performance-optimisations)
+  - [bfloat16 Autocast](#bfloat16-autocast)
+  - [Thread Configuration](#thread-configuration)
+  - [CPU Utilisation Control](#cpu-utilisation-control)
+  - [Benchmark Summary](#benchmark-summary)
 - [Video Chunking](#video-chunking)
   - [Memory Management Architecture](#memory-management-architecture)
   - [Streaming Mask Pipeline](#streaming-mask-pipeline)
@@ -56,7 +61,7 @@
 - [Future Work](#future-work)
 - [Citation](#citation)
 - [License](#license)
-- [Contributors](#contributors)
+- [Core Authors](#core-authors)
 
 ---
 
@@ -64,7 +69,7 @@
 
 | Requirement | Details |
 |---|---|
-| Python | 3.12 + |
+| Python | 3.12+ |
 | OS | Linux (Ubuntu 20.04+), macOS 11+ (Intel & Apple Silicon) |
 | ffmpeg / ffprobe | Required for video processing |
 | HuggingFace account | Model checkpoints are hosted on HuggingFace — you must [request access](https://huggingface.co/facebook/sam3) and authenticate (`huggingface-cli login`) before first use |
@@ -175,6 +180,7 @@ make image-prompter IMAGES='assets/images/truck.jpg' PROMPTS='truck wheel'
 make video-prompter VIDEO='assets/videos/sample.mp4' PROMPTS='person'
 make video-prompter VIDEO='clip.mp4' PROMPTS='player' FRAME_RANGE='100 500'
 make video-prompter VIDEO='clip.mp4' PROMPTS='player' TIME_RANGE='0:05 0:30'
+make video-prompter VIDEO='clip.mp4' PROMPTS='player' CPU_UTIL=75
 ```
 
 All `make` variables:
@@ -193,6 +199,7 @@ All `make` variables:
 | `OUTPUT` | both | `'results/demo'` |
 | `ALPHA` | both | `0.45` |
 | `DEVICE` | both | `cpu` or `cuda` |
+| `CPU_UTIL` | both | `75` (use 75% of logical cores) |
 | `CHUNK_SPREAD` | `video-prompter` | `even` |
 | `KEEP_TEMP` | `video-prompter` | `1` (any non-empty value) |
 | `MAX_VRAM_GB` | `video-prompter` | `10` (cap VRAM budget in GB) |
@@ -223,7 +230,8 @@ Segment one or more images with text prompts, click points, or bounding boxes.
 | `--output` | `str` | `results` | Output directory |
 | `--alpha` | `float` | `0.5` | Overlay alpha for mask visualisation (`0.0`–`1.0`) |
 | `--device` | `str` | auto | Force `cpu` or `cuda` (auto-detected if omitted) |
-| `--profile` | flag | off | Enable the built-in profiler (writes `profile_results.json` / `.txt`) |
+| `--cpu-utilisation` | `int` | `100` | Percentage of logical CPU cores to use (50–100) |
+| `--profile` | flag | off | Enable the built-in profiler |
 
 At least one of `--prompts`, `--points`, or `--bbox` is required.
 
@@ -242,25 +250,11 @@ uv run python image_prompter.py \
     --bbox 100 50 400 300 \
     --output results/truck_bbox
 
-# Click-point prompt
-uv run python image_prompter.py \
-    --images assets/images/truck.jpg \
-    --points 250,175 \
-    --output results/truck_points
-
-# Batch: multiple images with the same text prompt
+# Batch: multiple images, 75% CPU utilisation
 uv run python image_prompter.py \
     --images img1.jpg img2.jpg img3.jpg \
     --prompts "person" \
-    --output results/batch
-
-# Combined: text + points on a single image
-uv run python image_prompter.py \
-    --images scene.jpg \
-    --prompts "dog" \
-    --points 120,340 \
-    --point-labels 1 \
-    --alpha 0.45 --device cpu
+    --device cpu --cpu-utilisation 75
 ```
 
 ### video\_prompter.py
@@ -281,13 +275,14 @@ and generates per-object tracking metadata.
 | `--output` | `str` | `results` | Output directory |
 | `--alpha` | `float` | `0.5` | Overlay alpha (`0.0`–`1.0`) |
 | `--device` | `str` | auto | Force `cpu` or `cuda` |
+| `--cpu-utilisation` | `int` | `100` | Percentage of logical CPU cores to use (50–100) |
 | `--chunk-spread` | `str` | `default` | Chunk size strategy: `default` or `even` |
 | `--keep-temp` | flag | off | Preserve intermediate chunk files in output |
 | `--frame-range` | `int int` | `None` | Process only frames `START..END` (0-based, inclusive) |
 | `--time-range` | `str str` | `None` | Process a time segment (seconds, `MM:SS`, or `HH:MM:SS`) |
-| `--max-vram-gb` | `float` | `None` | Cap VRAM budget (GB) — useful for testing adaptive chunking on large GPUs |
-| `--max-ram-gb` | `float` | `None` | Cap RAM budget (GB) — useful for testing adaptive chunking |
-| `--profile` | flag | off | Enable the built-in profiler (writes `profile_results.json` / `.txt`) |
+| `--max-vram-gb` | `float` | `None` | Cap VRAM budget (GB) |
+| `--max-ram-gb` | `float` | `None` | Cap RAM budget (GB) |
+| `--profile` | flag | off | Enable the built-in profiler |
 
 At least one of `--prompts`, `--points`, or `--masks` is required.
 `--frame-range` and `--time-range` are mutually exclusive.
@@ -301,53 +296,29 @@ uv run python video_prompter.py \
     --prompts "player" "tennis racket" \
     --output results/tennis_demo
 
-# Point prompt
-uv run python video_prompter.py \
-    --video assets/videos/sample.mp4 \
-    --points 320,240 \
-    --output results/tennis_points
-
-# Mask prompt — provide binary mask images as initial objects
-uv run python video_prompter.py \
-    --video clip.mp4 \
-    --masks player_mask.png ball_mask.png \
-    --output results/masks_demo
-
 # Frame-range — process only frames 100 to 500
 uv run python video_prompter.py \
     --video match.mp4 \
     --prompts "player" \
     --frame-range 100 500
 
-# Time-range with MM:SS notation — process from 0:05 to 0:30
+# Time-range with MM:SS notation
 uv run python video_prompter.py \
     --video match.mp4 \
     --prompts "player" \
     --time-range 0:05 0:30
 
-# Time-range with seconds — process 10s to 45.5s
+# CPU at 75% utilisation
 uv run python video_prompter.py \
-    --video match.mp4 \
-    --prompts "player" \
-    --time-range 10.0 45.5
-
-# Time-range with HH:MM:SS — process a 5-minute segment
-uv run python video_prompter.py \
-    --video long_match.mp4 \
-    --prompts "player" \
-    --time-range 0:02:00 0:07:00
+    --video clip.mp4 \
+    --prompts "person" \
+    --device cpu --cpu-utilisation 75
 
 # Even chunk spread + preserve temp files
 uv run python video_prompter.py \
     --video clip.mp4 \
     --prompts "person" \
     --chunk-spread even --keep-temp
-
-# Force CPU processing
-uv run python video_prompter.py \
-    --video clip.mp4 \
-    --prompts "person" \
-    --device cpu
 ```
 
 ---
@@ -384,6 +355,88 @@ Lower-level access is available through `ImageProcessor`, `VideoProcessor`,
 
 ---
 
+## CPU Performance Optimisations
+
+SAM3-CPU includes several optimisations that significantly improve inference
+speed on modern x86 CPUs.  The key findings below were measured on an
+Intel Xeon 8573C (8 physical / 16 logical cores, 62 GB RAM).
+
+### bfloat16 Autocast
+
+The model runs under `torch.autocast("cpu", dtype=torch.bfloat16)` on any CPU
+that reports **AVX2** or **AVX512** capabilities via
+`torch.backends.cpu.get_cpu_capability()`.
+
+| Capability | CPU families covered |
+|---|---|
+| **AVX512** | Intel Xeon Sapphire Rapids+ (AMX-BF16, native 2–5× speedup), Ice Lake+, AMD EPYC Genoa / Ryzen 7000+ (Zen 4/5) |
+| **AVX2** | Intel 12th–15th Gen (Alder Lake+), AMD Ryzen 5000+ (Zen 3), Apple M-series via Rosetta 2 |
+
+On AVX512 CPUs with AMX-BF16 (e.g. Sapphire Rapids Xeon), bfloat16 matmuls
+are executed natively in the AMX tile accelerator, yielding a **2–5× per-op
+speedup**.  On AVX2 CPUs, PyTorch's oneDNN backend performs bf16→fp32
+conversion using VNNI or software fallback — still faster than pure fp32 due
+to **halved memory bandwidth**.
+
+Very old CPUs (SSE-only, "DEFAULT" capability tier) remain on fp32 automatically.
+
+### Thread Configuration
+
+SAM3 uses **all logical cores** (including hyper-threading siblings) for
+`torch.set_num_threads()`, rather than limiting to physical cores.  This is
+because SAM3's workload mixes compute-bound operations (matmul, convolution)
+with memory-bound operations (attention, elementwise), allowing HT siblings to
+hide memory latency from each other.
+
+**Benchmark** (Xeon 8573C, 8 physical / 16 logical, bfloat16 autocast):
+
+| Threads | Mode | Composite latency | Speedup |
+|---|---|---|---|
+| 8 (physical only) | BF16 | 20.1 ms | baseline |
+| 16 (logical, HT) | BF16 | 15.5 ms | **23% faster** |
+| 8 (physical only) | FP32 | 23.2 ms | — |
+| 16 (logical, HT) | FP32 | 21.2 ms | 9% faster |
+
+The HT benefit is largest in BF16 mode because AMX/VNNI instructions free ALU
+cycles that the sibling thread can use.
+
+> **Combined effect of BF16 + HT on propagation:** 8.02 s/frame → 2.69 s/frame
+> — a **2.98× speedup** on the per-frame propagation hot loop.
+
+### CPU Utilisation Control
+
+The `--cpu-utilisation` flag (50–100, default 100) scales the number of
+logical cores used:
+
+```
+threads = max(1, logical_cores × cpu_utilisation / 100)
+```
+
+This is useful when:
+- Running on a shared server and you want to leave cores for other processes
+- Reducing thermal throttling on laptops
+- Benchmarking the effect of thread count on throughput
+
+```bash
+# Use 75% of logical cores
+uv run python video_prompter.py --video clip.mp4 --prompts person --cpu-utilisation 75
+
+# Via Makefile
+make video-prompter VIDEO='clip.mp4' PROMPTS='person' CPU_UTIL=75
+```
+
+### Benchmark Summary
+
+End-to-end results on Intel Xeon 8573C, 62 GB RAM, CPU-only:
+
+| Optimisation | Before | After | Improvement |
+|---|---|---|---|
+| bfloat16 autocast (AVX512+AMX) | fp32 baseline | bf16 | ~2.5× per-op |
+| Logical cores (HT enabled) | 8 threads | 16 threads | 23% latency reduction |
+| Combined (BF16 + HT) | 8.02 s/frame | 2.69 s/frame | **2.98×** |
+
+---
+
 ## Video Chunking
 
 When a video is too large to fit in memory the framework automatically splits it
@@ -393,7 +446,7 @@ results back together.
 **How it works:**
 
 1. `MemoryManager` computes how many frames fit in available RAM (CPU) or VRAM (GPU).
-2. The video is split into chunks with configurable overlap (default 5 frames).
+2. The video is split into chunks with configurable overlap (default 1 frame).
 3. Each chunk is segmented and tracked independently.
 4. At chunk boundaries, masks from the overlap region are matched using IoU and
    object IDs are remapped so they stay consistent across the full video.
@@ -402,9 +455,9 @@ results back together.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `ram_usage_percent` | 0.45 | Fraction of free RAM budget for frames (override in `__globals.py`) |
+| `ram_usage_percent` | 0.975 | Fraction of free RAM budget for frames |
 | `min_frames` | 25 | Minimum frames per chunk |
-| `chunk_overlap` | 1 | Overlap frames between chunks (`DEFAULT_MIN_CHUNK_OVERLAP` in `__globals.py`) |
+| `chunk_overlap` | 1 | Overlap frames between chunks |
 | `CHUNK_MASK_MATCHING_IOU_THRESHOLD` | 0.75 | IoU threshold for cross-chunk ID matching |
 
 ### Memory Management Architecture
@@ -433,8 +486,6 @@ proactive intra-chunk monitoring with reactive inter-chunk adaptation:
 │   │  ├─ Immediate propagation halt                           │  │
 │   │  ├─ Use calibration for smart replan                     │  │
 │   │  └─ Resume from stop point in next chunk                 │  │
-│   │                                                          │  │
-│   │  Overhead: ~50ns/frame + ~10µs/checkpoint                │  │
 │   └──────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │   ┌──────────────────────────────────────────────────────────┐  │
@@ -457,8 +508,8 @@ proactive intra-chunk monitoring with reactive inter-chunk adaptation:
 │   │  Async I/O Pipeline                                      │  │
 │   │                                                          │  │
 │   │  ┌──────────┐  submit()  ┌───────────────┐              │  │
-│   │  │ GPU      │──────────>│ AsyncIOWorker  │              │  │
-│   │  │ Compute  │           │ (1 thread)     │              │  │
+│   │  │ Compute  │──────────>│ AsyncIOWorker  │              │  │
+│   │  │ Thread   │           │ (1 thread)     │              │  │
 │   │  │          │  overlap  │                │              │  │
 │   │  │ Next     │<────────>│ Write masks    │              │  │
 │   │  │ prompt   │           │ Write JSON     │              │  │
@@ -472,12 +523,11 @@ proactive intra-chunk monitoring with reactive inter-chunk adaptation:
 
 | Module | Purpose |
 |---|---|
-| `sam3/memory_optimizer.py` | `IntraChunkMonitor`, `AdaptiveChunkManager`, `AdaptiveMultiplier`, memory utilities |
+| `sam3/memory_optimizer.py` | `IntraChunkMonitor`, `AdaptiveChunkManager`, `AdaptiveMultiplier` |
 | `sam3/streaming_masks.py` | `StreamingMaskWriter`, `MaskVideoWriter`, `EmptyMaskPool`, `StreamingOverlayCompositor` |
 | `sam3/async_io.py` | `AsyncIOWorker` — background thread for disk writes |
 | `sam3/memory_manager.py` | Static chunk planning (`compute_memory_safe_frames`) |
 | `sam3/memory_predictor.py` | Background OOM predictor (soft/hard stop callbacks) |
-| `video_prompter.py` | Main processing pipeline integrating all components |
 
 **Memory pressure thresholds:**
 
@@ -499,11 +549,11 @@ just **3 MP4 files**.
 
 ```
 ┌──────────────┐    Queue     ┌────────────────────────────────┐
-│  GPU Thread  │─────────────>│  StreamingMaskWriter           │
-│  (propagate) │  MaskFrame   │  (background consumer thread)  │
-│              │  dataclass   │                                │
-│  push_frame()│              │  ├─ MaskVideoWriter per object │
-│              │              │  │  (mp4v, grayscale, lossless) │
+│  Compute     │─────────────>│  StreamingMaskWriter           │
+│  Thread      │  MaskFrame   │  (background consumer thread)  │
+│  (propagate) │  dataclass   │                                │
+│              │              │  ├─ MaskVideoWriter per object │
+│  push_frame()│              │  │  (mp4v, grayscale, lossless) │
 │              │              │  │                              │
 │              │              │  ├─ EmptyMaskPool               │
 │              │              │  │  (shared read-only black     │
@@ -515,60 +565,22 @@ just **3 MP4 files**.
                    ─────>       flush + close all writers
 ```
 
-**Key components:**
-
-| Class | Purpose |
-|---|---|
-| `EmptyMaskPool` | Shared read-only black frame — avoids repeated `np.zeros()` allocation when new objects appear mid-chunk |
-| `MaskVideoWriter` | Thread-safe per-object MP4 writer with `write_frame()` and `write_black()` |
-| `StreamingOverlayCompositor` | Reads original video frames in lockstep and composites colour masks incrementally |
-| `StreamingMaskWriter` | Queue-based GPU→CPU bridge: GPU thread pushes mask data, background consumer encodes MP4s and composites overlay simultaneously |
-| `stitch_chunk_mask_videos()` | Cross-chunk MP4 stitcher (reads chunk-level mask MP4s, skips overlap, writes final output) |
-| `create_overlay_from_masks()` | Fallback overlay builder from stitched mask MP4 files |
-
 **Performance gains:**
 - ~100× fewer I/O operations (1 MP4 per object vs. N PNGs per object)
-- GPU and CPU work in parallel via the queue bridge
+- Compute and I/O work in parallel via the queue bridge
 - Zero-copy black frame pool eliminates allocation overhead for new objects
 - Overlay compositing happens during propagation, not as a separate pass
 
 ### Adaptive Memory Multiplier
 
-The initial chunk size is computed using `MODEL_STATE_MULTIPLIER` (default 4.5),
-a static heuristic for how many bytes of VRAM each video frame requires.  This
-works well for the resolution and prompt it was calibrated on, but can be
-inaccurate when object count, resolution, or prompt complexity changes.
+The initial chunk size is computed using `MODEL_STATE_MULTIPLIER` (default 4.5).
+The **`AdaptiveMultiplier`** (`sam3/memory_optimizer.py`) replaces this static
+heuristic after the first chunk by learning from actual execution:
 
-The **`AdaptiveMultiplier`** (`sam3/memory_optimizer.py`) fixes this by
-learning from actual chunk execution:
-
-```
-Chunk 0 (static estimate)
-  │ MODEL_STATE_MULTIPLIER = 4.5
-  │ estimate: 70 MB/frame
-  ▼
-IntraChunkMonitor calibrates:
-  │ Measured growth_rate = 35 MB/iter
-  │ Effective per-frame = 35 × 2 = 70 MB  ← confirms static estimate
-  │ R² = 0.94 (high confidence)
-  ▼
-AdaptiveMultiplier.update()
-  │ Stores sample: {growth_rate, baseline, n_objects, confidence}
-  │ Rolling window of last 5 chunks
-  ▼
-Chunk 1+ (adaptive estimate)
-  │ Uses weighted average of measured growth rates
-  │ Weighted by confidence (R²)
-  │ Replaces static 4.5× with actual cost
-  ▼
-Better chunk sizing → fewer OOMs, fewer unnecessary boundaries
-```
-
-**Key properties:**
-- **Zero overhead on chunk 0** — falls back to static `MODEL_STATE_MULTIPLIER`
-- **Self-correcting** — rolling window of last 5 chunks, weighted by confidence (R²)
+- **Zero overhead on chunk 0** — falls back to static multiplier
+- **Self-correcting** — rolling window of last 5 chunks, weighted by R² confidence
 - **Reject bad data** — samples with R² < 0.3 or negative growth are silently dropped
-- **Exported in metadata** — `adaptive_multiplier` section in `metadata.json` shows static vs. adaptive estimates and all calibration samples
+- **Exported in metadata** — `adaptive_multiplier` section in `metadata.json`
 
 ---
 
@@ -584,15 +596,11 @@ results/images/
     ├── <prompt>/
     │   ├── object_0_mask.png
     │   ├── object_0_overlay.png
-    │   └── metadata.json           # per-prompt: scores, mask areas, inference time
-    ├── bbox/
-    │   ├── object_*_mask.png
-    │   ├── object_*_overlay.png
     │   └── metadata.json
+    ├── bbox/
+    │   └── ...
     └── points/
-        ├── object_*_mask.png
-        ├── object_*_overlay.png
-        └── metadata.json
+        └── ...
 ```
 
 ### video\_prompter.py
@@ -613,7 +621,7 @@ results/<video_name>/
 └── temp_files/                     # only when --keep-temp is set
     └── chunks/
         └── chunk_<id>/
-            └── masks/<prompt>/object_<id>_mask.mp4  # per-chunk mask MP4
+            └── masks/<prompt>/object_<id>_mask.mp4
 ```
 
 ---
@@ -627,130 +635,59 @@ to format changes.
 
 | Field | Type | Description |
 |---|---|---|
-| `schema_version` | `string` | Metadata format version — `"2.2.0"` for video, `"2.0.0"` for image |
-| `sam3_version` | `string` | SAM3-CPU release version (read from `VERSION` file) |
+| `schema_version` | `string` | `"2.2.0"` for video, `"2.0.0"` for image |
+| `sam3_version` | `string` | SAM3-CPU release version |
 
 ### Video Metadata
 
-The top-level `metadata.json` written by `video_prompter.py` contains the
-complete run record:
+The top-level `metadata.json` contains the complete run record:
 
 ```jsonc
 {
   "schema_version": "2.2.0",
-  "sam3_version": "0.1.0",
-
-  // ── Video info ──
   "video": "assets/videos/sample.mp4",
-  "video_name": "sample",
   "resolution": "854x480",
   "total_frames": 200,
   "fps": 25.0,
-  "duration_s": 8.0,
-  "frame_offset": 0,               // offset when --frame-range is used
-  "frame_range": null,              // [start, end] or null
-  "time_range": null,               // [start, end] or null
-
-  // ── Environment ──
   "device": "cpu",
   "thread_config": {
-    "intra_op_threads": 21,
-    "inter_op_threads": 1
+    "intra_op_threads": 16,
+    "inter_op_threads": 1,
+    "cpu_utilisation_pct": 100
   },
-
-  // ── Prompts ──
-  "prompts": ["person", "tennis racket"],
-  "points": null,
-  "mask_paths": null,
-  "num_chunks": 1,
-  "overlap_frames": 5,
-
-  // ── Timing breakdown ──
   "timing": {
-    "pipeline_start": "2026-02-28T13:46:13.444775",
-    "pipeline_end": "2026-02-28T13:46:48.566273",
     "total_s": 35.121,
     "model_load_s": 6.944,
     "chunk_processing_s": 26.538,
-    "stitching_s": 0.078,
-    "analysis_s": 0.013,
-    "per_chunk": [
-      { "chunk_id": 0, "frames": 200, "duration_s": 26.5, "s_per_frame": 0.133 }
-    ]
+    "stitching_s": 0.078
   },
-
-  // ── Memory ──
   "memory": {
-    "pre_run": { ... },             // RAM/VRAM budget from MemoryManager
     "peak_rss_bytes": 8008626176,
-    "peak_rss_timestamp": "2026-02-28T13:46:41.462853",
-    "min_rss_bytes": 957571072,
-    "min_rss_timestamp": "2026-02-28T13:46:13.445325",
-    "gpu_peak_allocated_bytes": null
-  },
-
-  // ── Per-chunk details ──
-  "chunks": [
-    {
-      "chunk_id": 0,
-      "start_frame": 0,
-      "end_frame": 199,
-      "start_frame_original": 0,    // relative to original video
-      "end_frame_original": 199,
-      "total_frames": 200,
-      "processing_time_s": 26.538,
-      "objects_by_prompt": {
-        "person": {
-          "object_ids": [0, 1],
-          "num_objects": 2,
-          "id_mapping": { "0": 0, "1": 1 }
-        }
-      }
-    }
-  ],
-
-  // ── Async I/O stats (v2.2.0+) ──
-  "async_io": {
-    "tasks_submitted": 2,
-    "errors": 0
-  },
-
-  // ── Cross-chunk IoU (multi-chunk videos only) ──
-  "cross_chunk_iou": null,          // see Cross-Chunk IoU section
-
-  // ── Object presence intervals ──
-  "objects": { ... }                // see Object Tracking section
+    "min_rss_bytes": 957571072
+  }
 }
 ```
 
 ### Image Metadata
 
-Per-image `metadata.json` written by `image_prompter.py`:
+Per-image `metadata.json`:
 
 ```jsonc
 {
   "schema_version": "2.0.0",
   "image_name": "truck",
-  "image_path": "/absolute/path/to/truck.jpg",
   "resolution": "1800x1200",
-  "width": 1800,
-  "height": 1200,
-  "total_pixels": 2160000,
   "device": "cpu",
   "timing": { "image_total_s": 12.34 },
-  "memory": { ... },
   "objects": {
     "text_prompts": [
       {
         "prompt": "truck",
         "num_objects": 1,
-        "inference_time_s": 1.217,
         "objects": [
           {
             "object_id": 0,
             "score": 0.866,
-            "box": [85.7, 281.5, 1710.3, 850.6],
-            "mask_area_pixels": 636375,
             "mask_area_pct": 29.46,
             "mask_file": "object_0_mask.png",
             "overlay_file": "object_0_overlay.png"
@@ -762,42 +699,12 @@ Per-image `metadata.json` written by `image_prompter.py`:
 }
 ```
 
-The pipeline-level `pipeline_metadata.json` adds batch-wide timing and memory:
-
-```jsonc
-{
-  "schema_version": "2.0.0",
-  "sam3_version": "0.1.0",
-  "device": "cpu",
-  "thread_config": { "intra_op_threads": 21, "inter_op_threads": 1 },
-  "num_images": 3,
-  "timing": {
-    "pipeline_start": "...",
-    "pipeline_end": "...",
-    "total_s": 38.5,
-    "model_load_s": 6.9,
-    "per_image": [
-      { "image_name": "truck", "processing_time_s": 12.3 }
-    ]
-  },
-  "memory": {
-    "peak_rss_bytes": 8008626176,
-    "peak_rss_timestamp": "...",
-    "min_rss_bytes": 957571072,
-    "min_rss_timestamp": "...",
-    "gpu_peak_allocated_bytes": null
-  }
-}
-```
-
 ### Object Tracking
 
 Each object's temporal presence is modelled as a list of **contiguous
 intervals** — an object that disappears and reappears gets multiple
 intervals.  All timestamps account for `--frame-range` / `--time-range`
 offsets so they refer to the **original** video timeline.
-
-The `objects` field in the video `metadata.json` is keyed by prompt name:
 
 ```json
 {
@@ -808,85 +715,69 @@ The `objects` field in the video `metadata.json` is keyed by prompt name:
         {
           "start_frame": 12,
           "end_frame": 187,
-          "start_time": 0.48,
-          "end_time": 7.48,
           "start_timecode": "00:00:00.480",
           "end_timecode": "00:00:07.480",
           "duration_frames": 176,
           "duration_s": 7.04
-        },
-        {
-          "start_frame": 210,
-          "end_frame": 487,
-          "start_time": 8.4,
-          "end_time": 19.48,
-          "start_timecode": "00:00:08.400",
-          "end_timecode": "00:00:19.480",
-          "duration_frames": 278,
-          "duration_s": 11.12
         }
       ],
-      "num_intervals": 2,
-      "total_frames_active": 454,
-      "total_frames": 500,
-      "total_duration_s": 18.16,
+      "total_frames_active": 176,
       "first_frame": 12,
-      "last_frame": 487,
-      "first_timestamp": 0.48,
-      "last_timestamp": 19.48,
-      "first_timecode": "00:00:00.480",
-      "last_timecode": "00:00:19.480"
+      "last_frame": 187
     }
   ]
 }
 ```
 
-This data is also saved separately as `metadata/object_tracking.json` for
-convenient downstream access.
+This data is also saved separately as `metadata/object_tracking.json`.
 
 ### Cross-Chunk IoU
 
 When a video is processed in multiple chunks, the full pairwise IoU matrix
-for every chunk boundary is captured.  This lives in the top-level
-`metadata.json` under `cross_chunk_iou` and is also saved as
-`metadata/cross_chunk_iou.json`:
+for every chunk boundary is captured in `metadata/cross_chunk_iou.json`:
 
 ```json
 {
   "chunk_0_to_1": {
     "person": {
-      "matrix": {
-        "0": { "0": 0.91, "1": 0.02 },
-        "1": { "0": 0.03, "1": 0.87 }
-      },
-      "matched": { "0": 0, "1": 1 },
+      "matrix": { "0": { "0": 0.91, "1": 0.02 } },
+      "matched": { "0": 0 },
       "threshold": 0.25
     }
   }
 }
 ```
 
-Each entry shows every new-object vs. previous-object IoU, the winner
-mapping, and the threshold used.  This is useful for offline evaluation of
-tracking quality.
-
 ---
 
 ## Profiling
 
-SAM3-CPU ships with a built-in **profiler** that measures wall-clock **execution
-time** and **memory consumption** (RSS) for any decorated function.  This is
-valuable for:
+SAM3-CPU ships with a built-in **profiler** that measures wall-clock execution
+time and memory consumption (RSS) for any decorated function.
 
-- Identifying bottlenecks (model loading vs. inference vs. post-processing)
-- Tracking memory growth across processing stages
-- Comparing CPU vs. GPU performance
-- Validating that optimisations have the intended effect
+### Instrumented functions
+
+The following functions have `@profile()` decorators (zero cost when profiling
+is disabled):
+
+| Module | Functions |
+|---|---|
+| `model_builder.py` | `build_sam3_video_model` |
+| `drivers.py` | `_build_model`, `_get_predictor`, `inference`, `start_session`, `propagate_in_video` |
+| `video_processor.py` | `process_with_prompts`, `_create_chunk_plan`, `_process_single_chunk_video`, `_process_multiple_chunks`, `_postprocess_results` |
+| `chunk_processor.py` | `process_with_prompts`, `_process_single_prompt` |
+| `image_processor.py` | `process_with_prompts`, `_process_single_image_with_prompts`, `_process_single_prompt`, `process_with_boxes` |
+| `postprocessor.py` | `process`, `_build_id_mappings`, `_stitch_masks_for_prompt` |
+| `memory_manager.py` | `compute_memory_safe_frames`, `chunk_plan_video` |
+
+Additionally, `sam3/model/sam3_video_base.py` logs **per-frame 5-step timing**
+at `DEBUG` level:
+
+```
+[perf] frame 42: backbone+det=890ms  tracker_prop=320ms  update_plan=15ms  update_exec=1200ms  build_out=45ms  total=2470ms
+```
 
 ### Enabling the profiler
-
-The profiler is **disabled by default** (zero overhead).  Enable it by passing
-the `--profile` flag to any script:
 
 ```bash
 # Profile image segmentation
@@ -898,92 +789,38 @@ uv run python video_prompter.py \
     --video clip.mp4 --prompts person --profile
 ```
 
-Or toggle it programmatically:
+Or toggle programmatically:
 
 ```python
 import sam3.__globals
 sam3.__globals.ENABLE_PROFILING = True
 ```
 
-### Using `@profile()` in your own code
-
-```python
-from sam3.utils.profiler import profile
-
-@profile()
-def my_heavy_function():
-    # ... expensive work ...
-    return result
-```
-
-When profiling is enabled each decorated call prints a summary:
-
-```
-[PROFILED] my_heavy_function | Time: 3.142857s | Memory Used: 128.000000 MB
-```
-
 ### Output files
-
-Results are appended to two files in the working directory:
 
 | File | Format | Content |
 |---|---|---|
-| `profile_results.json` | JSON array | One object per call with `function_name`, `timestamp`, `execution_time_seconds`, `memory_used_MB`, `total_process_memory_MB` |
+| `profile_results.json` | JSON array | One object per call: `function_name`, `timestamp`, `execution_time_seconds`, `memory_used_MB`, `total_process_memory_MB` |
 | `profile_results.txt` | Plain text | One line per call — human-readable summary |
 
-**Example `profile_results.json`:**
-
-```json
-[
-    {
-        "function_name": "_build_model",
-        "timestamp": "2026-02-16T21:07:27.912279",
-        "execution_time_seconds": 6.283576,
-        "memory_used_MB": 6750.577,
-        "total_process_memory_MB": 7515.546
-    },
-    {
-        "function_name": "inference",
-        "timestamp": "2026-02-16T21:07:33.132962",
-        "execution_time_seconds": 5.214927,
-        "memory_used_MB": 51.323,
-        "total_process_memory_MB": 7566.967
-    }
-]
-```
-
-**Example `profile_results.txt`:**
-
-```
-_build_model | Time: 6.283576 s | Memory Used: 6750.577 MB | Total Memory: 7515.546 MB
-inference    | Time: 5.214927 s | Memory Used: 51.323 MB  | Total Memory: 7566.967 MB
-```
-
-A standalone demo is available at `examples/profiler_example.py`:
-
-```bash
-uv run python examples/profiler_example.py --profile
-```
+A standalone demo: `uv run python examples/profiler_example.py --profile`
 
 ---
 
 ## Configuration
 
-Runtime defaults live in `config.json` (loaded by the wrapper class) and
-compile-time constants in `sam3/__globals.py`.  Key settings:
+Runtime defaults live in `config.json` and compile-time constants in
+`sam3/__globals.py`.  Key settings:
 
-```jsonc
-{
-  "ram_usage_percent": 0.45,
-  "min_frames": 25,
-  "chunk_overlap": 1,
-  "prefetch_threshold": 0.90,
-  "tmp_base": "/tmp/sam3-cpu",
-  "verbose": true,
-  "image_inference_MB": 6755,
-  "video_inference_MB": 6895
-}
-```
+| Setting | Default | Description |
+|---|---|---|
+| `ram_usage_percent` | 0.975 | Fraction of free RAM used for chunk planning |
+| `min_frames` | 25 | Minimum frames per chunk |
+| `chunk_overlap` | 1 | Overlap frames between chunks |
+| `DEFAULT_CPU_UTILISATION` | 100 | Default CPU utilisation % (overridden by `--cpu-utilisation`) |
+| `MODEL_STATE_MULTIPLIER` | 4.5 | Per-frame memory cost multiplier |
+| `VRAM_HARD_LIMIT_PCT` | 0.975 | Runtime VRAM hard stop threshold |
+| `RAM_HARD_LIMIT_PCT` | 0.975 | Runtime RAM hard stop threshold |
 
 ---
 
@@ -993,7 +830,7 @@ compile-time constants in `sam3/__globals.py`.  Key settings:
 sam3-cpu/
 ├── image_prompter.py          # CLI – image segmentation
 ├── video_prompter.py          # CLI – video segmentation
-├── main.py                    # Legacy CLI entry point
+├── main.py                    # Simple CLI entry point
 ├── config.json                # Runtime configuration
 ├── setup.sh / Makefile        # Build helpers
 │
@@ -1005,24 +842,23 @@ sam3-cpu/
 │   ├── chunk_processor.py     # ChunkProcessor (cross-chunk logic)
 │   ├── postprocessor.py       # VideoPostProcessor
 │   ├── memory_manager.py      # MemoryManager (static chunk planning)
-│   ├── memory_optimizer.py    # IntraChunkMonitor, AdaptiveChunkManager, AdaptiveMultiplier
+│   ├── memory_optimizer.py    # IntraChunkMonitor, AdaptiveChunkManager
 │   ├── memory_predictor.py    # Background OOM predictor
-│   ├── streaming_masks.py     # StreamingMaskWriter, MaskVideoWriter, EmptyMaskPool
+│   ├── streaming_masks.py     # StreamingMaskWriter, MaskVideoWriter
 │   ├── async_io.py            # AsyncIOWorker (background disk writes)
 │   ├── model_builder.py       # Model loading
 │   ├── __globals.py           # Constants & defaults
 │   ├── utils/                 # Utility modules
 │   │   ├── logger.py
-│   │   ├── helpers.py
-│   │   ├── memory_sampler.py  # Background RSS/VRAM sampler
 │   │   ├── profiler.py
+│   │   ├── memory_sampler.py
 │   │   ├── system_info.py
 │   │   ├── ffmpeglib.py
 │   │   └── visualization.py
 │   ├── model/                 # SAM 3 model definitions
 │   └── sam/                   # SAM core modules
 │
-├── examples/                  # Runnable example scripts
+├── examples/                  # Runnable example scripts (a–i)
 ├── notebook/                  # Jupyter notebooks
 ├── tests/                     # Pytest test suite
 ├── scripts/                   # Utility scripts
@@ -1034,63 +870,20 @@ sam3-cpu/
 
 ## Testing
 
-The test suite lives in `tests/` and uses **pytest**.  Tests are designed to run
+The test suite lives in `tests/` and uses **pytest**.  Tests run
 **without the SAM3 model** — they exercise helper functions, IoU logic,
 stitching, and metadata generation using synthetic data.
-
-### Test files
-
-| File | What it covers |
-|---|---|
-| `test_iou_matching.py` | IoU computation, mask matching between chunks |
-| `test_cross_chunk.py` | Cross-chunk ID remapping and continuity |
-| `test_video_prompter.py` | Video prompter helpers — streaming mask pipeline, stitching, overlay, timestamp parsing, range resolution, object tracking, EmptyMaskPool, MaskVideoWriter |
-| `test_chunks_injection.py` | Chunk injection and boundary handling |
-| `test_postprocessor_isolated.py` | Post-processing logic in isolation |
-| `test_intra_chunk_monitor.py` | IntraChunkMonitor calibration, checkpoints, hard-stop logic, AdaptiveMultiplier learning |
-| `test_all_scenarios.py` | End-to-end scenarios (requires model + assets — skipped when unavailable) |
-| `conftest.py` | Shared fixtures: asset paths, temp directories, markers |
-
-### Running tests
 
 ```bash
 # Full suite
 uv run python -m pytest tests/ -v
 
+# Fast tests only (skip model-dependent)
+uv run python -m pytest tests/ -v -m "not slow"
+
 # Single file
 uv run python -m pytest tests/test_video_prompter.py -v
-
-# Single test class or method
-uv run python -m pytest tests/test_video_prompter.py::TestParseTimestamp -v
-uv run python -m pytest tests/test_video_prompter.py::TestBuildObjectTracking::test_frame_offset -v
-
-# Skip slow / model-dependent tests
-uv run python -m pytest tests/ -v -m "not slow"
 ```
-
-### Injecting your own test data
-
-The unit tests create **synthetic videos and masks** on-the-fly (via OpenCV), so
-no real assets are needed.  To test with your own data:
-
-1. **Add assets** — place images in `assets/images/` and videos in
-   `assets/videos/`.  The fixtures in `conftest.py` will pick them up.
-2. **Write a fixture** — add a new `@pytest.fixture` in `conftest.py` that
-   points to your file:
-    ```python
-    @pytest.fixture(scope="session")
-    def my_custom_video(assets_dir):
-        path = assets_dir / "videos" / "my_clip.mp4"
-        if not path.exists():
-            pytest.skip(f"Custom video not found: {path}")
-        return str(path)
-    ```
-3. **Use the fixture** in your test function:
-    ```python
-    def test_my_clip(my_custom_video, temp_output_dir):
-        # run processing and assert on results
-        ...
-    ```
 
 Available markers: `@pytest.mark.slow`, `@pytest.mark.gpu`,
 `@pytest.mark.image`, `@pytest.mark.video`.
@@ -1099,33 +892,22 @@ Available markers: `@pytest.mark.slow`, `@pytest.mark.gpu`,
 
 ## Known Limitations
 
-- **Cross-chunk object ID reassignment** — Videos are processed in memory-sized
-  chunks.  Object IDs are kept consistent across chunk boundaries using
-  IoU-based mask matching.  However, if an object **disappears in the middle of
-  a chunk** and **reappears in a later chunk** with no overlapping mask in the
-  boundary region, it will be assigned a **new ID**.  The same real-world object
-  may therefore be counted multiple times in the tracking metadata.  This is an
-  inherent trade-off of chunk-based processing without a global re-identification
-  step.
+- **Cross-chunk object ID reassignment** — If an object disappears mid-chunk
+  and reappears in a later chunk with no overlapping mask at the boundary, it
+  gets a new ID.
 
 - **CPU inference speed** — Running the full SAM 3 model on CPU is
-  significantly slower than GPU.  Use `--frame-range` / `--time-range` to
-  process only the segment you need, or consider GPU acceleration for
-  production workloads.
+  significantly slower than GPU even with bfloat16 + HT optimisations.
+  Use `--frame-range` / `--time-range` to process only the segment you need.
 
-- **macOS / Windows support** — The project is tested primarily on Linux.
-  macOS works for most workflows but may have edge-case differences with
-  ffmpeg builds.  Windows support is not yet validated (see
-  [Future Work](#future-work)).
+- **macOS / Windows** — Tested primarily on Linux.  macOS works for most
+  workflows; Windows support is not yet validated.
 
 ---
 
 ## Contributing
 
-Contributions are welcome!  Whether it's a bug fix, a new feature, or improved
-documentation — we'd love your input.
-
-### How to contribute
+Contributions are welcome!
 
 1. **Fork** the repository on GitHub.
 2. **Create a feature branch** from `main`:
@@ -1133,16 +915,7 @@ documentation — we'd love your input.
    git checkout -b feature/my-improvement
    ```
 3. **Make your changes** and add tests where appropriate.
-4. **Open a Pull Request** against `main` with a clear description of the
-   change and its motivation.
-
-### Becoming a contributor / maintainer
-
-If you'd like to be added as a regular contributor or maintainer, please
-[open a GitHub Issue](https://github.com/rhubarb-ai/sam3-cpu/issues/new)
-with the title **"Contributor request"** and a brief description of your
-background and intended contributions.  GitHub Issues are the preferred
-channel for all project-level discussions.
+4. **Open a Pull Request** against `main` with a clear description.
 
 ### Guidelines
 
@@ -1155,21 +928,12 @@ channel for all project-level discussions.
 
 ## Future Work
 
-- **Docker support** — Provide a `Dockerfile` + `docker-compose.yml` for
-  reproducible, one-command deployment.
-- **Full macOS compatibility** — Validate and fix edge cases on Intel and
-  Apple Silicon Macs.
-- **Windows compatibility** — Test and adapt for native Windows and WSL
-  environments.
-- **Performance optimisation** — Further speed-up through model quantisation,
-  batched inference, and frame-level parallelism to reduce wall-clock time
-  on CPU.
-- **H.265 mask encoding** — Investigate H.265 (HEVC) for mask videos to
-  further reduce file size while maintaining lossless quality.
-- **Real-time preview** — Leverage the streaming mask pipeline to provide
-  live preview of segmentation during processing.
-- **Multi-GPU batch processing** — Distribute chunks across multiple GPUs
-  for linear speed-up on multi-GPU servers.
+- **Docker support** — `Dockerfile` + `docker-compose.yml` for one-command deployment.
+- **Full macOS / Windows compatibility** — Validate on Intel Mac, Apple Silicon, and WSL.
+- **Model quantisation** — INT8 / INT4 quantisation for further CPU speedup.
+- **H.265 mask encoding** — HEVC for smaller mask videos while maintaining lossless quality.
+- **Real-time preview** — Leverage the streaming mask pipeline for live preview during processing.
+- **Multi-GPU batch processing** — Distribute chunks across GPUs for linear speed-up.
 
 ---
 
@@ -1220,10 +984,9 @@ the original SAM 3 paper and this repository.
 
 ## License
 
-This project is released under the **SAM License** — see [LICENSE](LICENSE) for the
-full text.  The license covers both the wrapper code and the underlying SAM 3
-model weights.  Please review the license terms before redistribution or
-commercial use.
+This project is released under the **SAM License** — see [LICENSE](LICENSE) for
+the full text.  The license covers both the wrapper code and the underlying
+SAM 3 model weights.
 
 ---
 

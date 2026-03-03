@@ -370,6 +370,9 @@ class Sam3VideoInference(Sam3VideoBase):
         Perform inference on a single frame and get its inference results. This would
         also update `inference_state`.
         """
+        import time as _time
+
+        _t0 = _time.perf_counter()
         # prepare inputs
         input_batch = inference_state["input_batch"]
         tracker_states_local = inference_state["tracker_inference_states"]
@@ -402,6 +405,10 @@ class Sam3VideoInference(Sam3VideoBase):
             orig_vid_width=inference_state["orig_width"],
             is_image_only=inference_state["is_image_only"],
             allow_new_detections=has_text_prompt or has_geometric_prompt,
+        )
+        _t1 = _time.perf_counter()
+        logger.debug(
+            f"[perf] frame {frame_idx}: _det_track_one_frame={(_t1-_t0)*1000:.0f}ms"
         )
         # update inference state
         inference_state["tracker_inference_states"] = tracker_states_local_new

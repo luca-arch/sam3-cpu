@@ -175,12 +175,14 @@ class Sam3VideoBase(nn.Module):
         - `tracker_metadata_prev` manages the metadata for SAM2 objects, such as which masklet is hold on which GPUs
           it contains both global and local masklet information
         """
+        import time as _time
 
         # Step 1: run backbone and detector in a distributed manner -- this is done via Sam3ImageOnVideoMultiGPU,
         # a MultiGPU model (assigned to `self.detector`) that shards frames in a round-robin manner.
         # It returns a "det_out" dict for `frame_idx` and fills SAM2 backbone features for `frame_idx`
         # into `feature_cache`. Despite its distributed inference under the hood, the results would be
         # the same as if it is running backbone and detector for every frame on a single GPU.
+        _t1 = _time.perf_counter()
         det_out = self.run_backbone_and_detection(
             frame_idx=frame_idx,
             num_frames=num_frames,
@@ -190,6 +192,7 @@ class Sam3VideoBase(nn.Module):
             feature_cache=feature_cache,
             allow_new_detections=allow_new_detections,
         )
+        _t2 = _time.perf_counter()
 
         # Step 2: each GPU propagates its local SAM2 states to get the SAM2 prediction masks.
         # the returned `tracker_low_res_masks_global` contains the concatenated masklet predictions
@@ -208,6 +211,7 @@ class Sam3VideoBase(nn.Module):
                 tracker_metadata_prev=tracker_metadata_prev,
             )
         )
+        _t3 = _time.perf_counter()
 
         # Step 3: based on detection outputs and the propagated SAM2 prediction masks, we make plans
         # for SAM2 masklet updates (i.e. which objects to add and remove, how to load-balance them, etc).
@@ -229,6 +233,7 @@ class Sam3VideoBase(nn.Module):
                 is_image_only=is_image_only,
             )
         )
+        _t4 = _time.perf_counter()
 
         # Get reconditioning info from the update plan
         reconditioned_obj_ids = tracker_update_plan.get("reconditioned_obj_ids", set())
@@ -248,6 +253,7 @@ class Sam3VideoBase(nn.Module):
             orig_vid_width=orig_vid_width,
             feature_cache=feature_cache,
         )
+        _t5 = _time.perf_counter()
 
         # Step 5: finally, build the outputs for this frame (it only needs to be done on GPU 0 since
         # only GPU 0 will send outputs to the server).
@@ -269,6 +275,19 @@ class Sam3VideoBase(nn.Module):
             obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
         else:
             obj_id_to_mask, obj_id_to_score = {}, {}  # dummy outputs on other GPUs
+        _t6 = _time.perf_counter()
+
+        # Per-frame step timing (visible with DEBUG log level)
+        logger.debug(
+            f"[perf] frame {frame_idx}: "
+            f"backbone+det={(_t2 - _t1)*1000:.0f}ms  "
+            f"tracker_prop={(_t3 - _t2)*1000:.0f}ms  "
+            f"update_plan={(_t4 - _t3)*1000:.0f}ms  "
+            f"update_exec={(_t5 - _t4)*1000:.0f}ms  "
+            f"build_out={(_t6 - _t5)*1000:.0f}ms  "
+            f"total={(_t6 - _t1)*1000:.0f}ms"
+        )
+
         # a few statistics for the current frame as a part of the output
         frame_stats = {
             "num_obj_tracked": np.sum(tracker_metadata_new["num_obj_per_gpu"]),
