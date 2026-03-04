@@ -92,8 +92,8 @@ CROSS_CHUNK_MASK_INJECTION = True
 # across all processed chunks.  On very long videos with many objects this can
 # consume significant RAM.  When either limit is hit, the oldest prompt entries
 # in carry are dropped to free memory.
-CARRY_MAX_RAM_USAGE_PCT = 0.98   # Drop carry entries when RAM usage reaches 98%
-CARRY_MIN_FREE_RAM_GB = 1.0     # Drop carry entries when free RAM drops below 1 GB
+CARRY_MAX_RAM_USAGE_PCT = 0.98  # Drop carry entries when RAM usage reaches 98%
+CARRY_MIN_FREE_RAM_GB = 1.0  # Drop carry entries when free RAM drops below 1 GB
 
 # Memory bank: stores tracker spatial memory features (maskmem_features,
 # maskmem_pos_enc) from the last N frames of each chunk.  After reset, these

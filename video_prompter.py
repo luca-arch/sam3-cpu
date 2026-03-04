@@ -325,7 +325,7 @@ def _trim_carry_if_needed(
     while carry:
         mem = psutil.virtual_memory()
         pct_used = mem.percent / 100.0
-        free_gb = mem.available / (1024 ** 3)
+        free_gb = mem.available / (1024**3)
 
         if pct_used < max_ram_pct and free_gb > min_free_gb:
             break  # within limits
@@ -364,7 +364,7 @@ def _trim_memory_bank_if_needed(
     while memory_banks:
         mem = psutil.virtual_memory()
         pct_used = mem.percent / 100.0
-        free_gb = mem.available / (1024 ** 3)
+        free_gb = mem.available / (1024**3)
 
         if pct_used < max_ram_pct and free_gb >= min_free_gb:
             break  # within limits
@@ -1195,6 +1195,7 @@ def _process_video(
     elif device == "cuda":
         try:
             from sam3.__globals import OFFLOAD_TRACKER_STATE_TO_CPU
+
             _offload_state = OFFLOAD_TRACKER_STATE_TO_CPU
         except ImportError:
             _offload_state = True  # safe default — match drivers.py
@@ -1202,7 +1203,9 @@ def _process_video(
         _offload_state = False
 
     mem_info = _validate_video_memory(
-        video_path, device, max_memory_bytes=_mem_cap,
+        video_path,
+        device,
+        max_memory_bytes=_mem_cap,
         offload_state_to_cpu=_offload_state,
     )
     if _mem_cap:
@@ -1214,6 +1217,22 @@ def _process_video(
         deficit = mem_info.get("deficit_bytes", 0)
         print(f"\033[91m✗ Cannot process video — need {_fmt(deficit)} more memory.\033[0m")
         sys.exit(1)
+
+    # ── Cross-chunk mask injection flag ──
+    try:
+        from sam3.__globals import CROSS_CHUNK_MASK_INJECTION
+
+        _cross_chunk_inject = CROSS_CHUNK_MASK_INJECTION
+    except ImportError:
+        _cross_chunk_inject = True
+
+    # ── Memory bank max frames ──
+    try:
+        from sam3.__globals import MEMORY_BANK_MAX_FRAMES
+
+        _memory_bank_max_frames = MEMORY_BANK_MAX_FRAMES
+    except ImportError:
+        _memory_bank_max_frames = 6
 
     # ----- Chunk plan -----
     print("Creating chunk plan...")
@@ -1315,22 +1334,11 @@ def _process_video(
     # ── Memory bank: per-prompt tracker spatial memory across chunks ──
     # Maps prompt key → list of frame state dicts (newest-first).
     memory_banks: dict[str, list] = {}
-    try:
-        from sam3.__globals import MEMORY_BANK_MAX_FRAMES
-        _memory_bank_max_frames = MEMORY_BANK_MAX_FRAMES
-    except ImportError:
-        _memory_bank_max_frames = 6
-
-    # ── Cross-chunk mask injection flag ──
-    try:
-        from sam3.__globals import CROSS_CHUNK_MASK_INJECTION
-        _cross_chunk_inject = CROSS_CHUNK_MASK_INJECTION
-    except ImportError:
-        _cross_chunk_inject = True
 
     # ── RAM guard thresholds for carry data ──
     try:
         from sam3.__globals import CARRY_MAX_RAM_USAGE_PCT, CARRY_MIN_FREE_RAM_GB
+
         _carry_max_ram_pct = CARRY_MAX_RAM_USAGE_PCT
         _carry_min_free_gb = CARRY_MIN_FREE_RAM_GB
     except ImportError:
@@ -1449,9 +1457,7 @@ def _process_video(
                     # starts with rich context from the previous chunk.
                     if _injected_carry and prompt in memory_banks and memory_banks[prompt]:
                         try:
-                            _n_restored = driver.restore_memory_bank(
-                                session_id, memory_banks[prompt]
-                            )
+                            _n_restored = driver.restore_memory_bank(session_id, memory_banks[prompt])
                             if _n_restored:
                                 print(f"    ↳ Restored {_n_restored} memory frame(s)")
                         except Exception as _mb_err:
@@ -1645,9 +1651,7 @@ def _process_video(
                 # ── Memory bank restoration for point prompts ──
                 if _cross_chunk_inject and ci > 0 and prompt_key in memory_banks and memory_banks[prompt_key]:
                     try:
-                        _n_restored = driver.restore_memory_bank(
-                            session_id, memory_banks[prompt_key]
-                        )
+                        _n_restored = driver.restore_memory_bank(session_id, memory_banks[prompt_key])
                         if _n_restored:
                             print(f"    ↳ Restored {_n_restored} memory frame(s)")
                     except Exception as _mb_err:
@@ -1828,9 +1832,7 @@ def _process_video(
                 # ── Memory bank restoration for mask prompts ──
                 if _cross_chunk_inject and ci > 0 and prompt_key in memory_banks and memory_banks[prompt_key]:
                     try:
-                        _n_restored = driver.restore_memory_bank(
-                            session_id, memory_banks[prompt_key]
-                        )
+                        _n_restored = driver.restore_memory_bank(session_id, memory_banks[prompt_key])
                         if _n_restored:
                             print(f"    ↳ Restored {_n_restored} memory frame(s)")
                     except Exception as _mb_err:
@@ -2130,36 +2132,79 @@ def _process_video(
             mon_result = _early_stop_monitor.finalize()
             cal = mon_result.calibration
 
-            # Use calibration to compute frames that target SHRINK_TARGET_PCT
-            # utilisation.  VRAM = baseline + growth_rate × iterations.
-            # Target: baseline + growth_rate × target_iters = eff_limit × target_pct
-            # → target_iters = (eff_limit × target_pct − baseline) / growth_rate
-            target_pct = adaptive.SHRINK_TARGET_PCT
-            if cal and cal.growth_rate_per_iter > 0 and cal.baseline_bytes > 0 and adaptive.effective_vram_limit > 0:
-                target_vram = adaptive.effective_vram_limit * target_pct
-                target_growth = target_vram - cal.baseline_bytes
-                if target_growth > 0:
-                    target_iters = target_growth / cal.growth_rate_per_iter
-                    safe_frames = max(int(target_iters / 2), adaptive.min_chunk_frames)
-                else:
-                    # Baseline alone exceeds target — use minimum chunk
-                    safe_frames = adaptive.min_chunk_frames
-            elif cal and cal.safe_iterations > 0:
-                # Fallback: safe_iterations = iters to hard limit; scale to target
-                # safe_iterations was computed against hard_pct, so ratio gives
-                # the fraction of that distance we want to use.
-                try:
-                    from sam3.__globals import VRAM_HARD_LIMIT_PCT
+            # Determine whether the stop was triggered by VRAM or RAM.
+            _stop_was_vram = mon_result.stop_reason in (
+                "hard_limit",
+                "predictive_soft_stop",
+                "soft_limit_no_calibration",
+            )
+            _stop_was_ram = mon_result.stop_reason in (
+                "ram_hard_limit",
+                "ram_soft_limit",
+            )
 
-                    hard_pct = VRAM_HARD_LIMIT_PCT
-                except ImportError:
-                    hard_pct = 0.975
-                safe_frames = max(
-                    int(cal.safe_iterations // 2 * (target_pct / hard_pct)),
+            # ── Special case: offload_state_to_cpu + VRAM-triggered stop ──
+            # When offloading is active, per-frame state accumulates in RAM,
+            # NOT VRAM.  VRAM usage is approximately frame-independent (model
+            # weights + forward-pass peak + caching allocator overhead).  A
+            # VRAM soft/hard stop in this mode means the forward-pass peak is
+            # intrinsically high — reducing chunk size will NOT reduce VRAM
+            # usage.  Instead, apply a modest reduction (SHRINK_WARNING_FACTOR)
+            # based on the frames that were actually processed successfully,
+            # and let the intra-chunk monitor manage VRAM on the next chunk.
+            if _offload_state and _stop_was_vram:
+                # The actually-processed frames already worked — the VRAM peak
+                # is structural, not frame-driven.  Keep most of them.
+                if _partial_frames_processed > 0:
+                    safe_frames = max(
+                        int(_partial_frames_processed * adaptive.SHRINK_WARNING_FACTOR),
+                        adaptive.min_chunk_frames,
+                    )
+                else:
+                    safe_frames = max(
+                        int(current_chunk_frames * adaptive.SHRINK_WARNING_FACTOR),
+                        adaptive.min_chunk_frames,
+                    )
+            else:
+                # ── Standard path: use calibration to compute frames that target
+                # SHRINK_TARGET_PCT of the *bounding* resource.
+                # mem = baseline + growth_rate × iterations
+                # target: baseline + growth_rate × target_iters = eff_limit × target_pct
+                # → target_iters = (eff_limit × target_pct − baseline) / growth_rate
+                _eff_limit = adaptive._effective_limit  # RAM when offloading, VRAM otherwise
+                target_pct = adaptive.SHRINK_TARGET_PCT
+                if cal and cal.growth_rate_per_iter > 0 and cal.baseline_bytes > 0 and _eff_limit > 0:
+                    target_mem = _eff_limit * target_pct
+                    target_growth = target_mem - cal.baseline_bytes
+                    if target_growth > 0:
+                        target_iters = target_growth / cal.growth_rate_per_iter
+                        safe_frames = max(int(target_iters / 2), adaptive.min_chunk_frames)
+                    else:
+                        safe_frames = adaptive.min_chunk_frames
+                elif cal and cal.safe_iterations > 0:
+                    try:
+                        from sam3.__globals import VRAM_HARD_LIMIT_PCT
+
+                        hard_pct = VRAM_HARD_LIMIT_PCT
+                    except ImportError:
+                        hard_pct = 0.975
+                    safe_frames = max(
+                        int(cal.safe_iterations // 2 * (target_pct / hard_pct)),
+                        adaptive.min_chunk_frames,
+                    )
+                else:
+                    safe_frames = current_chunk_frames // 2
+
+            # ── Floor: never shrink below a fraction of actually-processed frames ──
+            # If we successfully processed N frames, shrinking to N/30 is absurd.
+            # Keep at least 50% of what actually worked (the monitor will catch
+            # overshoot on the next chunk if needed).
+            if _partial_frames_processed > 0:
+                _actual_floor = max(
+                    int(_partial_frames_processed * 0.50),
                     adaptive.min_chunk_frames,
                 )
-            else:
-                safe_frames = current_chunk_frames // 2  # last resort: halve
+                safe_frames = max(safe_frames, _actual_floor)
 
             safe_frames = max(safe_frames, adaptive.min_chunk_frames)
             adaptive.current_chunk_size = safe_frames
@@ -2226,11 +2271,12 @@ def _process_video(
 
                 frames_processed += _partial_frames_processed
 
+                _bounding_label = "RAM" if _offload_state else "VRAM"
+                _stop_note = " (VRAM-bounded, offloading active)" if _offload_state and _stop_was_vram else ""
                 print(
-                    f"\033[93m  ⚠ Proactive stop on chunk {ci + 1}: {mon_result.stop_reason}. "
+                    f"\033[93m  ⚠ Proactive stop on chunk {ci + 1}: {mon_result.stop_reason}{_stop_note}. "
                     f"Saved {_partial_frames_processed} frames. "
-                    f"Targeting {target_pct:.0%} VRAM utilisation → "
-                    f"next chunk: {current_chunk_frames} → {safe_frames} frames\033[0m"
+                    f"Next chunk: {current_chunk_frames} → {safe_frames} frames\033[0m"
                 )
 
                 new_chunks = adaptive.replan_remaining(resume_frame, total_frames_in_video, overlap)
@@ -2242,9 +2288,11 @@ def _process_video(
                 chunk_cursor += 1  # advance past partial chunk
             else:
                 # No partial frames — retry from start_frame (old behavior)
+                _bounding_label = "RAM" if _offload_state else "VRAM"
+                _stop_note = " (VRAM-bounded, offloading active)" if _offload_state and _stop_was_vram else ""
                 print(
-                    f"\033[93m  ⚠ Proactive stop on chunk {ci + 1}: {mon_result.stop_reason}. "
-                    f"Targeting {target_pct:.0%} → next chunk: {current_chunk_frames} → {safe_frames} frames\033[0m"
+                    f"\033[93m  ⚠ Proactive stop on chunk {ci + 1}: {mon_result.stop_reason}{_stop_note}. "
+                    f"Next chunk: {current_chunk_frames} → {safe_frames} frames\033[0m"
                 )
 
                 new_chunks = adaptive.replan_remaining(start_frame, total_frames_in_video, overlap)
@@ -2672,15 +2720,15 @@ Examples:
         action="store_true",
         default=None,
         help="Offload per-frame tracker state from VRAM to RAM (GPU only). "
-             "Keeps VRAM flat at the cost of ~10-15%% slower propagation. "
-             "Enabled by default on CUDA; pass this flag to force it on.",
+        "Keeps VRAM flat at the cost of ~10-15%% slower propagation. "
+        "Enabled by default on CUDA; pass this flag to force it on.",
     )
     parser.add_argument(
         "--no-offload-state-to-cpu",
         action="store_true",
         default=False,
         help="Disable tracker state offloading (keep all state on GPU). "
-             "Uses more VRAM but avoids the ~10-15%% propagation overhead.",
+        "Uses more VRAM but avoids the ~10-15%% propagation overhead.",
     )
 
     args = parser.parse_args()
@@ -2765,11 +2813,11 @@ Examples:
         print(f"  CPU util: {args.cpu_utilisation}%")
     if device == "cuda":
         if offload_state is True:
-            print(f"  Offload : ON  (forced via CLI)")
+            print("  Offload : ON  (forced via CLI)")
         elif offload_state is False:
-            print(f"  Offload : OFF (forced via CLI)")
+            print("  Offload : OFF (forced via CLI)")
         else:
-            print(f"  Offload : auto (from __globals.py)")
+            print("  Offload : auto (from __globals.py)")
     print(f"  Output  : {args.output}")
     print(f"  Alpha   : {args.alpha}")
     print(f"  Chunking: {args.chunk_spread}")

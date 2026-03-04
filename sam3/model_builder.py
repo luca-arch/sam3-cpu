@@ -9,8 +9,6 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from iopath.common.file_io import g_pathmgr
 
-from sam3.utils.profiler import profile
-
 from sam3.model.decoder import (
     TransformerDecoder,
     TransformerDecoderLayer,
@@ -47,6 +45,7 @@ from sam3.model.tokenizer_ve import SimpleTokenizer
 from sam3.model.vitdet import ViT
 from sam3.model.vl_combiner import SAM3VLBackbone
 from sam3.sam.transformer import RoPEAttention
+from sam3.utils.profiler import profile
 
 
 # Setup TensorFloat-32 for Ampere GPUs if available

@@ -511,7 +511,7 @@ Examples:
         action="store_true",
         default=False,
         help="Accepted for CLI consistency with video_prompter.py. "
-             "Has no effect on image inference (single-frame, no tracker state).",
+        "Has no effect on image inference (single-frame, no tracker state).",
     )
 
     args = parser.parse_args()

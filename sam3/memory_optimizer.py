@@ -695,6 +695,7 @@ class AdaptiveChunkManager:
         # Load GROW_TARGET_PCT from globals (user may tune it)
         try:
             from sam3.__globals import GPU_TARGET_UTILISATION_PCT
+
             self.GROW_TARGET_PCT = GPU_TARGET_UTILISATION_PCT
         except ImportError:
             pass  # keep the class default
@@ -727,6 +728,7 @@ class AdaptiveChunkManager:
         """
         try:
             from sam3.__globals import CPU_MEMORY_RESERVE_PERCENT
+
             reserve_pct = CPU_MEMORY_RESERVE_PERCENT
         except ImportError:
             reserve_pct = 0.30
@@ -924,6 +926,23 @@ class AdaptiveChunkManager:
         usage_pct = peak_for_pct / eff if eff > 0 else 0.0
 
         # Determine action
+        #
+        # ── Recovery heuristic ──
+        # After a previous SHRINK or proactive stop, the chunk size may
+        # have collapsed far below what the system can actually handle.
+        # If this chunk completed normally with low pressure, we should
+        # grow back aggressively even if usage_pct > GROW_THRESHOLD
+        # (the threshold was designed for steady-state, not recovery).
+        _recovering = (
+            len(self.chunk_history) >= 1
+            and self.chunk_history[-1].action in ("SHRINK",)
+            and chunk_size < self.initial_chunk_size * 0.5
+        )
+        # Also detect recovery from external rechunk events (proactive stops
+        # set current_chunk_size directly, so history may show no SHRINK).
+        if not _recovering and self.rechunk_events and chunk_size < self.initial_chunk_size * 0.5:
+            _recovering = True
+
         if pressure in (MemoryPressure.CRITICAL, MemoryPressure.WARNING):
             new_size = self._compute_target_chunk_size(
                 chunk_size,
@@ -933,24 +952,22 @@ class AdaptiveChunkManager:
                 baseline_vram_bytes=baseline_vram_bytes,
             )
             action = "SHRINK"
-        elif pressure == MemoryPressure.NORMAL and usage_pct < self.GROW_THRESHOLD and not soft_warning_seen:
-            # ── Calibration-based GROW ──
-            # When we have the heaviest prompt's growth rate + baseline,
-            # compute exactly how many frames fit before GROW_TARGET_PCT.
+        elif (
+            pressure == MemoryPressure.NORMAL
+            and (usage_pct < self.GROW_THRESHOLD or _recovering)
+            and not soft_warning_seen
+        ):
+            # ── GROW path ──
             #
-            #   mem = baseline + growth_rate × iterations
-            #   target_iters = (eff_limit × target_pct − baseline) / growth_rate
-            #   target_frames = target_iters / 2   ("both" = 2× frames)
-            #
-            # This is aggressive by design: the intra-chunk monitor with
-            # its soft (85%) + hard (97.5%) limits will catch any
-            # overshoot and save partial results, so under-utilising memory
-            # here only hurts accuracy (more chunk boundaries) with no
-            # safety upside.
+            # When offloading is active, VRAM calibration (baseline + slope)
+            # does NOT predict RAM growth, so skip calibration-based sizing
+            # and use the dampened-multiplier fallback instead.
             import math
 
+            _offloading = self.offload_state_to_cpu and self.device.startswith("cuda")
+
             calibration_grow = None
-            if growth_rate_per_iter > 0 and baseline_vram_bytes > 0 and eff > 0:
+            if not _offloading and growth_rate_per_iter > 0 and baseline_vram_bytes > 0 and eff > 0:
                 target_mem = eff * self.GROW_TARGET_PCT
                 target_growth = target_mem - baseline_vram_bytes
                 if target_growth > 0:
@@ -959,8 +976,6 @@ class AdaptiveChunkManager:
 
             if calibration_grow is not None:
                 # ── Calibration path: exact targeting ──
-                # Floor: never grow less than the old dampened-multiplier
-                # would give (so calibration errors can only help, not hurt).
                 n = max(n_objects, 1)
                 dampened_floor = int(chunk_size * (1.0 + (self.GROW_FACTOR - 1.0) / (1.0 + math.log2(n))))
                 new_size = max(calibration_grow, dampened_floor)
@@ -968,6 +983,14 @@ class AdaptiveChunkManager:
                 # ── Fallback: dampened multiplier (no calibration data) ──
                 n = max(n_objects, 1)
                 dampened_growth = 1.0 + (self.GROW_FACTOR - 1.0) / (1.0 + math.log2(n))
+
+                # Recovery boost: when chunk size is far below initial,
+                # grow more aggressively to reclaim utilisation quickly.
+                if _recovering:
+                    # Target: grow towards initial_chunk_size in ~2 steps.
+                    # Use at least 2× growth, capped by max_growth_factor.
+                    recovery_target = max(self.initial_chunk_size // 2, chunk_size * 2)
+                    dampened_growth = max(dampened_growth, recovery_target / max(chunk_size, 1))
 
                 # Trend adjustment: compare current n_objects with previous chunk
                 if len(self.chunk_history) >= 1:

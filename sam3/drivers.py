@@ -43,7 +43,13 @@ class Sam3ImageDriver:
         predictor: The underlying SAM3 model predictor instance.
     """
 
-    def __init__(self, bpe_path: str = BPE_PATH, num_workers: int | None = 1, device: str | None = None, cpu_utilisation: int = 100):
+    def __init__(
+        self,
+        bpe_path: str = BPE_PATH,
+        num_workers: int | None = 1,
+        device: str | None = None,
+        cpu_utilisation: int = 100,
+    ):
         """Initialize the SAM3 image driver.
 
         Args:
@@ -116,7 +122,9 @@ class Sam3ImageDriver:
                 torch.set_num_interop_threads(1)
             except RuntimeError:
                 pass  # can only be set once per process
-            logger.info(f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()} (utilisation={self._cpu_utilisation}%, logical_cores={logical_cores})")
+            logger.info(
+                f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()} (utilisation={self._cpu_utilisation}%, logical_cores={logical_cores})"
+            )
 
             # Enable bfloat16 autocast on CPU for modern processors (last ~3 years).
             # Coverage:
@@ -486,7 +494,13 @@ class Sam3VideoDriver:
         predictor: The underlying SAM3 video predictor instance (CPU or GPU variant).
     """
 
-    def __init__(self, bpe_path: str | None = BPE_PATH, num_workers: int | None = 1, device: str | None = None, cpu_utilisation: int = 100):
+    def __init__(
+        self,
+        bpe_path: str | None = BPE_PATH,
+        num_workers: int | None = 1,
+        device: str | None = None,
+        cpu_utilisation: int = 100,
+    ):
         """Initialize the SAM3 video driver.
 
         Args:
@@ -542,7 +556,9 @@ class Sam3VideoDriver:
                 torch.set_num_interop_threads(1)
             except RuntimeError:
                 pass  # can only be set once per process
-            logger.info(f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()} (utilisation={self._cpu_utilisation}%, logical_cores={logical_cores})")
+            logger.info(
+                f"CPU threads: intra-op={torch.get_num_threads()}, inter-op={torch.get_num_interop_threads()} (utilisation={self._cpu_utilisation}%, logical_cores={logical_cores})"
+            )
 
             # Enable bfloat16 autocast on CPU for modern processors (last ~3 years).
             # Coverage:
@@ -1326,6 +1342,7 @@ class Sam3VideoDriver:
             if device == "cuda":
                 try:
                     from sam3.__globals import OFFLOAD_TRACKER_STATE_TO_CPU
+
                     offload_state_to_cpu = OFFLOAD_TRACKER_STATE_TO_CPU
                 except ImportError:
                     offload_state_to_cpu = True
@@ -1340,10 +1357,7 @@ class Sam3VideoDriver:
             )
         )
         if offload_state_to_cpu:
-            logger.info(
-                "Tracker state offloading to CPU enabled — "
-                "VRAM growth during propagation will be bounded."
-            )
+            logger.info("Tracker state offloading to CPU enabled — VRAM growth during propagation will be bounded.")
         return response["session_id"]
 
     @profile()
