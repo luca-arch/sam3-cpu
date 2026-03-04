@@ -95,6 +95,14 @@ CROSS_CHUNK_MASK_INJECTION = True
 CARRY_MAX_RAM_USAGE_PCT = 0.98   # Drop carry entries when RAM usage reaches 98%
 CARRY_MIN_FREE_RAM_GB = 1.0     # Drop carry entries when free RAM drops below 1 GB
 
+# Memory bank: stores tracker spatial memory features (maskmem_features,
+# maskmem_pos_enc) from the last N frames of each chunk.  After reset, these
+# are re-injected at negative frame indices so the tracker starts the new
+# chunk with contextual memory from the previous chunk rather than a blank
+# state.  num_maskmem=7 means the tracker uses at most 6 non-cond memory
+# frames, so 6 is the effective useful maximum.
+MEMORY_BANK_MAX_FRAMES = 6
+
 # Parallel processing
 PARALLEL_CHUNK_THRESHOLD = 0.90  # Start loading next chunk at 90% completion
 

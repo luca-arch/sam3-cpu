@@ -1152,6 +1152,128 @@ class Sam3VideoInference(Sam3VideoBase):
 
         return injected_ids
 
+    # ------------------------------------------------------------------ #
+    #  Memory bank: extract / restore tracker spatial memory across chunks #
+    # ------------------------------------------------------------------ #
+
+    @torch.inference_mode()
+    def extract_memory_bank(self, inference_state, max_frames=6):
+        """Extract spatial memory frames from tracker states before reset.
+
+        Collects the last *max_frames* non-conditioning frame outputs
+        (sorted newest-first) from every tracker inference state.  Each
+        entry contains full per-frame state (maskmem_features,
+        maskmem_pos_enc, obj_ptr, pred_masks, object_score_logits) cloned
+        to CPU so they survive an upcoming ``reset_state`` call.
+
+        Args:
+            inference_state: Current inference state dict.
+            max_frames: Maximum number of memory frames to keep.
+
+        Returns:
+            List of state dicts, ordered newest-first by frame index.
+        """
+        import numpy as np  # noqa: F811
+
+        bank: list[dict] = []
+        for ts in inference_state.get("tracker_inference_states", []):
+            output_dict = ts.get("output_dict", {})
+            # Prefer non-cond frames (richer propagated outputs)
+            for storage_key in ["non_cond_frame_outputs", "cond_frame_outputs"]:
+                entries = output_dict.get(storage_key, {})
+                for fidx, out in entries.items():
+                    if out is None:
+                        continue
+                    mmf = out.get("maskmem_features")
+                    if mmf is None:
+                        continue
+                    entry: dict = {"_src_frame_idx": fidx, "_storage_key": storage_key}
+                    for k in ("maskmem_features", "obj_ptr", "pred_masks", "object_score_logits"):
+                        v = out.get(k)
+                        if v is not None and isinstance(v, torch.Tensor):
+                            entry[k] = v.detach().cpu().clone()
+                        else:
+                            entry[k] = v
+                    mpe = out.get("maskmem_pos_enc")
+                    if mpe is not None:
+                        entry["maskmem_pos_enc"] = [
+                            p.detach().cpu().clone() if isinstance(p, torch.Tensor) else p
+                            for p in mpe
+                        ]
+                    else:
+                        entry["maskmem_pos_enc"] = None
+                    bank.append(entry)
+
+        # Sort newest-first and trim
+        bank.sort(key=lambda x: x["_src_frame_idx"], reverse=True)
+        bank = bank[:max_frames]
+        logger.debug(
+            f"extract_memory_bank: collected {len(bank)} frame(s) "
+            f"(source indices: {[e['_src_frame_idx'] for e in bank]})"
+        )
+        return bank
+
+    @torch.inference_mode()
+    def restore_memory_bank(self, inference_state, memory_bank):
+        """Insert previously extracted memory frames into the latest tracker state.
+
+        Memory frames are placed at negative frame indices (-1, -2, …) in
+        ``output_dict["non_cond_frame_outputs"]``.  The tracker's standard
+        memory-selection loop (``prev_frame_idx = frame_idx - t_rel``)
+        naturally evaluates to negative indices for the first few frames of
+        a new chunk, so these entries are picked up as spatial memory
+        without any modification to the tracker code.
+
+        Must be called **after** ``inject_masks()`` (so a tracker state
+        exists) and **before** ``propagate_in_video()``.
+
+        Args:
+            inference_state: Current inference state dict.
+            memory_bank: List of state dicts from ``extract_memory_bank``.
+
+        Returns:
+            Number of memory frames successfully restored.
+        """
+        if not memory_bank:
+            return 0
+        tis = inference_state.get("tracker_inference_states", [])
+        if not tis:
+            logger.warning("restore_memory_bank: no tracker states available")
+            return 0
+
+        ts = tis[-1]  # latest tracker state (created by inject_masks)
+        output_dict = ts["output_dict"]
+        storage_device = ts.get("storage_device", torch.device("cpu"))
+
+        restored = 0
+        for i, entry in enumerate(memory_bank):
+            neg_idx = -(i + 1)  # -1, -2, -3, …
+            state: dict = {}
+            for k in ("maskmem_features", "obj_ptr", "pred_masks", "object_score_logits"):
+                v = entry.get(k)
+                if v is not None and isinstance(v, torch.Tensor):
+                    state[k] = v.to(storage_device)
+                else:
+                    state[k] = v
+            mpe = entry.get("maskmem_pos_enc")
+            if mpe is not None:
+                state["maskmem_pos_enc"] = [
+                    p.to(storage_device) if isinstance(p, torch.Tensor) else p
+                    for p in mpe
+                ]
+            else:
+                state["maskmem_pos_enc"] = None
+
+            if state.get("maskmem_features") is not None:
+                output_dict["non_cond_frame_outputs"][neg_idx] = state
+                restored += 1
+
+        logger.info(
+            f"restore_memory_bank: inserted {restored} memory frame(s) "
+            f"at indices {list(range(-1, -restored - 1, -1))}"
+        )
+        return restored
+
 
 class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
     def __init__(

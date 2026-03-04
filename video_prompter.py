@@ -344,6 +344,51 @@ def _trim_carry_if_needed(
     return dropped
 
 
+def _trim_memory_bank_if_needed(
+    memory_banks: dict[str, list],
+    max_ram_pct: float,
+    min_free_gb: float,
+) -> int:
+    """Drop oldest memory-bank frames when RAM pressure is too high.
+
+    Similar to ``_trim_carry_if_needed`` but operates on the per-prompt
+    memory bank dicts.  Each iteration drops the oldest entry from the
+    longest bank (past-forgetting: recent frames are preserved, oldest
+    frames are sacrificed first).
+
+    Returns the total number of individual frame entries dropped.
+    """
+    import psutil
+
+    dropped = 0
+    while memory_banks:
+        mem = psutil.virtual_memory()
+        pct_used = mem.percent / 100.0
+        free_gb = mem.available / (1024 ** 3)
+
+        if pct_used < max_ram_pct and free_gb >= min_free_gb:
+            break  # within limits
+
+        # Find the prompt with the longest bank — trim its oldest entry
+        longest_key = max(memory_banks, key=lambda k: len(memory_banks[k]))
+        bank = memory_banks[longest_key]
+        if not bank:
+            del memory_banks[longest_key]
+            continue
+
+        bank.pop()  # drop the oldest (last) entry — bank is newest-first
+        dropped += 1
+        if not bank:
+            del memory_banks[longest_key]
+
+        print(
+            f"\033[93m⚠ RAM guard: dropped memory bank frame for '{longest_key}' "
+            f"— RAM {pct_used:.0%} used, {free_gb:.1f} GB free\033[0m"
+        )
+
+    return dropped
+
+
 # ---------------------------------------------------------------------------
 # IoU + ID remapping (same algorithm as ChunkProcessor)
 # ---------------------------------------------------------------------------
@@ -1183,7 +1228,10 @@ def _process_video(
     n_chunks = len(chunk_list)
     print(f"  {n_chunks} chunk(s), {initial_chunk_size} frames/chunk")
     if n_chunks > 1 and _cross_chunk_inject:
-        print("  Cross-chunk mask injection: ON (carry masks → conditioning frames)")
+        print(
+            f"  Cross-chunk mask injection: ON (carry masks → conditioning frames, "
+            f"memory bank → {_memory_bank_max_frames} spatial frames)"
+        )
 
     # ----- Adaptive chunk manager with auto-detected memory tier -----
     from sam3.memory_optimizer import get_memory_tier
@@ -1263,6 +1311,15 @@ def _process_video(
     carry: dict[str, dict[int, np.ndarray]] = {}
     global_next_ids: dict[str, int] = {}
     all_object_ids: dict[str, set] = {}
+
+    # ── Memory bank: per-prompt tracker spatial memory across chunks ──
+    # Maps prompt key → list of frame state dicts (newest-first).
+    memory_banks: dict[str, list] = {}
+    try:
+        from sam3.__globals import MEMORY_BANK_MAX_FRAMES
+        _memory_bank_max_frames = MEMORY_BANK_MAX_FRAMES
+    except ImportError:
+        _memory_bank_max_frames = 6
 
     # ── Cross-chunk mask injection flag ──
     try:
@@ -1386,6 +1443,20 @@ def _process_video(
                         except Exception as _inj_err:
                             print(f"\033[93m    ⚠ Carry injection failed: {_inj_err}\033[0m")
 
+                    # ── Memory bank restoration ──
+                    # After inject_masks creates a tracker state, restore past
+                    # spatial memory frames at negative indices so propagation
+                    # starts with rich context from the previous chunk.
+                    if _injected_carry and prompt in memory_banks and memory_banks[prompt]:
+                        try:
+                            _n_restored = driver.restore_memory_bank(
+                                session_id, memory_banks[prompt]
+                            )
+                            if _n_restored:
+                                print(f"    ↳ Restored {_n_restored} memory frame(s)")
+                        except Exception as _mb_err:
+                            print(f"\033[93m    ⚠ Memory bank restore failed: {_mb_err}\033[0m")
+
                     driver.add_prompt(session_id, prompt)
 
                     # ── Monitored streaming propagation ──
@@ -1463,6 +1534,16 @@ def _process_video(
                                 video_metadata.get("fps", 25),
                             )
                             carry[prompt] = _extract_last_frame_masks(result, obj_ids)
+
+                            # ── Extract memory bank (partial — still useful for next chunk) ──
+                            if _cross_chunk_inject and n_chunks > 1:
+                                try:
+                                    memory_banks[prompt] = driver.extract_memory_bank(
+                                        session_id, max_frames=_memory_bank_max_frames
+                                    )
+                                except Exception:
+                                    pass
+
                             print(f"    {len(obj_ids)} object(s) (partial)")
 
                             del result, obj_ids, frame_objs
@@ -1521,6 +1602,16 @@ def _process_video(
 
                     # Extract carry-forward
                     carry[prompt] = _extract_last_frame_masks(result, obj_ids)
+
+                    # ── Extract memory bank (spatial memory for next chunk) ──
+                    if _cross_chunk_inject and n_chunks > 1:
+                        try:
+                            memory_banks[prompt] = driver.extract_memory_bank(
+                                session_id, max_frames=_memory_bank_max_frames
+                            )
+                        except Exception:
+                            pass  # non-critical
+
                     print(f"    {len(obj_ids)} object(s)")
 
                     # Free result tensors so GPU memory is available for next prompt
@@ -1550,6 +1641,17 @@ def _process_video(
                         print(f"    ↳ Injected {len(_carry_ids)} mask(s) from previous chunk")
                     except Exception as _inj_err:
                         print(f"\033[93m    ⚠ Carry injection failed: {_inj_err}\033[0m")
+
+                # ── Memory bank restoration for point prompts ──
+                if _cross_chunk_inject and ci > 0 and prompt_key in memory_banks and memory_banks[prompt_key]:
+                    try:
+                        _n_restored = driver.restore_memory_bank(
+                            session_id, memory_banks[prompt_key]
+                        )
+                        if _n_restored:
+                            print(f"    ↳ Restored {_n_restored} memory frame(s)")
+                    except Exception as _mb_err:
+                        print(f"\033[93m    ⚠ Memory bank restore failed: {_mb_err}\033[0m")
 
                 for pi, (pt, lbl) in enumerate(zip(points, point_labels)):
                     driver.add_object_with_points_prompt(
@@ -1683,6 +1785,16 @@ def _process_video(
                         video_metadata.get("fps", 25),
                     )
                     carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
+
+                    # ── Extract memory bank (points normal) ──
+                    if _cross_chunk_inject and n_chunks > 1:
+                        try:
+                            memory_banks[prompt_key] = driver.extract_memory_bank(
+                                session_id, max_frames=_memory_bank_max_frames
+                            )
+                        except Exception:
+                            pass
+
                     print(f"    {len(obj_ids)} object(s)")
 
                     # Free result tensors so GPU memory is available for next prompt
@@ -1712,6 +1824,17 @@ def _process_video(
                         print(f"    ↳ Injected {len(_carry_ids)} mask(s) from previous chunk")
                     except Exception as _inj_err:
                         print(f"\033[93m    ⚠ Carry injection failed: {_inj_err}\033[0m")
+
+                # ── Memory bank restoration for mask prompts ──
+                if _cross_chunk_inject and ci > 0 and prompt_key in memory_banks and memory_banks[prompt_key]:
+                    try:
+                        _n_restored = driver.restore_memory_bank(
+                            session_id, memory_banks[prompt_key]
+                        )
+                        if _n_restored:
+                            print(f"    ↳ Restored {_n_restored} memory frame(s)")
+                    except Exception as _mb_err:
+                        print(f"\033[93m    ⚠ Memory bank restore failed: {_mb_err}\033[0m")
 
                 # Inject each user-provided mask as a separate object
                 mask_dict = {}
@@ -1794,6 +1917,16 @@ def _process_video(
                             video_metadata.get("fps", 25),
                         )
                         carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
+
+                        # ── Extract memory bank (masks partial) ──
+                        if _cross_chunk_inject and n_chunks > 1:
+                            try:
+                                memory_banks[prompt_key] = driver.extract_memory_bank(
+                                    session_id, max_frames=_memory_bank_max_frames
+                                )
+                            except Exception:
+                                pass
+
                         print(f"    {len(obj_ids)} object(s) (partial)")
 
                         del result, obj_ids, frame_objs
@@ -1844,6 +1977,16 @@ def _process_video(
                         video_metadata.get("fps", 25),
                     )
                     carry[prompt_key] = _extract_last_frame_masks(result, obj_ids)
+
+                    # ── Extract memory bank (masks normal) ──
+                    if _cross_chunk_inject and n_chunks > 1:
+                        try:
+                            memory_banks[prompt_key] = driver.extract_memory_bank(
+                                session_id, max_frames=_memory_bank_max_frames
+                            )
+                        except Exception:
+                            pass
+
                     print(f"    {len(obj_ids)} object(s)")
 
                     # Free result tensors
@@ -2219,9 +2362,11 @@ def _process_video(
         chunk_cursor += 1
         ci += 1
 
-        # ── RAM guard: trim carry if memory pressure is high ──
+        # ── RAM guard: trim carry and memory banks if memory pressure is high ──
         if carry:
             _trim_carry_if_needed(carry, _carry_max_ram_pct, _carry_min_free_gb)
+        if memory_banks:
+            _trim_memory_bank_if_needed(memory_banks, _carry_max_ram_pct, _carry_min_free_gb)
 
     chunk_processing_s = round(time.time() - t_chunks_start, 3)
 
@@ -2341,6 +2486,7 @@ def _process_video(
         "num_chunks_processed": ci,
         "overlap_frames": overlap,
         "cross_chunk_mask_injection": _cross_chunk_inject,
+        "memory_bank_max_frames": _memory_bank_max_frames,
         "simulated_limits": {
             "max_vram_gb": max_vram_gb,
             "max_ram_gb": max_ram_gb,

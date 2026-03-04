@@ -23,6 +23,7 @@ from video_prompter import (
     _stitch_masks_to_video,
     _table,
     _trim_carry_if_needed,
+    _trim_memory_bank_if_needed,
 )
 
 # ---------------------------------------------------------------------------
@@ -782,3 +783,67 @@ class TestTrimCarryIfNeeded:
         _trim_carry_if_needed(carry, max_ram_pct=0.0, min_free_gb=0.0)
         # All dropped because pct=0 always exceeds
         assert len(carry) == 0
+
+
+# ---------------------------------------------------------------------------
+# _trim_memory_bank_if_needed
+# ---------------------------------------------------------------------------
+
+
+class TestTrimMemoryBankIfNeeded:
+    """Tests for the RAM guard that drops memory bank entries under pressure."""
+
+    def _make_bank(self, n: int) -> list:
+        """Helper: create a fake memory bank with n entries."""
+        return [{"maskmem_features": f"frame_{i}"} for i in range(n)]
+
+    def test_no_drop_when_within_limits(self):
+        """Banks untouched when RAM is well within limits."""
+        banks = {
+            "person": self._make_bank(6),
+            "ball": self._make_bank(4),
+        }
+        dropped = _trim_memory_bank_if_needed(banks, max_ram_pct=1.0, min_free_gb=0.0)
+        assert dropped == 0
+        assert len(banks["person"]) == 6
+        assert len(banks["ball"]) == 4
+
+    def test_drops_all_when_pct_zero(self):
+        """With max_ram_pct=0 (always exceeded) everything is dropped."""
+        banks = {
+            "a": self._make_bank(3),
+            "b": self._make_bank(2),
+        }
+        dropped = _trim_memory_bank_if_needed(banks, max_ram_pct=0.0, min_free_gb=0.0)
+        assert dropped == 5
+        assert len(banks) == 0
+
+    def test_drops_all_when_free_gb_huge(self):
+        """When min_free_gb is impossibly large, everything is dropped."""
+        banks = {"prompt": self._make_bank(4)}
+        dropped = _trim_memory_bank_if_needed(banks, max_ram_pct=1.0, min_free_gb=99999.0)
+        assert dropped == 4
+        assert len(banks) == 0
+
+    def test_empty_banks_noop(self):
+        """Empty banks dict should be a no-op."""
+        banks: dict[str, list] = {}
+        dropped = _trim_memory_bank_if_needed(banks, max_ram_pct=0.0, min_free_gb=99999.0)
+        assert dropped == 0
+
+    def test_longest_bank_trimmed_first(self):
+        """Oldest entry from the longest bank is dropped first."""
+        banks = {
+            "short": self._make_bank(1),
+            "long": self._make_bank(6),
+        }
+        # Force all to drop
+        _trim_memory_bank_if_needed(banks, max_ram_pct=0.0, min_free_gb=0.0)
+        assert len(banks) == 0
+
+    def test_preserves_newest_drops_oldest(self):
+        """Newest entries (low indices) are preserved; oldest (high indices) dropped."""
+        banks = {"p": [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}]}
+        # Force all drops
+        _trim_memory_bank_if_needed(banks, max_ram_pct=0.0, min_free_gb=0.0)
+        assert len(banks) == 0

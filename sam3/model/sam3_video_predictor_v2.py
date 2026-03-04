@@ -92,6 +92,16 @@ class Sam3VideoPredictor:
                 masks=request["masks"],
                 object_ids=request["object_ids"],
             )
+        elif request_type == "extract_memory_bank":
+            return self.extract_memory_bank(
+                session_id=request["session_id"],
+                max_frames=request.get("max_frames", 6),
+            )
+        elif request_type == "restore_memory_bank":
+            return self.restore_memory_bank(
+                session_id=request["session_id"],
+                memory_bank=request["memory_bank"],
+            )
         elif request_type == "reset_session":
             return self.reset_session(session_id=request["session_id"])
         elif request_type == "close_session":
@@ -278,6 +288,25 @@ class Sam3VideoPredictor:
             object_ids=object_ids,
         )
         return {"injected_object_ids": injected_ids}
+
+    def extract_memory_bank(self, session_id, max_frames=6):
+        """Extract spatial memory from tracker states (before reset) for later restoration."""
+        logger.debug(f"extract_memory_bank in session {session_id}: {max_frames=}")
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+        bank = self.model.extract_memory_bank(inference_state, max_frames=max_frames)
+        return {"memory_bank": bank}
+
+    def restore_memory_bank(self, session_id, memory_bank):
+        """Restore previously extracted memory frames into the current tracker state."""
+        logger.debug(
+            f"restore_memory_bank in session {session_id}: "
+            f"{len(memory_bank) if memory_bank else 0} frame(s)"
+        )
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+        n = self.model.restore_memory_bank(inference_state, memory_bank)
+        return {"restored_frames": n}
 
     def reset_session(self, session_id):
         """Reset the session to its initial state (as when it's initial opened)."""

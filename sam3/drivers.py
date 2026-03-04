@@ -1006,6 +1006,67 @@ class Sam3VideoDriver:
         return response
 
     @profile()
+    def extract_memory_bank(self, session_id: str, max_frames: int = 6) -> list:
+        """Extract spatial memory frames from the tracker before a session reset.
+
+        Returns a list of per-frame state dicts (newest-first) that can later be
+        re-injected via ``restore_memory_bank`` to give the tracker contextual
+        memory at the start of a new chunk.  Each entry contains the tracker's
+        ``maskmem_features``, ``maskmem_pos_enc`` and auxiliary fields, cloned
+        to CPU.
+
+        Args:
+            session_id: Active session identifier.
+            max_frames: Maximum number of memory frames to retain.
+
+        Returns:
+            List of memory-frame dicts, ordered most-recent first.
+        """
+        if self.predictor is None:
+            raise ValueError("Model is not loaded.")
+        response = self.predictor.handle_request(
+            request=dict(
+                type="extract_memory_bank",
+                session_id=session_id,
+                max_frames=max_frames,
+            )
+        )
+        return response.get("memory_bank", [])
+
+    @profile()
+    def restore_memory_bank(self, session_id: str, memory_bank: list) -> int:
+        """Restore previously extracted memory frames into the current tracker state.
+
+        Memory entries are placed at negative frame indices in the tracker's
+        ``output_dict["non_cond_frame_outputs"]``.  The tracker's standard
+        memory-selection loop naturally reaches these indices for the first
+        few propagation frames, providing spatial context from the previous
+        chunk without any modification to the tracker itself.
+
+        Must be called **after** ``inject_masks()`` (which creates the target
+        tracker state) and **before** ``propagate_in_video()``.
+
+        Args:
+            session_id: Active session identifier.
+            memory_bank: List of state dicts from ``extract_memory_bank``.
+
+        Returns:
+            Number of memory frames successfully inserted.
+        """
+        if self.predictor is None:
+            raise ValueError("Model is not loaded.")
+        if not memory_bank:
+            return 0
+        response = self.predictor.handle_request(
+            request=dict(
+                type="restore_memory_bank",
+                session_id=session_id,
+                memory_bank=memory_bank,
+            )
+        )
+        return response.get("restored_frames", 0)
+
+    @profile()
     def remove_object(self, session_id: str, object_id: int):
         """Remove an object from the video segmentation session.
 

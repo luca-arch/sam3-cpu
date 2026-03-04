@@ -51,6 +51,7 @@
   - [Best Practices](#best-practices)
 - [Cross-Chunk Mask Injection](#cross-chunk-mask-injection)
   - [How It Works](#how-it-works-1)
+  - [Memory Bank](#memory-bank)
   - [RAM Guard](#ram-guard)
   - [Drawbacks & Trade-offs](#drawbacks--trade-offs)
 - [Output Structure](#output-structure)
@@ -474,6 +475,7 @@ results back together.
 | `chunk_overlap` | 1 | Overlap frames between chunks |
 | `CHUNK_MASK_MATCHING_IOU_THRESHOLD` | 0.75 | IoU threshold for cross-chunk ID matching |
 | `CROSS_CHUNK_MASK_INJECTION` | `True` | Inject carry masks as conditioning frames at chunk boundaries |
+| `MEMORY_BANK_MAX_FRAMES` | `6` | Max spatial-memory frames to backup per prompt across chunks |
 
 ### Memory Management Architecture
 
@@ -691,11 +693,15 @@ tracker has no knowledge of objects found in previous chunks.  Object
 continuity relies solely on **IoU matching** at the 1-frame overlap boundary,
 which is fragile for small or fast-moving objects.
 
-**Cross-chunk mask injection** improves accuracy by injecting the previous
-chunk's last-frame masks into the new chunk as **conditioning frames** before
-the text/point prompt is even added.  This gives the tracker a "warm start":
-it already knows where objects are, so propagation begins with a strong prior
-rather than relying on re-detection alone.
+**Cross-chunk mask injection** improves accuracy by:
+1. **Injecting carry masks** — the previous chunk’s last-frame binary masks
+   become conditioning frames, giving the tracker a spatial prior.
+2. **Restoring the memory bank** — the last N frames of tracker spatial memory
+   (maskmem_features, maskmem_pos_enc) are re-inserted at negative frame
+   indices, providing rich visual context beyond a single frame.
+
+Together these two mechanisms give the tracker a “warm start” with both
+precise mask priors *and* multi-frame appearance memory.
 
 ### How It Works
 
@@ -705,10 +711,11 @@ WITHOUT injection (baseline):
   Chunk N+1:  detect from scratch → IoU match after propagation
               ↑ objects may drift, small objs can be lost
 
-WITH injection (default):
-  Chunk N:  detect + propagate → carry last-frame masks
-  Chunk N+1:  inject carry as conditioning → detect + propagate
-              ↑ tracker starts with prior knowledge, objects stay locked
+WITH injection + memory bank (default):
+  Chunk N:  detect + propagate → carry masks + extract memory bank (6 frames)
+  Chunk N+1:  inject carry as conditioning → restore memory bank at -1..-6
+              → detect + propagate
+              ↑ tracker starts with prior knowledge + multi-frame context
 ```
 
 **Flow per chunk (when enabled):**
@@ -717,51 +724,90 @@ WITH injection (default):
 2. `driver.inject_masks(frame_idx=0, masks=carry[prompt])` — inject carry
    masks as conditioning frames (creates a new tracker state with memory-encoded
    features, same as `add_new_mask` with `add_mask_to_memory=True`)
-3. `driver.add_prompt("person")` — add text/point prompt for new detections
-4. `driver.propagate_in_video()` — both injected and newly detected objects are
-   tracked together, benefiting from the conditioning memory
+3. `driver.restore_memory_bank(session_id, memory_bank[prompt])` — insert
+   the last N frames’ spatial memory at negative indices (-1, -2, …) in the
+   tracker’s output_dict so the propagation loop naturally finds them
+4. `driver.add_prompt("person")` — add text/point prompt for new detections
+5. `driver.propagate_in_video()` — both injected and newly detected objects are
+   tracked together, benefiting from both conditioning and spatial memory
 
-The injection uses the same `inject_masks()` API that already exists for
-user-provided mask prompts.  Injected objects are automatically marked as
-"confirmed" (skip the hotstart delay), and their masks are added to the
-tracker's memory bank as conditioned-frame outputs.
+### Memory Bank
+
+The **memory bank** extends single-frame carry injection with multi-frame
+spatial context.  Before each chunk reset, the pipeline calls
+`driver.extract_memory_bank()` to snapshot the last N frames’ tracker state
+(specifically `maskmem_features` and `maskmem_pos_enc`).  After resetting and
+injecting carry masks, `driver.restore_memory_bank()` inserts these snapshots
+at negative frame indices in the new tracker state.
+
+The tracker’s memory-selection loop (`_prepare_memory_conditioned_features`)
+naturally computes `prev_frame_idx = frame_idx - t_rel`.  For the first few
+frames of a new chunk (frame_idx = 0, 1, 2, …), this yields negative indices
+(-1, -2, -3, …) which resolve against the restored bank entries:
+
+```
+Frame 0:  uses cond_frame[0] (injected masks)
+Frame 1:  uses cond_frame[0] + non_cond[-1] (bank)
+Frame 2:  uses cond_frame[0] + non_cond[1] + non_cond[-1] (bank)
+Frame 3:  uses cond_frame[0] + non_cond[2,1] + non_cond[-1,-2] (bank)
+…
+Frame 6+: entirely self-sufficient (all memory from current chunk)
+```
+
+No modifications to the tracker code are needed — the bank entries are
+standard output_dict entries that the tracker treats as regular propagated
+frames.  `MEMORY_BANK_MAX_FRAMES` (default 6) matches the tracker’s
+`num_maskmem=7` window (1 cond + 6 non-cond).
+
+The bank is extracted **per prompt** and stored in CPU RAM.  When RAM pressure
+is high, the RAM guard drops the **oldest** bank entries first
+(past-forgetting tendency), preserving the most recent frames.
 
 **Configuration:**
 
 | Setting | Default | Description |
 |---|---|---|
-| `CROSS_CHUNK_MASK_INJECTION` | `True` | Enable/disable carry injection |
-| `CARRY_MAX_RAM_USAGE_PCT` | 0.98 | Drop carry entries when RAM usage ≥ 98% |
-| `CARRY_MIN_FREE_RAM_GB` | 1.0 | Drop carry entries when free RAM < 1 GB |
+| `CROSS_CHUNK_MASK_INJECTION` | `True` | Enable/disable carry injection + memory bank |
+| `MEMORY_BANK_MAX_FRAMES` | 6 | Max spatial memory frames to backup per prompt |
+| `CARRY_MAX_RAM_USAGE_PCT` | 0.98 | Drop entries when RAM usage ≥ 98% |
+| `CARRY_MIN_FREE_RAM_GB` | 1.0 | Drop entries when free RAM < 1 GB |
 
 ### RAM Guard
 
-The carry dict holds numpy masks for every prompt across all chunks.  On very
-long videos with many objects this can accumulate significant RAM.  A
-**RAM guard** monitors memory after each chunk and drops the **oldest** prompt
+The carry dict holds numpy masks for every prompt across all chunks.  The
+memory bank holds tensor snapshots (maskmem_features, pos encodings) for the
+last N frames per prompt.  On very long videos this can accumulate significant
+RAM.  A **RAM guard** monitors memory after each chunk and drops the **oldest**
 entries when either limit is breached:
 
 ```
 After each chunk:
-  if RAM_used ≥ 98%  OR  RAM_free < 1 GB:
-    drop oldest carry entry (e.g. "person" → 3 masks)
-    ↳ ⚠ RAM guard: dropped carry for 'person' (3 mask(s)) — RAM 98% used, 0.8 GB free
-    re-check → drop more if still over limit
+  1. Trim carry (oldest prompt entries first):
+     if RAM_used ≥ 98%  OR  RAM_free < 1 GB:
+       drop oldest carry entry (e.g. "person" → 3 masks)
+       re-check → drop more if still over limit
+
+  2. Trim memory banks (oldest frame entries first):
+     if RAM still over limit:
+       drop oldest memory bank frame from longest bank
+       → past-forgetting: recent spatial memory preserved,
+          oldest context sacrificed first
 ```
 
 When carry is dropped for a prompt, the next chunk falls back to the original
-behaviour: detect from scratch + IoU matching only.  This is a graceful
-degradation — you lose the accuracy boost but avoid OOM.
+behaviour: detect from scratch + IoU matching only.  When memory bank entries
+are trimmed, the tracker still has the conditioning frame from carry injection
+but fewer spatial memory frames.  Both are graceful degradations.
 
 ### Drawbacks & Trade-offs
 
 | Aspect | Impact | Notes |
 |---|---|---|
-| **RAM usage** | +1–5 MB per prompt | Carry stores uint8 masks at video resolution; negligible for most systems |
-| **Startup latency** | +50–200 ms per prompt per chunk | `inject_masks` runs memory encoding on the conditioning frame |
-| **Object duplication risk** | Low | Injected and detected objects are distinct tracker states; the IoU remapping still runs post-propagation to merge duplicates |
-| **Stale masks** | Possible on scene cuts | If a scene cut occurs at a chunk boundary, the injected masks are from the old scene — the tracker will likely score them low and drop them naturally |
-| **Incompatible prompts** | None | Each prompt type (text, point, mask) maintains its own carry dict and injection path |
+| **RAM usage** | +1–5 MB per prompt (carry) + ~4 MB × N (bank) | Carry stores uint8 masks; bank stores bfloat16 tensor snapshots per frame |
+| **Startup latency** | +50–200 ms per prompt per chunk | `inject_masks` runs memory encoding; `restore_memory_bank` is a fast dict insert |
+| **Object duplication risk** | Low | Injected and detected objects are distinct tracker states; IoU remapping merges duplicates post-propagation |
+| **Stale masks** | Possible on scene cuts | If a scene cut occurs at a chunk boundary, injected masks and bank context are from the old scene — the tracker will score them low and drop naturally |
+| **Incompatible prompts** | None | Each prompt type (text, point, mask) maintains its own carry dict and memory bank |
 
 **When injection helps most:**
 - Objects that are small, fast-moving, or partially occluded at chunk boundaries
@@ -1015,6 +1061,7 @@ Runtime defaults live in `config.json` and compile-time constants in
 | `OFFLOAD_TRACKER_STATE_TO_CPU` | `True` | Offload per-frame tracker state from VRAM to RAM (GPU) |
 | `GPU_TARGET_UTILISATION_PCT` | 0.90 | Target VRAM usage % for adaptive chunk GROW decisions |
 | `CROSS_CHUNK_MASK_INJECTION` | `True` | Inject carry masks as conditioning frames at chunk boundaries |
+| `MEMORY_BANK_MAX_FRAMES` | 6 | Max spatial memory frames to backup per prompt across chunks |
 | `CARRY_MAX_RAM_USAGE_PCT` | 0.98 | Drop oldest carry entries when RAM usage reaches 98% |
 | `CARRY_MIN_FREE_RAM_GB` | 1.0 | Drop oldest carry entries when free RAM drops below 1 GB |
 
