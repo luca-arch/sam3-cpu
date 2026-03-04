@@ -47,6 +47,7 @@ class MemoryManager:
         device: str = DEVICE.type,
         type: Literal["video", "image"] = "video",
         max_memory_bytes: int = None,
+        offload_state_to_cpu: bool = False,
     ):
         """Compute maximum frames that fit safely in available memory.
 
@@ -61,6 +62,10 @@ class MemoryManager:
             Simulate a smaller device by capping total memory.  When set,
             ``free`` is computed as ``max_memory_bytes − used`` so the
             chunk planner thinks it only has this much VRAM/RAM.
+        offload_state_to_cpu : bool
+            When *True* on a CUDA device, the tracker stores per-frame
+            state on CPU RAM instead of VRAM.  The bounding resource
+            shifts from VRAM to RAM, so chunk sizing uses available RAM.
         """
         # Clear stale CUDA cache before measuring so we get accurate free memory
         clear_memory(device, full_gc=True)
@@ -70,7 +75,19 @@ class MemoryManager:
 
         logger.debug(f"Frame size in MB: {bytes_per_frame / (1024**2):.2f} MB")
 
-        if device == "cpu":
+        if device == "cuda" and offload_state_to_cpu:
+            # With offloading, per-frame VRAM cost is near-zero (state
+            # goes to RAM).  VRAM only holds model weights + the forward-
+            # pass peak, which is constant regardless of frame count.
+            # Size chunks by available RAM instead.
+            memory_info = ram_stat()
+            percent = RAM_USAGE_PERCENT
+            available_key = "available"
+            logger.debug(
+                "Offload active on GPU — sizing chunks by RAM "
+                f"(available: {memory_info['available'] / (1024**3):.1f} GB)"
+            )
+        elif device == "cpu":
             memory_info = ram_stat()
             percent = RAM_USAGE_PERCENT
             available_key = "available"
@@ -159,8 +176,16 @@ class MemoryManager:
         device: str = DEVICE.type,
         chunk_spread: Literal["even", "default"] = "default",
         max_memory_bytes: int = None,
+        offload_state_to_cpu: bool = False,
     ):
-        # Placeholder for actual chunk planning logic
+        """Create a memory-safe chunk plan for *video_file*.
+
+        Parameters
+        ----------
+        offload_state_to_cpu : bool
+            Forward to :meth:`compute_memory_safe_frames` so the
+            chunk planner uses RAM (not VRAM) when offloading is active.
+        """
         logger.info(f"Planning memory chunks for video: {video_file}")
 
         video_info = ffmpeg_lib.get_video_info(video_file)
@@ -176,6 +201,7 @@ class MemoryManager:
             device,
             type="video",
             max_memory_bytes=max_memory_bytes,
+            offload_state_to_cpu=offload_state_to_cpu,
         )
 
         fps = round(video_info.get("fps", 25))  # Default to 25 if FPS info is missing

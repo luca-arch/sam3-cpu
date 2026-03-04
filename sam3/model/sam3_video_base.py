@@ -1543,6 +1543,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_height: int,
         orig_vid_width: int,
         feature_cache: Dict,
+        **kwargs,
     ):
         """Add a new object to SAM2 inference states."""
         prev_tracker_state = (
@@ -1552,11 +1553,19 @@ class Sam3VideoBase(nn.Module):
         # prepare inference_state
         # batch objects that first appear on the same frame together
         # Clear inference state. Keep the cached image features if available.
+        # Forward offload_state_to_cpu from the parent inference_state so
+        # tracker memories are stored on CPU when the flag is set.
+        # The flag can come via an explicit kwarg or be stashed in feature_cache.
+        offload_flag = kwargs.get(
+            "offload_state_to_cpu",
+            feature_cache.get("_offload_state_to_cpu", False),
+        )
         new_tracker_state = self.tracker.init_state(
             cached_features=feature_cache,
             video_height=orig_vid_height,
             video_width=orig_vid_width,
             num_frames=num_frames,
+            offload_state_to_cpu=offload_flag,
         )
         new_tracker_state["backbone_out"] = (
             prev_tracker_state.get("backbone_out", None)

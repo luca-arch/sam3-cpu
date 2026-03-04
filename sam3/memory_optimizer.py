@@ -636,7 +636,7 @@ class AdaptiveChunkManager:
     # will catch any overshoot and trigger a predictive stop (saving partial
     # results), so under-shooting here wastes GPU and hurts accuracy via
     # unnecessary chunk boundaries.
-    GROW_TARGET_PCT = 0.85  # matches VRAM_SOFT_LIMIT_PCT
+    GROW_TARGET_PCT = 0.90  # matches GPU_TARGET_UTILISATION_PCT
 
     def __init__(
         self,
@@ -648,12 +648,14 @@ class AdaptiveChunkManager:
         min_chunk_frames: int = 25,
         max_growth_factor: float = 1.5,
         tier: dict | None = None,
+        offload_state_to_cpu: bool = False,
     ):
         self.device = device
         self.initial_chunk_size = initial_chunk_size
         self.current_chunk_size = initial_chunk_size
         self.min_chunk_frames = min_chunk_frames
         self.max_growth_factor = max_growth_factor
+        self.offload_state_to_cpu = offload_state_to_cpu
 
         # Resolve memory limits
         if device.startswith("cuda"):
@@ -690,6 +692,13 @@ class AdaptiveChunkManager:
         # Adaptive per-frame multiplier — learns from actual propagation
         self.adaptive_multiplier: AdaptiveMultiplier | None = None
 
+        # Load GROW_TARGET_PCT from globals (user may tune it)
+        try:
+            from sam3.__globals import GPU_TARGET_UTILISATION_PCT
+            self.GROW_TARGET_PCT = GPU_TARGET_UTILISATION_PCT
+        except ImportError:
+            pass  # keep the class default
+
     @property
     def effective_vram_limit(self) -> int:
         """Maximum total GPU allocation before we consider memory critical.
@@ -707,6 +716,33 @@ class AdaptiveChunkManager:
         except ImportError:
             reserve_pct = 0.05
         return int(self.vram_limit * (1 - reserve_pct))
+
+    @property
+    def effective_ram_limit(self) -> int:
+        """Maximum process RSS before we consider RAM critical.
+
+        Uses the same reserve fraction as the IntraChunkMonitor so that
+        pressure levels are consistent between the adaptive manager
+        (inter-chunk) and the per-frame guard (intra-chunk).
+        """
+        try:
+            from sam3.__globals import CPU_MEMORY_RESERVE_PERCENT
+            reserve_pct = CPU_MEMORY_RESERVE_PERCENT
+        except ImportError:
+            reserve_pct = 0.30
+        return int(self.ram_limit * (1 - reserve_pct))
+
+    @property
+    def _effective_limit(self) -> int:
+        """Return the effective limit of the *bounding* resource.
+
+        When ``offload_state_to_cpu`` is active on a CUDA device, the
+        per-frame state accumulates in RAM, not VRAM, so the bounding
+        resource is RAM.
+        """
+        if self.offload_state_to_cpu and self.device.startswith("cuda"):
+            return self.effective_ram_limit
+        return self.effective_vram_limit
 
     def init_adaptive_multiplier(self, width: int, height: int) -> None:
         """Initialise the adaptive per-frame multiplier for this video.
@@ -744,12 +780,24 @@ class AdaptiveChunkManager:
             return self.adaptive_multiplier.estimate_per_frame_bytes()
         return None
 
-    def evaluate_pressure(self, peak_vram_bytes: int) -> str:
-        """Classify memory pressure based on peak VRAM usage."""
-        if self.effective_vram_limit <= 0:
+    def evaluate_pressure(self, peak_vram_bytes: int, peak_ram_bytes: int = 0) -> str:
+        """Classify memory pressure based on peak usage of the bounding resource.
+
+        When ``offload_state_to_cpu`` is active on a CUDA device, the
+        per-frame state lives in RAM, so pressure is evaluated against
+        RAM.  Otherwise, VRAM is the bounding resource.
+        """
+        if self.offload_state_to_cpu and self.device.startswith("cuda"):
+            eff = self.effective_ram_limit
+            peak = peak_ram_bytes
+        else:
+            eff = self.effective_vram_limit
+            peak = peak_vram_bytes
+
+        if eff <= 0:
             return MemoryPressure.NORMAL
 
-        usage_pct = peak_vram_bytes / self.effective_vram_limit
+        usage_pct = peak / eff
 
         if usage_pct >= MemoryPressure.CRITICAL_THRESHOLD:
             return MemoryPressure.CRITICAL
@@ -762,7 +810,7 @@ class AdaptiveChunkManager:
     def _compute_target_chunk_size(
         self,
         chunk_size: int,
-        peak_vram_bytes: int,
+        peak_bytes: int,
         usage_pct: float,
         pressure: str,
         baseline_vram_bytes: int = 0,
@@ -771,7 +819,7 @@ class AdaptiveChunkManager:
 
         Strategy
         --------
-        VRAM = baseline + per_frame_growth × N_frames.
+        mem = baseline + per_frame_growth × N_frames.
 
         When ``baseline_vram_bytes`` is provided (from calibration), we
         can isolate the per-frame growth and scale just that portion to
@@ -783,7 +831,7 @@ class AdaptiveChunkManager:
         (``SHRINK_CRITICAL_FACTOR`` for CRITICAL, ``SHRINK_WARNING_FACTOR``
         for WARNING) to guarantee a meaningful reduction.
         """
-        target_bytes = self.effective_vram_limit * self.SHRINK_TARGET_PCT
+        target_bytes = self._effective_limit * self.SHRINK_TARGET_PCT
 
         # Pick the legacy floor factor for this pressure level
         if pressure == MemoryPressure.CRITICAL:
@@ -791,9 +839,9 @@ class AdaptiveChunkManager:
         else:
             floor_factor = self.SHRINK_WARNING_FACTOR
 
-        if baseline_vram_bytes > 0 and peak_vram_bytes > baseline_vram_bytes:
+        if baseline_vram_bytes > 0 and peak_bytes > baseline_vram_bytes:
             # ── Baseline-aware: scale only the growth portion ──
-            growth_bytes = peak_vram_bytes - baseline_vram_bytes
+            growth_bytes = peak_bytes - baseline_vram_bytes
             target_growth = target_bytes - baseline_vram_bytes
             if target_growth > 0 and growth_bytes > 0:
                 new_size = int(chunk_size * (target_growth / growth_bytes) * 0.95)
@@ -864,14 +912,22 @@ class AdaptiveChunkManager:
             else (0.8 if growth_rate_per_iter > 0 else 0.0),
         )
 
-        pressure = self.evaluate_pressure(peak_vram_bytes)
-        usage_pct = peak_vram_bytes / self.effective_vram_limit if self.effective_vram_limit > 0 else 0.0
+        pressure = self.evaluate_pressure(peak_vram_bytes, peak_ram_bytes)
+
+        # usage_pct: fraction of the *bounding* resource consumed.
+        # With offloading on GPU the bounding resource is RAM, not VRAM.
+        eff = self._effective_limit
+        if self.offload_state_to_cpu and self.device.startswith("cuda"):
+            peak_for_pct = peak_ram_bytes
+        else:
+            peak_for_pct = peak_vram_bytes
+        usage_pct = peak_for_pct / eff if eff > 0 else 0.0
 
         # Determine action
         if pressure in (MemoryPressure.CRITICAL, MemoryPressure.WARNING):
             new_size = self._compute_target_chunk_size(
                 chunk_size,
-                peak_vram_bytes,
+                peak_for_pct,
                 usage_pct,
                 pressure,
                 baseline_vram_bytes=baseline_vram_bytes,
@@ -882,21 +938,21 @@ class AdaptiveChunkManager:
             # When we have the heaviest prompt's growth rate + baseline,
             # compute exactly how many frames fit before GROW_TARGET_PCT.
             #
-            #   VRAM = baseline + growth_rate × iterations
+            #   mem = baseline + growth_rate × iterations
             #   target_iters = (eff_limit × target_pct − baseline) / growth_rate
             #   target_frames = target_iters / 2   ("both" = 2× frames)
             #
             # This is aggressive by design: the intra-chunk monitor with
             # its soft (85%) + hard (97.5%) limits will catch any
-            # overshoot and save partial results, so under-utilising VRAM
+            # overshoot and save partial results, so under-utilising memory
             # here only hurts accuracy (more chunk boundaries) with no
             # safety upside.
             import math
 
             calibration_grow = None
-            if growth_rate_per_iter > 0 and baseline_vram_bytes > 0 and self.effective_vram_limit > 0:
-                target_vram = self.effective_vram_limit * self.GROW_TARGET_PCT
-                target_growth = target_vram - baseline_vram_bytes
+            if growth_rate_per_iter > 0 and baseline_vram_bytes > 0 and eff > 0:
+                target_mem = eff * self.GROW_TARGET_PCT
+                target_growth = target_mem - baseline_vram_bytes
                 if target_growth > 0:
                     target_iters = target_growth / growth_rate_per_iter
                     calibration_grow = max(int(target_iters / 2), self.min_chunk_frames)
@@ -1027,12 +1083,16 @@ class AdaptiveChunkManager:
             "final_chunk_size": self.current_chunk_size,
             "device": self.device,
             "tier": self._tier,
+            "offload_state_to_cpu": self.offload_state_to_cpu,
             "grow_factor": self.GROW_FACTOR,
+            "grow_target_pct": self.GROW_TARGET_PCT,
             "grow_threshold": self.GROW_THRESHOLD,
             "shrink_target_pct": self.SHRINK_TARGET_PCT,
             "vram_limit_bytes": self.vram_limit,
             "ram_limit_bytes": self.ram_limit,
             "effective_vram_limit_bytes": self.effective_vram_limit,
+            "effective_ram_limit_bytes": self.effective_ram_limit,
+            "bounding_resource": "RAM" if (self.offload_state_to_cpu and self.device.startswith("cuda")) else "VRAM",
             "min_chunk_frames": self.min_chunk_frames,
             "max_growth_factor": self.max_growth_factor,
             "chunk_history": [

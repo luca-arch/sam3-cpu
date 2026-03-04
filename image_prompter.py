@@ -506,6 +506,13 @@ Examples:
         metavar="PCT",
         help="Percentage of logical CPU cores to use (50-100, default: 100)",
     )
+    parser.add_argument(
+        "--offload-state-to-cpu",
+        action="store_true",
+        default=False,
+        help="Accepted for CLI consistency with video_prompter.py. "
+             "Has no effect on image inference (single-frame, no tracker state).",
+    )
 
     args = parser.parse_args()
 

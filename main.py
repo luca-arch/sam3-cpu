@@ -77,6 +77,20 @@ Examples:
         help='Percentage of logical CPU cores to use (50-100, default: 100)'
     )
     
+    # Offload state
+    parser.add_argument(
+        '--offload-state-to-cpu',
+        action='store_true',
+        default=None,
+        help='Offload per-frame tracker state from VRAM to RAM (GPU video only)'
+    )
+    parser.add_argument(
+        '--no-offload-state-to-cpu',
+        action='store_true',
+        default=False,
+        help='Disable tracker state offloading (keep all state on GPU)'
+    )
+    
     # Parse arguments
     args = parser.parse_args()
     

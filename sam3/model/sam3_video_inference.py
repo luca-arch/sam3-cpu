@@ -65,10 +65,20 @@ class Sam3VideoInference(Sam3VideoBase):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
     ):
-        """Initialize an inference state from `resource_path` (an image or a video)."""
+        """Initialize an inference state from `resource_path` (an image or a video).
+
+        Parameters
+        ----------
+        offload_state_to_cpu : bool
+            When *True*, the SAM2 tracker stores per-frame state
+            (mask-memory features, predicted masks, object pointers)
+            on CPU RAM instead of VRAM.  This prevents monotonic VRAM
+            growth during long video propagation at a small FPS cost.
+        """
         images, orig_height, orig_width = load_resource_as_video_frames(
             resource_path=resource_path,
             image_size=self.image_size,
@@ -84,6 +94,9 @@ class Sam3VideoInference(Sam3VideoBase):
         # the original video height and width, used for resizing final output scores
         inference_state["orig_height"] = orig_height
         inference_state["orig_width"] = orig_width
+        # Forward the offload flag so that tracker states created later
+        # (via _tracker_add_new_objects / _init_new_tracker_state) inherit it.
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
         # values that don't change across frames (so we only need to hold one copy of them)
         inference_state["constants"] = {}
         # inputs on each frame
@@ -92,6 +105,10 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["tracker_inference_states"] = []
         inference_state["tracker_metadata"] = {}
         inference_state["feature_cache"] = {}
+        # Also store the offload flag inside feature_cache so that code paths
+        # which only receive feature_cache (e.g. run_tracker_update_execution_phase)
+        # can forward it to tracker.init_state().
+        inference_state["feature_cache"]["_offload_state_to_cpu"] = offload_state_to_cpu
         inference_state["cached_frame_outputs"] = {}
         inference_state["action_history"] = []  # for logging user actions
         inference_state["is_image_only"] = is_image_type(resource_path)
@@ -116,7 +133,10 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["visual_prompt_mask"] = None
         inference_state["tracker_inference_states"].clear()
         inference_state["tracker_metadata"].clear()
+        # Preserve the offload flag across resets
+        _offload_flag = inference_state["feature_cache"].get("_offload_state_to_cpu", False)
         inference_state["feature_cache"].clear()
+        inference_state["feature_cache"]["_offload_state_to_cpu"] = _offload_flag
         inference_state["cached_frame_outputs"].clear()
         inference_state["action_history"].clear()  # for logging user actions
 
@@ -776,6 +796,7 @@ class Sam3VideoInference(Sam3VideoBase):
             orig_vid_height=inference_state["orig_height"],
             orig_vid_width=inference_state["orig_width"],
             feature_cache=inference_state["feature_cache"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
         # Synthesize obj_id_to_mask data for cached_frame_outputs to support _build_tracker_output during warmup
@@ -1026,6 +1047,7 @@ class Sam3VideoInference(Sam3VideoBase):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
         injected_ids = []
@@ -1159,6 +1181,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get("offload_state_to_cpu", False),
         )
 
     @torch.inference_mode()

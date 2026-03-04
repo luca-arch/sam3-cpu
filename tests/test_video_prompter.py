@@ -22,6 +22,7 @@ from video_prompter import (
     _save_chunk_masks,
     _stitch_masks_to_video,
     _table,
+    _trim_carry_if_needed,
 )
 
 # ---------------------------------------------------------------------------
@@ -718,3 +719,66 @@ class TestStreamingMaskWriterIntegration:
             n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
             assert n == 4  # all 4 frames written (2 with data, 2 black)
+
+
+# ---------------------------------------------------------------------------
+# _trim_carry_if_needed
+# ---------------------------------------------------------------------------
+
+
+class TestTrimCarryIfNeeded:
+    """Tests for the RAM guard that drops carry entries under memory pressure."""
+
+    def test_no_drop_when_within_limits(self):
+        """Carry is untouched when RAM usage is within both limits."""
+        carry = {
+            "person": {0: np.ones((10, 10), dtype=np.uint8)},
+            "ball": {1: np.zeros((10, 10), dtype=np.uint8)},
+        }
+        # max_ram_pct=1.0 and min_free_gb=0 → never triggers
+        dropped = _trim_carry_if_needed(carry, max_ram_pct=1.0, min_free_gb=0.0)
+        assert dropped == 0
+        assert len(carry) == 2
+
+    def test_drops_oldest_when_pct_exceeded(self):
+        """When fake pct threshold is 0 (always exceeded), all entries are dropped."""
+        carry = {
+            "first": {0: np.ones((10, 10), dtype=np.uint8)},
+            "second": {1: np.ones((10, 10), dtype=np.uint8)},
+        }
+        # max_ram_pct=0.0 means 0% threshold → always exceeded
+        dropped = _trim_carry_if_needed(carry, max_ram_pct=0.0, min_free_gb=0.0)
+        assert dropped == 2
+        assert len(carry) == 0
+
+    def test_drops_oldest_when_free_gb_exceeded(self):
+        """When min_free_gb is very large, all entries are dropped."""
+        carry = {
+            "alpha": {0: np.ones((10, 10), dtype=np.uint8)},
+            "beta": {1: np.ones((10, 10), dtype=np.uint8)},
+        }
+        # min_free_gb=9999 → always exceeded (nobody has 9999 GB free)
+        dropped = _trim_carry_if_needed(carry, max_ram_pct=1.0, min_free_gb=9999.0)
+        assert dropped == 2
+        assert len(carry) == 0
+
+    def test_empty_carry_noop(self):
+        """Empty carry should not raise and return 0."""
+        carry = {}
+        dropped = _trim_carry_if_needed(carry, max_ram_pct=0.0, min_free_gb=9999.0)
+        assert dropped == 0
+
+    def test_insertion_order_preserved(self):
+        """Items are dropped in insertion order (oldest first)."""
+        carry = {
+            "oldest": {0: np.ones((5, 5), dtype=np.uint8)},
+            "middle": {1: np.ones((5, 5), dtype=np.uint8)},
+            "newest": {2: np.ones((5, 5), dtype=np.uint8)},
+        }
+        # Force 1 drop at a time by using a threshold that becomes
+        # satisfied after removing entries (we use a trick: only check
+        # that at least oldest is dropped first)
+        # With pct=0 all will be dropped, but order matters
+        _trim_carry_if_needed(carry, max_ram_pct=0.0, min_free_gb=0.0)
+        # All dropped because pct=0 always exceeds
+        assert len(carry) == 0

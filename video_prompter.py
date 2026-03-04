@@ -148,6 +148,7 @@ def _validate_video_memory(
     video_path: Path,
     device: str,
     max_memory_bytes: int = None,
+    offload_state_to_cpu: bool = False,
 ) -> dict[str, Any]:
     """Check if there is enough memory to process at least MIN_VIDEO_FRAMES.
 
@@ -157,6 +158,8 @@ def _validate_video_memory(
     ----------
     max_memory_bytes : int, optional
         Simulate a smaller device (for testing).
+    offload_state_to_cpu : bool
+        Forward to the chunk planner so it sizes by RAM when offloading.
     """
     from sam3.__globals import (
         DEFAULT_MIN_VIDEO_FRAMES,
@@ -177,9 +180,14 @@ def _validate_video_memory(
         device,
         type="video",
         max_memory_bytes=max_memory_bytes,
+        offload_state_to_cpu=offload_state_to_cpu,
     )
 
-    if device == "cuda":
+    if device == "cuda" and offload_state_to_cpu:
+        # With offloading the bounding resource is RAM
+        mem = ram_stat()
+        available = mem["available"]
+    elif device == "cuda":
         mem = vram_stat()
         available = mem["free"]
     else:
@@ -251,6 +259,7 @@ def _make_chunk_plan(
     device: str,
     chunk_spread: str = "default",
     max_memory_bytes: int = None,
+    offload_state_to_cpu: bool = False,
 ) -> tuple:
     """Create a memory-safe chunk plan.
 
@@ -263,6 +272,7 @@ def _make_chunk_plan(
         device=device,
         chunk_spread=chunk_spread,
         max_memory_bytes=max_memory_bytes,
+        offload_state_to_cpu=offload_state_to_cpu,
     )
     return metadata, chunks
 
@@ -291,6 +301,47 @@ def _extract_last_frame_masks(
             m = output["out_binary_masks"][idx]
             masks[oid] = m.astype(np.uint8) * 255
     return masks
+
+
+def _trim_carry_if_needed(
+    carry: dict[str, dict[int, np.ndarray]],
+    max_ram_pct: float,
+    min_free_gb: float,
+) -> int:
+    """Drop oldest carry entries when RAM pressure is too high.
+
+    Checks two conditions (whichever hits first triggers trimming):
+    1. RAM usage >= *max_ram_pct* (e.g. 0.98 = 98%)
+    2. Free RAM < *min_free_gb* (e.g. 1.0 GB)
+
+    Drops entries in insertion order (oldest prompt first) until memory is
+    within both limits or carry is empty.
+
+    Returns the number of prompt entries dropped.
+    """
+    import psutil
+
+    dropped = 0
+    while carry:
+        mem = psutil.virtual_memory()
+        pct_used = mem.percent / 100.0
+        free_gb = mem.available / (1024 ** 3)
+
+        if pct_used < max_ram_pct and free_gb > min_free_gb:
+            break  # within limits
+
+        # Drop the oldest prompt entry (first key in insertion order)
+        oldest_key = next(iter(carry))
+        n_masks = len(carry[oldest_key])
+        del carry[oldest_key]
+        dropped += 1
+        print(
+            f"\033[93m⚠ RAM guard: dropped carry for '{oldest_key}' "
+            f"({n_masks} mask(s)) — RAM {pct_used:.0%} used, "
+            f"{free_gb:.1f} GB free\033[0m"
+        )
+
+    return dropped
 
 
 # ---------------------------------------------------------------------------
@@ -1023,6 +1074,7 @@ def _process_video(
     max_vram_gb: float | None = None,
     max_ram_gb: float | None = None,
     cpu_utilisation: int = 100,
+    offload_state_to_cpu: bool | None = None,
 ):
     """Full video processing pipeline with adaptive dynamic chunking."""
     from datetime import datetime
@@ -1088,7 +1140,26 @@ def _process_video(
     # ----- Memory check -----
     # Use simulated VRAM limit if testing with a smaller GPU
     _mem_cap = max_vram_bytes if device == "cuda" else max_ram_bytes
-    mem_info = _validate_video_memory(video_path, device, max_memory_bytes=_mem_cap)
+
+    # Resolve offload flag early — it influences chunk sizing.
+    # On CUDA with OFFLOAD_TRACKER_STATE_TO_CPU == True, per-frame state
+    # goes to RAM so chunks are sized by RAM, not VRAM.
+    # CLI override (True/False) takes precedence; None = auto from globals.
+    if offload_state_to_cpu is not None:
+        _offload_state = offload_state_to_cpu
+    elif device == "cuda":
+        try:
+            from sam3.__globals import OFFLOAD_TRACKER_STATE_TO_CPU
+            _offload_state = OFFLOAD_TRACKER_STATE_TO_CPU
+        except ImportError:
+            _offload_state = True  # safe default — match drivers.py
+    else:
+        _offload_state = False
+
+    mem_info = _validate_video_memory(
+        video_path, device, max_memory_bytes=_mem_cap,
+        offload_state_to_cpu=_offload_state,
+    )
     if _mem_cap:
         mem_info["simulated_limit_gb"] = round(_mem_cap / (1024**3), 1)
     _show_video_memory_table(mem_info)
@@ -1106,10 +1177,13 @@ def _process_video(
         device,
         chunk_spread,
         max_memory_bytes=_mem_cap,
+        offload_state_to_cpu=_offload_state,
     )
     initial_chunk_size = mem_info.get("max_frames_per_chunk", 200)
     n_chunks = len(chunk_list)
     print(f"  {n_chunks} chunk(s), {initial_chunk_size} frames/chunk")
+    if n_chunks > 1 and _cross_chunk_inject:
+        print("  Cross-chunk mask injection: ON (carry masks → conditioning frames)")
 
     # ----- Adaptive chunk manager with auto-detected memory tier -----
     from sam3.memory_optimizer import get_memory_tier
@@ -1130,6 +1204,7 @@ def _process_video(
         vram_limit_bytes=max_vram_bytes,
         ram_limit_bytes=max_ram_bytes,
         tier=memory_tier,
+        offload_state_to_cpu=_offload_state,
     )
     # Initialise adaptive per-frame multiplier (learns from actual execution)
     _vid_w = video_metadata.get("width", 1920)
@@ -1188,6 +1263,22 @@ def _process_video(
     carry: dict[str, dict[int, np.ndarray]] = {}
     global_next_ids: dict[str, int] = {}
     all_object_ids: dict[str, set] = {}
+
+    # ── Cross-chunk mask injection flag ──
+    try:
+        from sam3.__globals import CROSS_CHUNK_MASK_INJECTION
+        _cross_chunk_inject = CROSS_CHUNK_MASK_INJECTION
+    except ImportError:
+        _cross_chunk_inject = True
+
+    # ── RAM guard thresholds for carry data ──
+    try:
+        from sam3.__globals import CARRY_MAX_RAM_USAGE_PCT, CARRY_MIN_FREE_RAM_GB
+        _carry_max_ram_pct = CARRY_MAX_RAM_USAGE_PCT
+        _carry_min_free_gb = CARRY_MIN_FREE_RAM_GB
+    except ImportError:
+        _carry_max_ram_pct = 0.98
+        _carry_min_free_gb = 1.0
 
     # ── Collectors for enriched metadata ──
     chunk_timing: list[dict[str, Any]] = []
@@ -1274,6 +1365,27 @@ def _process_video(
                     print(f"  Prompt: '{prompt}'")
 
                     driver.reset_session(session_id)
+
+                    # ── Cross-chunk mask injection ──
+                    # Inject carry masks from previous chunk as conditioning frames
+                    # BEFORE adding the text prompt.  This gives the tracker memory
+                    # of where objects were, improving boundary continuity.
+                    _injected_carry = False
+                    if _cross_chunk_inject and ci > 0 and prompt in carry and carry[prompt]:
+                        _carry_masks = carry[prompt]
+                        _carry_ids = sorted(_carry_masks.keys())
+                        try:
+                            driver.inject_masks(
+                                session_id,
+                                frame_idx=0,
+                                masks=_carry_masks,
+                                object_ids=_carry_ids,
+                            )
+                            _injected_carry = True
+                            print(f"    ↳ Injected {len(_carry_ids)} mask(s) from previous chunk")
+                        except Exception as _inj_err:
+                            print(f"\033[93m    ⚠ Carry injection failed: {_inj_err}\033[0m")
+
                     driver.add_prompt(session_id, prompt)
 
                     # ── Monitored streaming propagation ──
@@ -1424,6 +1536,21 @@ def _process_video(
 
                 driver.reset_session(session_id)
 
+                # ── Cross-chunk mask injection for point prompts ──
+                if _cross_chunk_inject and ci > 0 and prompt_key in carry and carry[prompt_key]:
+                    _carry_masks = carry[prompt_key]
+                    _carry_ids = sorted(_carry_masks.keys())
+                    try:
+                        driver.inject_masks(
+                            session_id,
+                            frame_idx=0,
+                            masks=_carry_masks,
+                            object_ids=_carry_ids,
+                        )
+                        print(f"    ↳ Injected {len(_carry_ids)} mask(s) from previous chunk")
+                    except Exception as _inj_err:
+                        print(f"\033[93m    ⚠ Carry injection failed: {_inj_err}\033[0m")
+
                 for pi, (pt, lbl) in enumerate(zip(points, point_labels)):
                     driver.add_object_with_points_prompt(
                         session_id,
@@ -1571,7 +1698,22 @@ def _process_video(
 
                 driver.reset_session(session_id)
 
-                # Inject each mask as a separate object
+                # ── Cross-chunk mask injection for mask prompts ──
+                if _cross_chunk_inject and ci > 0 and prompt_key in carry and carry[prompt_key]:
+                    _carry_masks = carry[prompt_key]
+                    _carry_ids = sorted(_carry_masks.keys())
+                    try:
+                        driver.inject_masks(
+                            session_id,
+                            frame_idx=0,
+                            masks=_carry_masks,
+                            object_ids=_carry_ids,
+                        )
+                        print(f"    ↳ Injected {len(_carry_ids)} mask(s) from previous chunk")
+                    except Exception as _inj_err:
+                        print(f"\033[93m    ⚠ Carry injection failed: {_inj_err}\033[0m")
+
+                # Inject each user-provided mask as a separate object
                 mask_dict = {}
                 obj_id_list = []
                 for mi, mp in enumerate(mask_paths):
@@ -2003,10 +2145,12 @@ def _process_video(
             calibration_confidence=_calibration_confidence,
         )
 
+        _bounding = "RAM" if _offload_state else "VRAM"
+
         if rec.action == "SHRINK":
             print(
                 f"\033[93m  ⚠ Memory pressure {rec.pressure} "
-                f"(peak {rec.vram_usage_pct:.0f}% of effective VRAM). "
+                f"(peak {rec.vram_usage_pct:.0f}% of effective {_bounding}). "
                 f"Targeting {rec.target_utilization_pct:.0f}% → "
                 f"next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m"
             )
@@ -2020,7 +2164,7 @@ def _process_video(
         elif rec.action == "GROW":
             _grow_method = "calibrated" if _growth_rate > 0 and _baseline_vram > 0 else "heuristic"
             print(
-                f"\033[92m  ↑ Under-utilised (peak {rec.vram_usage_pct:.0f}%). "
+                f"\033[92m  ↑ {_bounding} under-utilised (peak {rec.vram_usage_pct:.0f}%). "
                 f"Targeting {rec.target_utilization_pct:.0f}% ({_grow_method}) → "
                 f"next chunk: {current_chunk_frames} → {rec.adjusted_chunk_size} frames\033[0m"
             )
@@ -2068,11 +2212,16 @@ def _process_video(
             f"  Chunk {ci + 1} done in {chunk_dur:.1f}s "
             f"({chunk_dur / max(chunk_frames, 1):.2f} s/frame, "
             f"peak VRAM: {peak_vram / (1024**2):.0f} MB, "
-            f"pressure: {rec.pressure})\n"
+            f"peak RAM: {peak_ram / (1024**2):.0f} MB, "
+            f"pressure ({_bounding}): {rec.pressure})\n"
         )
 
         chunk_cursor += 1
         ci += 1
+
+        # ── RAM guard: trim carry if memory pressure is high ──
+        if carry:
+            _trim_carry_if_needed(carry, _carry_max_ram_pct, _carry_min_free_gb)
 
     chunk_processing_s = round(time.time() - t_chunks_start, 3)
 
@@ -2191,6 +2340,7 @@ def _process_video(
         "num_chunks": n_chunks,
         "num_chunks_processed": ci,
         "overlap_frames": overlap,
+        "cross_chunk_mask_injection": _cross_chunk_inject,
         "simulated_limits": {
             "max_vram_gb": max_vram_gb,
             "max_ram_gb": max_ram_gb,
@@ -2371,8 +2521,36 @@ Examples:
         metavar="PCT",
         help="Percentage of logical CPU cores to use (50-100, default: 100)",
     )
+    parser.add_argument(
+        "--offload-state-to-cpu",
+        action="store_true",
+        default=None,
+        help="Offload per-frame tracker state from VRAM to RAM (GPU only). "
+             "Keeps VRAM flat at the cost of ~10-15%% slower propagation. "
+             "Enabled by default on CUDA; pass this flag to force it on.",
+    )
+    parser.add_argument(
+        "--no-offload-state-to-cpu",
+        action="store_true",
+        default=False,
+        help="Disable tracker state offloading (keep all state on GPU). "
+             "Uses more VRAM but avoids the ~10-15%% propagation overhead.",
+    )
 
     args = parser.parse_args()
+
+    # Validate: --offload-state-to-cpu and --no-offload-state-to-cpu are mutually exclusive
+    if args.offload_state_to_cpu and args.no_offload_state_to_cpu:
+        print("\033[91m✗ --offload-state-to-cpu and --no-offload-state-to-cpu are mutually exclusive.\033[0m")
+        sys.exit(1)
+
+    # Resolve offload tri-state: True (forced on), False (forced off), None (auto)
+    offload_state: bool | None = None
+    if args.offload_state_to_cpu:
+        offload_state = True
+    elif args.no_offload_state_to_cpu:
+        offload_state = False
+    # else: None → _process_video will auto-resolve from globals
 
     # Validate: frame-range and time-range are mutually exclusive
     if args.frame_range and args.time_range:
@@ -2439,6 +2617,13 @@ Examples:
     print(f"  Device  : {device}")
     if device == "cpu":
         print(f"  CPU util: {args.cpu_utilisation}%")
+    if device == "cuda":
+        if offload_state is True:
+            print(f"  Offload : ON  (forced via CLI)")
+        elif offload_state is False:
+            print(f"  Offload : OFF (forced via CLI)")
+        else:
+            print(f"  Offload : auto (from __globals.py)")
     print(f"  Output  : {args.output}")
     print(f"  Alpha   : {args.alpha}")
     print(f"  Chunking: {args.chunk_spread}")
@@ -2465,6 +2650,7 @@ Examples:
         max_vram_gb=args.max_vram_gb,
         max_ram_gb=args.max_ram_gb,
         cpu_utilisation=args.cpu_utilisation,
+        offload_state_to_cpu=offload_state,
     )
 
 

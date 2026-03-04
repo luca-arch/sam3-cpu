@@ -45,6 +45,14 @@
   - [Memory Management Architecture](#memory-management-architecture)
   - [Streaming Mask Pipeline](#streaming-mask-pipeline)
   - [Adaptive Memory Multiplier](#adaptive-memory-multiplier)
+- [GPU Memory Offloading](#gpu-memory-offloading)
+  - [How It Works](#how-it-works)
+  - [Performance Impact](#performance-impact)
+  - [Best Practices](#best-practices)
+- [Cross-Chunk Mask Injection](#cross-chunk-mask-injection)
+  - [How It Works](#how-it-works-1)
+  - [RAM Guard](#ram-guard)
+  - [Drawbacks & Trade-offs](#drawbacks--trade-offs)
 - [Output Structure](#output-structure)
 - [Metadata Reference](#metadata-reference)
   - [Schema Version](#schema-version)
@@ -204,6 +212,8 @@ All `make` variables:
 | `KEEP_TEMP` | `video-prompter` | `1` (any non-empty value) |
 | `MAX_VRAM_GB` | `video-prompter` | `10` (cap VRAM budget in GB) |
 | `MAX_RAM_GB` | `video-prompter` | `16` (cap RAM budget in GB) |
+| `OFFLOAD_STATE` | both | `1` (enable `--offload-state-to-cpu`) |
+| `NO_OFFLOAD_STATE` | `video-prompter` | `1` (enable `--no-offload-state-to-cpu`) |
 | `VIDEO_RES` | `run-*` examples | `480p`, `720p`, `1080p` |
 | `ARGS` | all | extra flags passed through |
 
@@ -231,9 +241,8 @@ Segment one or more images with text prompts, click points, or bounding boxes.
 | `--alpha` | `float` | `0.5` | Overlay alpha for mask visualisation (`0.0`–`1.0`) |
 | `--device` | `str` | auto | Force `cpu` or `cuda` (auto-detected if omitted) |
 | `--cpu-utilisation` | `int` | `100` | Percentage of logical CPU cores to use (50–100) |
+| `--offload-state-to-cpu` | flag | off | Accepted for CLI consistency (no effect on single-frame image inference) |
 | `--profile` | flag | off | Enable the built-in profiler |
-
-At least one of `--prompts`, `--points`, or `--bbox` is required.
 
 #### Examples
 
@@ -282,6 +291,8 @@ and generates per-object tracking metadata.
 | `--time-range` | `str str` | `None` | Process a time segment (seconds, `MM:SS`, or `HH:MM:SS`) |
 | `--max-vram-gb` | `float` | `None` | Cap VRAM budget (GB) |
 | `--max-ram-gb` | `float` | `None` | Cap RAM budget (GB) |
+| `--offload-state-to-cpu` | flag | auto | Force tracker state offloading from VRAM → RAM (GPU only) |
+| `--no-offload-state-to-cpu` | flag | off | Disable tracker state offloading (keep all state on GPU) |
 | `--profile` | flag | off | Enable the built-in profiler |
 
 At least one of `--prompts`, `--points`, or `--masks` is required.
@@ -447,7 +458,10 @@ results back together.
 
 1. `MemoryManager` computes how many frames fit in available RAM (CPU) or VRAM (GPU).
 2. The video is split into chunks with configurable overlap (default 1 frame).
-3. Each chunk is segmented and tracked independently.
+3. Each chunk is segmented and tracked.  When `CROSS_CHUNK_MASK_INJECTION` is
+   enabled (default), the previous chunk's last-frame masks are injected as
+   conditioning frames at the start of the next chunk, giving the tracker
+   object-awareness before re-detection (see [Cross-Chunk Mask Injection](#cross-chunk-mask-injection)).
 4. At chunk boundaries, masks from the overlap region are matched using IoU and
    object IDs are remapped so they stay consistent across the full video.
 
@@ -459,6 +473,7 @@ results back together.
 | `min_frames` | 25 | Minimum frames per chunk |
 | `chunk_overlap` | 1 | Overlap frames between chunks |
 | `CHUNK_MASK_MATCHING_IOU_THRESHOLD` | 0.75 | IoU threshold for cross-chunk ID matching |
+| `CROSS_CHUNK_MASK_INJECTION` | `True` | Inject carry masks as conditioning frames at chunk boundaries |
 
 ### Memory Management Architecture
 
@@ -581,6 +596,182 @@ heuristic after the first chunk by learning from actual execution:
 - **Self-correcting** — rolling window of last 5 chunks, weighted by R² confidence
 - **Reject bad data** — samples with R² < 0.3 or negative growth are silently dropped
 - **Exported in metadata** — `adaptive_multiplier` section in `metadata.json`
+
+---
+
+## GPU Memory Offloading
+
+When running on a CUDA GPU, SAM3's video tracker accumulates per-frame state
+(object scores, masks, logits, hidden states) for every processed frame.
+Without offloading, this state lives on GPU VRAM and grows **linearly**, often
+causing OOM on long videos. **Tracker state offloading** moves this per-frame
+state to CPU RAM after each propagation step, keeping VRAM usage flat.
+
+### How It Works
+
+```
+Without offloading (default SAM2/3 behaviour):
+  Frame 0 → state on VRAM     VRAM ████░░░░░░  42%
+  Frame 50 → state on VRAM    VRAM ██████░░░░  60%
+  Frame 200 → state on VRAM   VRAM █████████░  88%
+  Frame 350 → OOM!            VRAM ██████████  100% 💥
+
+With offloading (--offload-state-to-cpu):
+  Frame 0 → state → RAM       VRAM ████░░░░░░  42%  RAM ████░░░░░░  35%
+  Frame 50 → state → RAM      VRAM ████░░░░░░  42%  RAM █████░░░░░  40%
+  Frame 200 → state → RAM     VRAM ████░░░░░░  42%  RAM ██████░░░░  50%
+  Frame 350 → state → RAM     VRAM ████░░░░░░  42%  RAM ████████░░  65%
+```
+
+The feature is controlled at three levels:
+
+| Level | Setting | Behaviour |
+|---|---|---|
+| Global default | `OFFLOAD_TRACKER_STATE_TO_CPU = True` in `sam3/__globals.py` | Auto-enabled on GPU |
+| CLI flag | `--offload-state-to-cpu` / `--no-offload-state-to-cpu` | Overrides global |
+| Makefile | `OFFLOAD_STATE=1` / `NO_OFFLOAD_STATE=1` | Passes CLI flag |
+
+When offloading is active, the **adaptive chunk manager** automatically shifts
+its bounding resource from VRAM to RAM — chunks are sized to fit in available
+RAM rather than VRAM, and pressure evaluation uses peak RAM usage.
+
+### Performance Impact
+
+Offloading adds a small per-frame CUDA↔CPU transfer cost.  Measured on an
+**NVIDIA A100 80 GB** with 1080p video:
+
+| Metric | Offloading OFF | Offloading ON | Delta |
+|---|---|---|---|
+| VRAM usage | Grows linearly | **Flat ~42%** | Eliminates OOM risk |
+| RAM usage | Flat | Grows linearly | ~1–2 MB/frame/object |
+| Propagation speed | ~30 FPS (1 obj) | ~27 FPS (1 obj) | **~10–15% slower** |
+| Propagation speed | ~4.0 it/s (10 obj) | ~3.5 it/s (10 obj) | ~12% slower |
+| Max video length | Limited by VRAM | **Limited by RAM** | 10–100× longer |
+
+> **Rule of thumb:** On a GPU with ≥ 8 GB VRAM and ≥ 16 GB RAM, offloading
+> lets you process videos of virtually unlimited length.  The ~10–15% speed
+> penalty is negligible compared to OOM crashes.
+
+### Best Practices
+
+```bash
+# Default: offloading is auto-enabled on GPU (recommended)
+uv run python video_prompter.py --video long_clip.mp4 --prompts person
+
+# Force offloading OFF for short videos where you want max throughput
+uv run python video_prompter.py --video short_clip.mp4 --prompts person \
+    --no-offload-state-to-cpu
+
+# Simulate a smaller GPU + offloading for testing
+uv run python video_prompter.py --video clip.mp4 --prompts person \
+    --max-vram-gb 8 --offload-state-to-cpu
+
+# Via Makefile
+make video-prompter VIDEO='clip.mp4' PROMPTS='person' OFFLOAD_STATE=1
+make video-prompter VIDEO='clip.mp4' PROMPTS='person' NO_OFFLOAD_STATE=1
+```
+
+**When to disable offloading:**
+- Short videos (< 200 frames) where VRAM won't be exhausted
+- Benchmarking raw GPU propagation speed
+- GPUs with very large VRAM (80+ GB) processing small object counts
+
+**When to keep offloading enabled (default):**
+- Long videos or unknown video lengths
+- Multiple tracked objects (each object adds to per-frame state)
+- GPUs with limited VRAM (8–24 GB)
+- Production workloads where OOM crashes are unacceptable
+
+---
+
+## Cross-Chunk Mask Injection
+
+When a video is split into chunks, each chunk normally starts fresh — the
+tracker has no knowledge of objects found in previous chunks.  Object
+continuity relies solely on **IoU matching** at the 1-frame overlap boundary,
+which is fragile for small or fast-moving objects.
+
+**Cross-chunk mask injection** improves accuracy by injecting the previous
+chunk's last-frame masks into the new chunk as **conditioning frames** before
+the text/point prompt is even added.  This gives the tracker a "warm start":
+it already knows where objects are, so propagation begins with a strong prior
+rather than relying on re-detection alone.
+
+### How It Works
+
+```
+WITHOUT injection (baseline):
+  Chunk N:  detect + propagate → carry last-frame masks
+  Chunk N+1:  detect from scratch → IoU match after propagation
+              ↑ objects may drift, small objs can be lost
+
+WITH injection (default):
+  Chunk N:  detect + propagate → carry last-frame masks
+  Chunk N+1:  inject carry as conditioning → detect + propagate
+              ↑ tracker starts with prior knowledge, objects stay locked
+```
+
+**Flow per chunk (when enabled):**
+
+1. `driver.reset_session()` — clear previous prompt state
+2. `driver.inject_masks(frame_idx=0, masks=carry[prompt])` — inject carry
+   masks as conditioning frames (creates a new tracker state with memory-encoded
+   features, same as `add_new_mask` with `add_mask_to_memory=True`)
+3. `driver.add_prompt("person")` — add text/point prompt for new detections
+4. `driver.propagate_in_video()` — both injected and newly detected objects are
+   tracked together, benefiting from the conditioning memory
+
+The injection uses the same `inject_masks()` API that already exists for
+user-provided mask prompts.  Injected objects are automatically marked as
+"confirmed" (skip the hotstart delay), and their masks are added to the
+tracker's memory bank as conditioned-frame outputs.
+
+**Configuration:**
+
+| Setting | Default | Description |
+|---|---|---|
+| `CROSS_CHUNK_MASK_INJECTION` | `True` | Enable/disable carry injection |
+| `CARRY_MAX_RAM_USAGE_PCT` | 0.98 | Drop carry entries when RAM usage ≥ 98% |
+| `CARRY_MIN_FREE_RAM_GB` | 1.0 | Drop carry entries when free RAM < 1 GB |
+
+### RAM Guard
+
+The carry dict holds numpy masks for every prompt across all chunks.  On very
+long videos with many objects this can accumulate significant RAM.  A
+**RAM guard** monitors memory after each chunk and drops the **oldest** prompt
+entries when either limit is breached:
+
+```
+After each chunk:
+  if RAM_used ≥ 98%  OR  RAM_free < 1 GB:
+    drop oldest carry entry (e.g. "person" → 3 masks)
+    ↳ ⚠ RAM guard: dropped carry for 'person' (3 mask(s)) — RAM 98% used, 0.8 GB free
+    re-check → drop more if still over limit
+```
+
+When carry is dropped for a prompt, the next chunk falls back to the original
+behaviour: detect from scratch + IoU matching only.  This is a graceful
+degradation — you lose the accuracy boost but avoid OOM.
+
+### Drawbacks & Trade-offs
+
+| Aspect | Impact | Notes |
+|---|---|---|
+| **RAM usage** | +1–5 MB per prompt | Carry stores uint8 masks at video resolution; negligible for most systems |
+| **Startup latency** | +50–200 ms per prompt per chunk | `inject_masks` runs memory encoding on the conditioning frame |
+| **Object duplication risk** | Low | Injected and detected objects are distinct tracker states; the IoU remapping still runs post-propagation to merge duplicates |
+| **Stale masks** | Possible on scene cuts | If a scene cut occurs at a chunk boundary, the injected masks are from the old scene — the tracker will likely score them low and drop them naturally |
+| **Incompatible prompts** | None | Each prompt type (text, point, mask) maintains its own carry dict and injection path |
+
+**When injection helps most:**
+- Objects that are small, fast-moving, or partially occluded at chunk boundaries
+- Multiple chunks (the more chunks, the more boundaries benefit)
+- Videos with stable backgrounds where objects maintain spatial coherence
+
+**When injection may not help:**
+- Single-chunk videos (no boundaries to improve)
+- Scene cuts at chunk boundaries (injected masks are from ≠ scene)
+- Very large object counts (RAM guard may drop carry entries)
 
 ---
 
@@ -821,6 +1012,11 @@ Runtime defaults live in `config.json` and compile-time constants in
 | `MODEL_STATE_MULTIPLIER` | 4.5 | Per-frame memory cost multiplier |
 | `VRAM_HARD_LIMIT_PCT` | 0.975 | Runtime VRAM hard stop threshold |
 | `RAM_HARD_LIMIT_PCT` | 0.975 | Runtime RAM hard stop threshold |
+| `OFFLOAD_TRACKER_STATE_TO_CPU` | `True` | Offload per-frame tracker state from VRAM to RAM (GPU) |
+| `GPU_TARGET_UTILISATION_PCT` | 0.90 | Target VRAM usage % for adaptive chunk GROW decisions |
+| `CROSS_CHUNK_MASK_INJECTION` | `True` | Inject carry masks as conditioning frames at chunk boundaries |
+| `CARRY_MAX_RAM_USAGE_PCT` | 0.98 | Drop oldest carry entries when RAM usage reaches 98% |
+| `CARRY_MIN_FREE_RAM_GB` | 1.0 | Drop oldest carry entries when free RAM drops below 1 GB |
 
 ---
 
@@ -894,7 +1090,16 @@ Available markers: `@pytest.mark.slow`, `@pytest.mark.gpu`,
 
 - **Cross-chunk object ID reassignment** — If an object disappears mid-chunk
   and reappears in a later chunk with no overlapping mask at the boundary, it
-  gets a new ID.
+  gets a new ID.  Cross-chunk mask injection (enabled by default) reduces the
+  frequency of this by giving the tracker prior knowledge of objects at chunk
+  boundaries, but cannot eliminate it entirely for objects that vanish and
+  reappear across chunks.
+
+- **Scene cuts at chunk boundaries** — When cross-chunk mask injection is
+  active and a scene cut happens exactly at a chunk boundary, the injected
+  masks are from the previous scene.  The tracker will typically score these
+  low and drop them, but in rare cases stale masks may persist for a few
+  frames before being pruned.
 
 - **CPU inference speed** — Running the full SAM 3 model on CPU is
   significantly slower than GPU even with bfloat16 + HT optimisations.

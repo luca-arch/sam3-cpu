@@ -1207,7 +1207,7 @@ class Sam3VideoDriver:
         clear_memory(device, full_gc=True)
 
     @profile()
-    def start_session(self, video_path: str) -> str:
+    def start_session(self, video_path: str, offload_state_to_cpu: bool | None = None) -> str:
         """Start a new video segmentation session and load the video.
 
         This method initializes a new session, loads the video, and encodes all frames
@@ -1216,6 +1216,12 @@ class Sam3VideoDriver:
 
         Args:
             video_path: Path to video file. Supports common formats (mp4, avi, mov, mkv, etc.).
+            offload_state_to_cpu: If *True*, per-frame tracker state (mask-memory
+                features, predicted masks, object pointers) is stored on CPU RAM
+                instead of VRAM.  This prevents monotonic VRAM growth during long
+                video propagation at a modest FPS cost (~10-15%).
+                Defaults to the ``OFFLOAD_TRACKER_STATE_TO_CPU`` setting from
+                ``sam3.__globals`` (which is *True* on GPU builds).
 
         Returns:
             Unique session identifier (string) used for all session operations.
@@ -1252,12 +1258,31 @@ class Sam3VideoDriver:
         """
         if self.predictor is None:
             raise ValueError("Model is not loaded.")
+
+        # Resolve offload default: auto-enable on GPU to prevent VRAM growth
+        if offload_state_to_cpu is None:
+            device = getattr(self, "_device", DEVICE.type)
+            if device == "cuda":
+                try:
+                    from sam3.__globals import OFFLOAD_TRACKER_STATE_TO_CPU
+                    offload_state_to_cpu = OFFLOAD_TRACKER_STATE_TO_CPU
+                except ImportError:
+                    offload_state_to_cpu = True
+            else:
+                offload_state_to_cpu = False
+
         response = self.predictor.handle_request(
             request=dict(
                 type="start_session",
                 resource_path=video_path,
+                offload_state_to_cpu=offload_state_to_cpu,
             )
         )
+        if offload_state_to_cpu:
+            logger.info(
+                "Tracker state offloading to CPU enabled — "
+                "VRAM growth during propagation will be bounded."
+            )
         return response["session_id"]
 
     @profile()

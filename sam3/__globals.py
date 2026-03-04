@@ -59,6 +59,20 @@ MEMORY_SAFETY_MULTIPLIER = 1.5  # Require 1.5x estimated memory for safety (redu
 CPU_MEMORY_RESERVE_PERCENT = 0.3  # Reserve 30% for OS
 GPU_MEMORY_RESERVE_PERCENT = 0.05  # Reserve 5% for display
 
+# GPU memory offloading: when True, the SAM3 tracker stores per-frame
+# inference state (mask-memory features, predicted masks, object pointers)
+# on CPU RAM instead of VRAM.  This prevents the monotonic VRAM growth
+# observed during long video propagation at the cost of a small speed
+# reduction (~10-15% lower tracking FPS).  Has no effect when device is CPU.
+OFFLOAD_TRACKER_STATE_TO_CPU = True
+
+# Target memory utilisation for the adaptive chunk manager.  The planner
+# aims to size chunks so the bounding resource (VRAM, or RAM when
+# offloading) peaks close to this fraction of the effective limit.
+# Kept above the VRAM_SOFT_LIMIT_PCT so the IntraChunkMonitor can still
+# intervene with a predictive stop on the rare overshoot.
+GPU_TARGET_UTILISATION_PCT = 0.90
+
 # Intra-chunk memory guard thresholds (enforced per-frame during propagation)
 # These are the live safety limits.  VRAM_USAGE_PERCENT above is only for
 # initial chunk *planning*; the guard below is the runtime enforcement.
@@ -68,6 +82,18 @@ VRAM_HARD_LIMIT_PCT = 0.975  # Immediate stop — 2.5% headroom prevents actual 
 # RAM guard thresholds (same dual-threshold design as VRAM)
 RAM_SOFT_LIMIT_PCT = 0.85  # Warn when process RSS reaches 85% of available RAM
 RAM_HARD_LIMIT_PCT = 0.975  # Immediate stop — leave 2.5% headroom for OS/other
+
+# Cross-chunk mask injection: when True, inject the previous chunk's last-frame
+# masks as conditioning frames at the start of the next chunk.  This gives the
+# tracker memory of where objects were, improving continuity without re-detection.
+CROSS_CHUNK_MASK_INJECTION = True
+
+# RAM guard for carry data: the carry dict holds numpy masks from every prompt
+# across all processed chunks.  On very long videos with many objects this can
+# consume significant RAM.  When either limit is hit, the oldest prompt entries
+# in carry are dropped to free memory.
+CARRY_MAX_RAM_USAGE_PCT = 0.98   # Drop carry entries when RAM usage reaches 98%
+CARRY_MIN_FREE_RAM_GB = 1.0     # Drop carry entries when free RAM drops below 1 GB
 
 # Parallel processing
 PARALLEL_CHUNK_THRESHOLD = 0.90  # Start loading next chunk at 90% completion
