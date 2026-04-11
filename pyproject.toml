@@ -42,6 +42,7 @@ dependencies = [
     "typing-extensions>=4.15.0",
     "pycocotools>=2.0.11",
     "pandas>=3.0.0",
+    "decord2",
 ]
 
 
