@@ -8,7 +8,7 @@ from typing import Optional
 # import pkg_resources
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
+#from huggingface_hub import hf_hub_download
 from iopath.common.file_io import g_pathmgr
 from sam3.model.decoder import (
     TransformerDecoder,
@@ -659,14 +659,24 @@ def build_sam3_image_model(
     return model
 
 
-def download_ckpt_from_hf():
-    SAM3_MODEL_ID = "facebook/sam3"
-    SAM3_CKPT_NAME = "sam3.pt"
-    SAM3_CFG_NAME = "config.json"
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
-    return checkpoint_path
+# def download_ckpt_from_hf():
+#     SAM3_MODEL_ID = "facebook/sam3"
+#     SAM3_CKPT_NAME = "sam3.pt"
+#     SAM3_CFG_NAME = "config.json"
+#     _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
+#     checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
+#     return checkpoint_path
 
+def download_ckpt_from_hf(*args, **kwargs):
+    cfg = os.environ["VOLUME_DIR"] / "sam3" / "config.json"
+    if not os.path.exists(cfg):
+        raise Exception(f"file {pt} does not exist")
+
+    pt = os.environ["VOLUME_DIR"] / "sam3" / "sam3.pt"
+    if not os.path.exists(pt):
+        raise Exception(f"file {pt} does not exist")
+
+    return pt
 
 def build_sam3_video_model(
     checkpoint_path: Optional[str] = None,
@@ -692,7 +702,7 @@ def build_sam3_video_model(
     """
     if device is None:
         device = _get_device()
-    
+
     # if bpe_path is None:
     #     bpe_path = pkg_resources.resource_filename(
     #         "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
@@ -821,7 +831,7 @@ def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
         *model_args, gpus_to_use=gpus_to_use, **model_kwargs
     )
 
-def build_sam3_video_predictor_cpu(*model_args, num_workers=None, **model_kwargs): 
-    return Sam3VideoPredictorMultiCPU( 
-        *model_args, num_workers=num_workers, **model_kwargs 
+def build_sam3_video_predictor_cpu(*model_args, num_workers=None, **model_kwargs):
+    return Sam3VideoPredictorMultiCPU(
+        *model_args, num_workers=num_workers, **model_kwargs
     )

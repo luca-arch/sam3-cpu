@@ -28,7 +28,6 @@ dependencies = [
     "torchvision",
     "numpy",
     "pillow",
-    "huggingface-hub",
     "iopath",
     "einops>=0.8.2",
     "jupyter>=1.1.1",
