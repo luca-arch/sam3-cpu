@@ -668,11 +668,11 @@ def build_sam3_image_model(
 #     return checkpoint_path
 
 def download_ckpt_from_hf(*args, **kwargs):
-    cfg = os.environ["VOLUME_DIR"] / "sam3" / "config.json"
+    cfg = os.environ["MODELS_DIR"] + "/sam3/config.json"
     if not os.path.exists(cfg):
         raise Exception(f"file {pt} does not exist")
 
-    pt = os.environ["VOLUME_DIR"] / "sam3" / "sam3.pt"
+    pt = os.environ["MODELS_DIR"] + "/sam3/sam3.pt"
     if not os.path.exists(pt):
         raise Exception(f"file {pt} does not exist")
 
